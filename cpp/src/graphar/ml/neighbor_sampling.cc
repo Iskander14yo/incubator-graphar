@@ -1,11 +1,13 @@
 #include "graphar/ml/neighbor_sampling.h"
 
 #include <algorithm>
+#include <map>
 #include <random>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "arrow/api.h"
+#include "graphar/arrow/chunk_reader.h"
 #include "graphar/graph_info.h"
 #include "graphar/high-level/graph_reader.h"
 
@@ -139,8 +141,120 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
     return Status::Invalid("Vertex type '", vertex_type, "' not found");
   }
 
-  // TODO: Implement feature retrieval
-  return Status::Invalid("GetNodeFeatures not yet implemented");
+  // Validate that all properties exist
+  for (const auto& prop : properties) {
+    if (!vertex_info->HasProperty(prop)) {
+      return Status::Invalid("Property '", prop, "' not found in vertex type '",
+                            vertex_type, "'");
+    }
+  }
+
+  // Group properties by their property group
+  std::unordered_map<std::shared_ptr<PropertyGroup>,
+                     std::vector<std::string>>
+      pg_to_props;
+  for (const auto& prop : properties) {
+    auto pg = vertex_info->GetPropertyGroup(prop);
+    if (!pg) {
+      return Status::Invalid("Property group not found for property '", prop,
+                            "'");
+    }
+    pg_to_props[pg].push_back(prop);
+  }
+
+  // Build Arrow schema and arrays for result
+  std::vector<std::shared_ptr<arrow::Field>> schema_fields;
+  std::vector<std::shared_ptr<arrow::Array>> result_arrays;
+
+  // For each property group, read the data
+  for (const auto& [pg, props] : pg_to_props) {
+    // Create reader for this property group
+    auto reader_result =
+        VertexPropertyArrowChunkReader::Make(graph_info, vertex_type, pg);
+    GAR_RETURN_NOT_OK(reader_result.status());
+    auto reader = reader_result.value();
+
+    // Group node_ids by chunk to minimize chunk reads
+    IdType chunk_size = vertex_info->GetChunkSize();
+    std::map<IdType, std::vector<size_t>> chunk_to_indices;
+    for (size_t i = 0; i < node_ids.size(); i++) {
+      IdType chunk_id = node_ids[i] / chunk_size;
+      chunk_to_indices[chunk_id].push_back(i);
+    }
+
+    // Build arrays for each property in this group
+    std::unordered_map<std::string, std::vector<std::shared_ptr<arrow::Scalar>>>
+        prop_scalars;
+    for (const auto& prop : props) {
+      prop_scalars[prop].resize(node_ids.size());
+    }
+
+    // Read each chunk and extract needed rows
+    for (const auto& [chunk_id, indices] : chunk_to_indices) {
+      // Seek to the beginning of this chunk
+      IdType chunk_start_node = chunk_id * chunk_size;
+      GAR_RETURN_NOT_OK(reader->seek(chunk_start_node));
+
+      // Read the chunk
+      auto chunk_result = reader->GetChunk();
+      GAR_RETURN_NOT_OK(chunk_result.status());
+      auto chunk_table = chunk_result.value();
+
+      // Extract values for each node_id in this chunk
+      for (size_t idx : indices) {
+        IdType node_id = node_ids[idx];
+        IdType row_in_chunk = node_id - chunk_start_node;
+
+        // Extract value for each property
+        for (const auto& prop : props) {
+          auto column = chunk_table->GetColumnByName(prop);
+          if (!column) {
+            return Status::Invalid("Column '", prop, "' not found in chunk");
+          }
+          auto scalar_result = column->chunk(0)->GetScalar(row_in_chunk);
+          if (!scalar_result.ok()) {
+            return Status::ArrowError(scalar_result.status().ToString());
+          }
+          prop_scalars[prop][idx] = scalar_result.ValueOrDie();
+        }
+      }
+    }
+
+    // Convert scalars to arrays for each property
+    for (const auto& prop : props) {
+      auto prop_type_result = vertex_info->GetPropertyType(prop);
+      GAR_RETURN_NOT_OK(prop_type_result.status());
+      auto prop_type = prop_type_result.value();
+
+      // Build arrow array from scalars
+      auto arrow_type = DataType::DataTypeToArrowDataType(prop_type);
+      auto builder_result = arrow::MakeBuilder(arrow_type, arrow::default_memory_pool());
+      if (!builder_result.ok()) {
+        return Status::ArrowError(builder_result.status().ToString());
+      }
+      auto builder = std::move(builder_result).ValueOrDie();
+
+      for (const auto& scalar : prop_scalars[prop]) {
+        auto append_status = builder->AppendScalar(*scalar);
+        if (!append_status.ok()) {
+          return Status::ArrowError(append_status.ToString());
+        }
+      }
+
+      std::shared_ptr<arrow::Array> array;
+      auto finish_status = builder->Finish(&array);
+      if (!finish_status.ok()) {
+        return Status::ArrowError(finish_status.ToString());
+      }
+
+      schema_fields.push_back(arrow::field(prop, arrow_type));
+      result_arrays.push_back(array);
+    }
+  }
+
+  // Create final table
+  auto schema = arrow::schema(schema_fields);
+  return arrow::Table::Make(schema, result_arrays, node_ids.size());
 }
 
 }  // namespace graphar::ml

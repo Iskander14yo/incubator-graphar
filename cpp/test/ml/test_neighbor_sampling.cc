@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -251,6 +252,116 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - empty fanout") {
   auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout);
   REQUIRE(result.has_error());
   REQUIRE(result.status().IsInvalid());
+}
+
+// Tests for GetNodeFeatures
+TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - single property") {
+  std::vector<IdType> node_ids = {0, 1, 2};
+  std::vector<std::string> properties = {"id"};
+
+  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
+  REQUIRE(result.status().ok());
+
+  auto table = result.value();
+  REQUIRE(table->num_rows() == 3);
+  REQUIRE(table->num_columns() == 1);
+
+  auto id_column = table->GetColumnByName("id");
+  REQUIRE(id_column != nullptr);
+  
+  // Verify values
+  auto id_array = std::static_pointer_cast<arrow::Int64Array>(id_column->chunk(0));
+  REQUIRE(id_array->Value(0) == 0);
+  REQUIRE(id_array->Value(1) == 1);
+  REQUIRE(id_array->Value(2) == 2);
+}
+
+TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - multiple properties") {
+  std::vector<IdType> node_ids = {0, 2, 4};
+  std::vector<std::string> properties = {"id", "feature"};
+
+  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
+  REQUIRE(result.status().ok());
+
+  auto table = result.value();
+  REQUIRE(table->num_rows() == 3);
+  REQUIRE(table->num_columns() == 2);
+
+  // Verify id column
+  auto id_column = table->GetColumnByName("id");
+  REQUIRE(id_column != nullptr);
+  auto id_array = std::static_pointer_cast<arrow::Int64Array>(id_column->chunk(0));
+  REQUIRE(id_array->Value(0) == 0);
+  REQUIRE(id_array->Value(1) == 2);
+  REQUIRE(id_array->Value(2) == 4);
+
+  // Verify feature column
+  auto feature_column = table->GetColumnByName("feature");
+  REQUIRE(feature_column != nullptr);
+  auto feature_array = std::static_pointer_cast<arrow::FloatArray>(feature_column->chunk(0));
+  REQUIRE(std::abs(feature_array->Value(0) - 0.0f) < 0.001f);
+  REQUIRE(std::abs(feature_array->Value(1) - 0.2f) < 0.001f);
+  REQUIRE(std::abs(feature_array->Value(2) - 0.4f) < 0.001f);
+}
+
+TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - empty node list") {
+  std::vector<IdType> node_ids = {};
+  std::vector<std::string> properties = {"id"};
+
+  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
+  REQUIRE(result.status().ok());
+
+  auto table = result.value();
+  REQUIRE(table->num_rows() == 0);
+}
+
+TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - empty properties") {
+  std::vector<IdType> node_ids = {0};
+  std::vector<std::string> properties = {};
+
+  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
+  REQUIRE(result.has_error());
+  REQUIRE(result.status().IsInvalid());
+}
+
+TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - invalid property") {
+  std::vector<IdType> node_ids = {0};
+  std::vector<std::string> properties = {"non_existent"};
+
+  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
+  REQUIRE(result.has_error());
+  REQUIRE(result.status().IsInvalid());
+}
+
+TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - invalid vertex type") {
+  std::vector<IdType> node_ids = {0};
+  std::vector<std::string> properties = {"id"};
+
+  auto result = GetNodeFeatures(graph_info, "InvalidType", node_ids, properties);
+  REQUIRE(result.has_error());
+  REQUIRE(result.status().IsInvalid());
+}
+
+TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - unordered node ids") {
+  std::vector<IdType> node_ids = {5, 1, 3, 0};
+  std::vector<std::string> properties = {"id"};
+
+  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
+  if (!result.status().ok()) {
+    std::cerr << "Error: " << result.status().message() << std::endl;
+  }
+  REQUIRE(result.status().ok());
+
+  auto table = result.value();
+  REQUIRE(table->num_rows() == 4);
+
+  // Values should be in the same order as input node_ids
+  auto id_column = table->GetColumnByName("id");
+  auto id_array = std::static_pointer_cast<arrow::Int64Array>(id_column->chunk(0));
+  REQUIRE(id_array->Value(0) == 5);
+  REQUIRE(id_array->Value(1) == 1);
+  REQUIRE(id_array->Value(2) == 3);
+  REQUIRE(id_array->Value(3) == 0);
 }
 
 }  // namespace graphar::ml
