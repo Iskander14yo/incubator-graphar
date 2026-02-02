@@ -50,8 +50,7 @@ struct SamplingTestFixture {
     REQUIRE(!builder_result.has_error());
     auto vertex_builder = builder_result.value();
 
-    // Add 6 vertices (IDs: 0-5)
-    // Node 5 will be isolated (no edges)  todo: remove line
+    // Add vertices and save them
     for (int64_t i = 0; i < 6; i++) {
       builder::Vertex v;
       v.AddProperty("id", i);
@@ -60,14 +59,14 @@ struct SamplingTestFixture {
     }
     REQUIRE(vertex_builder->Dump().ok());
 
-    // Build edges using EdgesBuilder
+    // Add edges and save them
     // Graph structure:
     // 0 -> 1, 2
     // 1 -> 2, 3
     // 2 -> 3, 4
     // 3 -> 4
     // 4 -> (none)
-    // 5 -> (isolated)
+    // 5 (isolated)
     auto edges_builder_result = builder::EdgesBuilder::Make(
         edge_info, test_dir, AdjListType::ordered_by_source, 6);
     REQUIRE(!edges_builder_result.has_error());
@@ -89,20 +88,9 @@ struct SamplingTestFixture {
   std::string test_dir;
   std::shared_ptr<GraphInfo> graph_info;
 };
-// todo: move to bottom
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - empty seed list") {
-  std::vector<IdType> seeds = {};
-  std::vector<int> fanout = {2};
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout);
-  REQUIRE(result.status().ok());
+//////////////////////////// SampleNeighbors /////////////////////////////////////
 
-  auto& sampling = result.value();
-  REQUIRE(sampling.sampled_nodes.empty());
-  REQUIRE(sampling.src_indices.empty());
-  REQUIRE(sampling.dst_indices.empty());
-}
-// todo: switch to = instead of <= or >= on 115 line
 TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - single hop") {
   std::vector<IdType> seeds = {0};
   std::vector<int> fanout = {10};  // Request more than available
@@ -112,9 +100,8 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - single hop") {
 
   auto& sampling = result.value();
   
-  // Should have seed + its neighbors
-  REQUIRE(sampling.sampled_nodes.size() >= 1);
-  REQUIRE(sampling.sampled_nodes.size() <= 3);  // seed + max 2 neighbors
+  // Should have seed (0) + its neighbors (1,2)
+  REQUIRE(sampling.sampled_nodes.size() == 3);
 
   // Verify seed is in sampled_nodes
   REQUIRE(std::find(sampling.sampled_nodes.begin(),
@@ -189,20 +176,6 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - isolated node") {
   REQUIRE(sampling.src_indices.empty());
   REQUIRE(sampling.dst_indices.empty());
 }
-// todo: remove this test
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - node with few neighbors") {
-  std::vector<IdType> seeds = {4};  // Node 4 has no outgoing edges
-  std::vector<int> fanout = {10};   // Request more than available
-
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout);
-  REQUIRE(result.status().ok());
-
-  auto& sampling = result.value();
-  
-  // Should only have seed (no neighbors)
-  REQUIRE(sampling.sampled_nodes.size() == 1);
-  REQUIRE(sampling.src_indices.empty());
-}
 
 TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - multiple seeds") {
   std::vector<IdType> seeds = {0, 1};
@@ -223,6 +196,19 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - multiple seeds") {
 
   // Should have edges from both seeds
   REQUIRE(sampling.src_indices.size() > 0);
+}
+
+TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - empty seed list") {
+  std::vector<IdType> seeds = {};
+  std::vector<int> fanout = {2};
+
+  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout);
+  REQUIRE(result.status().ok());
+
+  auto& sampling = result.value();
+  REQUIRE(sampling.sampled_nodes.empty());
+  REQUIRE(sampling.src_indices.empty());
+  REQUIRE(sampling.dst_indices.empty());
 }
 
 TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - invalid vertex type") {
@@ -254,7 +240,8 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - empty fanout") {
   REQUIRE(result.status().IsInvalid());
 }
 
-// Tests for GetNodeFeatures
+//////////////////////////// GetNodeFeatures /////////////////////////////////////
+
 TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - single property") {
   std::vector<IdType> node_ids = {0, 1, 2};
   std::vector<std::string> properties = {"id"};
