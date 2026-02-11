@@ -92,6 +92,7 @@ python_add_library(_core MODULE src/bindings/types_binding.cc
                                    src/bindings/cli_binding.cc
                                    src/bindings/graph_info_binding.cc
                                    src/bindings/high_level_binding.cc
+                                   src/bindings/ml_binding.cc
                                    src/bindings/_core_module.cc WITH_SOABI)
                                    
 target_link_libraries(_core PRIVATE pybind11::headers graphar Arrow::arrow_shared
