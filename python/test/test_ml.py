@@ -16,7 +16,7 @@ def test_sample_neighbors_basic(ldbc_graph):
     seeds = [0, 1]
     fanout = [5]
 
-    result = gar_ml.sample_neighbors(ldbc_graph, "person", "knows", seeds, fanout)
+    result = gar_ml.sample_neighbors(ldbc_graph, "person", "knows", seeds, fanout, seed=42)
 
     assert hasattr(result, "sampled_nodes")
     assert hasattr(result, "src_indices")
@@ -32,7 +32,7 @@ def test_sample_neighbors_fanout_respected(ldbc_graph):
     seeds = [0]
     fanout = [2]
 
-    result = gar_ml.sample_neighbors(ldbc_graph, "person", "knows", seeds, fanout)
+    result = gar_ml.sample_neighbors(ldbc_graph, "person", "knows", seeds, fanout, seed=42)
 
     # Number of neighbors for node 0 should be <= fanout[0]
     neighbors_of_seed = [
@@ -46,7 +46,7 @@ def test_sample_neighbors_empty_seeds(ldbc_graph):
     seeds = []
     fanout = [5]
 
-    result = gar_ml.sample_neighbors(ldbc_graph, "person", "knows", seeds, fanout)
+    result = gar_ml.sample_neighbors(ldbc_graph, "person", "knows", seeds, fanout, seed=42)
 
     assert len(result.sampled_nodes) == 0
     assert len(result.src_indices) == 0
@@ -94,7 +94,7 @@ def test_get_node_features_invalid_property(ldbc_graph):
     node_ids = [0]
     properties = ["nonexistent_property"]
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not found"):
         gar_ml.get_node_features(ldbc_graph, "person", node_ids, properties)
 
 
@@ -103,5 +103,19 @@ def test_sample_neighbors_invalid_edge_type(ldbc_graph):
     seeds = [0]
     fanout = [5]
 
-    with pytest.raises(ValueError):
-        gar_ml.sample_neighbors(ldbc_graph, "person", "nonexistent_edge", seeds, fanout)
+    with pytest.raises(ValueError, match="not found"):
+        gar_ml.sample_neighbors(ldbc_graph, "person", "nonexistent_edge", seeds, fanout, seed=42)
+
+
+def test_sample_neighbors_deterministic_with_seed(ldbc_graph):
+    """Test that same seed produces same sampled result."""
+    seeds = [0]
+    fanout = [2]
+    seed = 12345
+
+    result1 = gar_ml.sample_neighbors(ldbc_graph, "person", "knows", seeds, fanout, seed=seed)
+    result2 = gar_ml.sample_neighbors(ldbc_graph, "person", "knows", seeds, fanout, seed=seed)
+
+    assert result1.sampled_nodes == result2.sampled_nodes
+    assert result1.src_indices == result2.src_indices
+    assert result1.dst_indices == result2.dst_indices

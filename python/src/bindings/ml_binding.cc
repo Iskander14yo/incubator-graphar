@@ -78,9 +78,9 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
          const std::string& vertex_type,
          const std::string& edge_type,
          const std::vector<graphar::IdType>& seed_nodes,
-         const std::vector<int>& fanout) {
+         const std::vector<int>& fanout, uint64_t seed) {
         auto result = graphar::ml::SampleNeighbors(
-            graph_info, vertex_type, edge_type, seed_nodes, fanout);
+            graph_info, vertex_type, edge_type, seed_nodes, fanout, seed);
         return ThrowOrReturn(result);
       },
       py::arg("graph_info"),
@@ -88,6 +88,7 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       py::arg("edge_type"),
       py::arg("seed_nodes"),
       py::arg("fanout"),
+      py::arg("seed"),
       "Sample multi-hop neighbors for given seed nodes");
 
   // Bind get_node_features function

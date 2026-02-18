@@ -16,7 +16,8 @@ namespace graphar::ml {
 Result<SamplingResult> SampleNeighbors(
     const std::shared_ptr<GraphInfo>& graph_info,
     const std::string& vertex_type, const std::string& edge_type,
-    const std::vector<IdType>& seed_nodes, const std::vector<int>& fanout) {
+    const std::vector<IdType>& seed_nodes, const std::vector<int>& fanout,
+    uint64_t seed) {
   // Validate inputs
   if (seed_nodes.empty()) {
     return SamplingResult{};
@@ -54,9 +55,8 @@ Result<SamplingResult> SampleNeighbors(
   // Current frontier starts with seed nodes
   std::vector<IdType> current_frontier = seed_nodes;
 
-  // Random number generator for sampling
-  std::random_device rd;
-  std::mt19937 gen(rd());
+  // Random number generator for deterministic sampling
+  std::mt19937 gen(seed);
 
   // Process each hop
   for (size_t hop = 0; hop < fanout.size(); ++hop) {

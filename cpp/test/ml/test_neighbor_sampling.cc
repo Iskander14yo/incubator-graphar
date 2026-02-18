@@ -95,7 +95,7 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - single hop") {
   std::vector<IdType> seeds = {0};
   std::vector<int> fanout = {10};  // Request more than available
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout);
+  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
   REQUIRE(result.status().ok());
 
   auto& sampling = result.value();
@@ -124,7 +124,7 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - fanout limit") {
   std::vector<IdType> seeds = {0};
   std::vector<int> fanout = {1};  // Limit to 1 neighbor
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout);
+  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
   REQUIRE(result.status().ok());
 
   auto& sampling = result.value();
@@ -137,11 +137,28 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - fanout limit") {
   REQUIRE(sampling.sampled_nodes.size() == 2);
 }
 
+TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - deterministic with seed") {
+  std::vector<IdType> seeds = {0};
+  std::vector<int> fanout = {1};
+  uint64_t seed = 12345;
+
+  auto result1 = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, seed);
+  auto result2 = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, seed);
+  REQUIRE(result1.status().ok());
+  REQUIRE(result2.status().ok());
+
+  const auto& sampling1 = result1.value();
+  const auto& sampling2 = result2.value();
+  REQUIRE(sampling1.sampled_nodes == sampling2.sampled_nodes);
+  REQUIRE(sampling1.src_indices == sampling2.src_indices);
+  REQUIRE(sampling1.dst_indices == sampling2.dst_indices);
+}
+
 TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - multi-hop") {
   std::vector<IdType> seeds = {0};
   std::vector<int> fanout = {2, 2};  // 2-hop, 2 neighbors per hop
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout);
+  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
   REQUIRE(result.status().ok());
 
   auto& sampling = result.value();
@@ -163,7 +180,7 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - isolated node") {
   std::vector<IdType> seeds = {5};  // Node 5 has no edges
   std::vector<int> fanout = {2};
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout);
+  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
   REQUIRE(result.status().ok());
 
   auto& sampling = result.value();
@@ -181,7 +198,7 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - multiple seeds") {
   std::vector<IdType> seeds = {0, 1};
   std::vector<int> fanout = {2};
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout);
+  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
   REQUIRE(result.status().ok());
 
   auto& sampling = result.value();
@@ -202,7 +219,7 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - empty seed list") {
   std::vector<IdType> seeds = {};
   std::vector<int> fanout = {2};
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout);
+  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
   REQUIRE(result.status().ok());
 
   auto& sampling = result.value();
@@ -216,7 +233,7 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - invalid vertex type") {
   std::vector<int> fanout = {2};
 
   auto result =
-      SampleNeighbors(graph_info, "InvalidType", "edge", seeds, fanout);
+      SampleNeighbors(graph_info, "InvalidType", "edge", seeds, fanout, 42);
   REQUIRE(result.has_error());
   REQUIRE(result.status().IsInvalid());
 }
@@ -226,7 +243,7 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - invalid edge type") {
   std::vector<int> fanout = {2};
 
   auto result =
-      SampleNeighbors(graph_info, "Node", "invalid_edge", seeds, fanout);
+      SampleNeighbors(graph_info, "Node", "invalid_edge", seeds, fanout, 42);
   REQUIRE(result.has_error());
   REQUIRE(result.status().IsInvalid());
 }
@@ -235,7 +252,7 @@ TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - empty fanout") {
   std::vector<IdType> seeds = {0};
   std::vector<int> fanout = {};
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout);
+  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
   REQUIRE(result.has_error());
   REQUIRE(result.status().IsInvalid());
 }

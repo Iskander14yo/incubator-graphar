@@ -34,7 +34,8 @@ struct SamplingResult {
 Result<SamplingResult> SampleNeighbors(
     const std::shared_ptr<GraphInfo>& graph_info,
     const std::string& vertex_type, const std::string& edge_type,
-    const std::vector<IdType>& seed_nodes, const std::vector<int>& fanout);
+    const std::vector<IdType>& seed_nodes, const std::vector<int>& fanout,
+    uint64_t seed);
 
 /**
  * Fetch node properties for given internal IDs.
