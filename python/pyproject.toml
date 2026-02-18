@@ -59,6 +59,7 @@ include = [
 [project.optional-dependencies]
 test = ["pandas ~= 2.0", "typing_extensions ~= 4.0"]
 docs = ["pdoc"]
+ml = ["numpy", "torch", "torch-geometric"]
 
 [project.scripts]
 graphar = "cli.graphar_cli:main"
