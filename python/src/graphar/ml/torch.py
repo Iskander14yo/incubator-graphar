@@ -1,33 +1,22 @@
 from __future__ import annotations
 
+import struct
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 
 import pyarrow as pa
 import torch
 from torch.utils.data import IterableDataset
 from torch_geometric.data import Data
 
-from . import get_node_features, sample_neighbors
-
-
-def _is_numeric_arrow_type(data_type: pa.DataType) -> bool:
-    return (
-        pa.types.is_integer(data_type)
-        or pa.types.is_floating(data_type)
-        or pa.types.is_boolean(data_type)
-    )
+import graphar.ml as gar_ml
 
 
 def _chunked_array_to_tensor(column: pa.ChunkedArray) -> torch.Tensor:
     combined = column.combine_chunks()
-    if not _is_numeric_arrow_type(combined.type):
-        raise TypeError(f"Feature column '{column}' has non-numeric type: {combined.type}")
     numpy_array = combined.to_numpy(zero_copy_only=False)
+    # from_numpy may warn if underlying array is read-only; this loader is read-only so it's ok
     tensor = torch.from_numpy(numpy_array)
-    if tensor.dtype == torch.bool:
-        return tensor.to(torch.float32)
-    if tensor.is_floating_point():
-        return tensor.to(torch.float32)
     return tensor.to(torch.float32)
 
 
@@ -39,9 +28,11 @@ def _table_to_feature_tensor(table: pa.Table) -> torch.Tensor:
 
 
 def _properties_for_vertex(graph_info, vertex_type: str) -> list[str]:
+    """Collect all properties when features=None"""
     vertex_info = graph_info.get_vertex_info(vertex_type)
     if vertex_info is None:
-        raise ValueError(f"Vertex type '{vertex_type}' not found")
+        msg = f"Vertex type '{vertex_type}' not found"
+        raise ValueError(msg)
     properties: list[str] = []
     for group in vertex_info.get_property_groups():
         for prop in group.get_properties():
@@ -52,14 +43,55 @@ def _properties_for_vertex(graph_info, vertex_type: str) -> list[str]:
 def _vertex_count(graph_info, vertex_type: str) -> int:
     vertex_info = graph_info.get_vertex_info(vertex_type)
     if vertex_info is None:
-        raise ValueError(f"Vertex type '{vertex_type}' not found")
+        msg = f"Vertex type '{vertex_type}' not found"
+        raise ValueError(msg)
     relative_path = vertex_info.get_vertices_num_file_path()
     prefix = graph_info.get_prefix()
     if prefix.startswith("file://"):
         prefix = prefix.removeprefix("file://")
     path = prefix.rstrip("/") + "/" + relative_path.lstrip("/")
-    with open(path, encoding="utf-8") as f:
-        return int(f.read().strip())
+    with Path(path).open("rb") as f:
+        data = f.read()
+    if len(data) == 8:
+        return int(struct.unpack("<q", data)[0])
+    return int(data.decode("utf-8").strip())
+
+
+def _is_numeric_type_name(type_name: str) -> bool:
+    return type_name in {
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "float",
+        "float16",
+        "float32",
+        "float64",
+        "double",
+        "bool",
+    }
+
+
+def _validate_numeric_features(graph_info, vertex_type: str, features: Sequence[str]) -> None:
+    if not features:
+        return
+    vertex_info = graph_info.get_vertex_info(vertex_type)
+    if vertex_info is None:
+        msg = f"Vertex type '{vertex_type}' not found"
+        raise ValueError(msg)
+    invalid: list[tuple[str, str]] = []
+    for name in features:
+        type_name = vertex_info.get_property_type(name).to_type_name()
+        if not _is_numeric_type_name(type_name):
+            invalid.append((name, type_name))
+    if invalid:
+        details = ", ".join(f"{name}:{type_name}" for name, type_name in invalid)
+        msg = f"Only numeric features are supported. Got non-numeric: {details}"
+        raise ValueError(msg)
 
 
 def _normalize_input_nodes(
@@ -90,7 +122,7 @@ def _as_unique_list(values: Sequence[int]) -> list[int]:
         unique_values.append(value)
     return unique_values
 
-# todo: проверить этот инвариант в сорсе
+
 def _reorder_sampled_nodes(sampled_nodes: Sequence[int], seed_nodes: Sequence[int]) -> list[int]:
     seed_set = set(seed_nodes)
     rest = [node for node in sampled_nodes if node not in seed_set]
@@ -107,7 +139,7 @@ def _hop_stats(
 
     sources = edge_index[0].tolist()
     targets = edge_index[1].tolist()
-    depth_by_node = {idx: 0 for idx in range(seed_count)}
+    depth_by_node = dict.fromkeys(range(seed_count), 0)
     num_sampled_edges = [0] * num_hops
     num_sampled_nodes = [0] * num_hops
 
@@ -141,13 +173,15 @@ class GARNeighborLoader(IterableDataset):
         features: list[str] | None = None,
     ) -> None:
         if batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
+            msg = "batch_size must be > 0"
+            raise ValueError(msg)
         if not num_neighbors:
-            raise ValueError("num_neighbors must not be empty")
+            msg = "num_neighbors must not be empty"
+            raise ValueError(msg)
         self.graph_info = graph_info
         self.vertex_type = vertex_type
         self.edge_type = edge_type
-        self.num_neighbors = [int(v) for v in num_neighbors]  # todo: убрать все эти конвертации
+        self.num_neighbors = [int(v) for v in num_neighbors]
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
         self._input_nodes = _as_unique_list(
@@ -158,7 +192,8 @@ class GARNeighborLoader(IterableDataset):
             if features is None
             else [str(name) for name in features]
         )
-        self._epoch = 0  # todo: подумать на тему эпохи в качестве сида
+        _validate_numeric_features(graph_info, vertex_type, self.features)
+        self._epoch = 0
 
     def __len__(self) -> int:
         if not self._input_nodes:
@@ -184,7 +219,7 @@ class GARNeighborLoader(IterableDataset):
 
     def _build_batch(self, seed_nodes: list[int]) -> Data:
         seed = self._sample_seed()
-        sampling = sample_neighbors(
+        sampling = gar_ml.sample_neighbors(
             self.graph_info,
             self.vertex_type,
             self.edge_type,
@@ -214,7 +249,7 @@ class GARNeighborLoader(IterableDataset):
             edge_index = torch.empty((2, 0), dtype=torch.long)
 
         if self.features:
-            feature_table = get_node_features(
+            feature_table = gar_ml.get_node_features(
                 self.graph_info, self.vertex_type, n_id_list, self.features
             )
             x = _table_to_feature_tensor(feature_table)
