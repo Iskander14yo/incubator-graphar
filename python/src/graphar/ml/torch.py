@@ -31,7 +31,7 @@ def _properties_for_vertex(graph_info, vertex_type: str) -> list[str]:
     """Collect all properties when features=None"""
     vertex_info = graph_info.get_vertex_info(vertex_type)
     if vertex_info is None:
-        msg = f"Vertex type '{vertex_type}' not found"
+        msg = f"Vertex type '{vertex_type}' not found"  # TODO: separate error type or function?
         raise ValueError(msg)
     properties: list[str] = []
     for group in vertex_info.get_property_groups():
@@ -47,7 +47,7 @@ def _vertex_count(graph_info, vertex_type: str) -> int:
         raise ValueError(msg)
     relative_path = vertex_info.get_vertices_num_file_path()
     prefix = graph_info.get_prefix()
-    if prefix.startswith("file://"):
+    if prefix.startswith("file://"):  # TODO: possible? need to check
         prefix = prefix.removeprefix("file://")
     path = prefix.rstrip("/") + "/" + relative_path.lstrip("/")
     with Path(path).open("rb") as f:
@@ -58,7 +58,7 @@ def _vertex_count(graph_info, vertex_type: str) -> int:
 
 
 def _is_numeric_type_name(type_name: str) -> bool:
-    return type_name in {
+    return type_name in {  # TODO: refactor to constant
         "int8",
         "int16",
         "int32",
@@ -85,7 +85,7 @@ def _validate_numeric_features(graph_info, vertex_type: str, features: Sequence[
         raise ValueError(msg)
     invalid: list[tuple[str, str]] = []
     for name in features:
-        type_name = vertex_info.get_property_type(name).to_type_name()
+        type_name = vertex_info.get_property_type(name).to_type_name()  # TODO: add type mapping to original module?
         if not _is_numeric_type_name(type_name):
             invalid.append((name, type_name))
     if invalid:
@@ -93,7 +93,7 @@ def _validate_numeric_features(graph_info, vertex_type: str, features: Sequence[
         msg = f"Only numeric features are supported. Got non-numeric: {details}"
         raise ValueError(msg)
 
-
+# TODO: add comments and/or simplify
 def _normalize_input_nodes(
     graph_info,
     vertex_type: str,
@@ -111,7 +111,7 @@ def _normalize_input_nodes(
         return [idx for idx, keep in enumerate(input_nodes) if keep]
     return [int(node) for node in input_nodes]
 
-
+# TODO: do we need this strange function?
 def _as_unique_list(values: Sequence[int]) -> list[int]:
     seen: set[int] = set()
     unique_values: list[int] = []
@@ -122,13 +122,13 @@ def _as_unique_list(values: Sequence[int]) -> list[int]:
         unique_values.append(value)
     return unique_values
 
-
+# TODO: check this invariant in source
 def _reorder_sampled_nodes(sampled_nodes: Sequence[int], seed_nodes: Sequence[int]) -> list[int]:
     seed_set = set(seed_nodes)
     rest = [node for node in sampled_nodes if node not in seed_set]
     return [*seed_nodes, *rest]
 
-
+# TODO: unclear what this function does
 def _hop_stats(
     num_hops: int, seed_count: int, edge_index: torch.Tensor
 ) -> tuple[list[int], list[int]]:
@@ -181,7 +181,7 @@ class GARNeighborLoader(IterableDataset):
         self.graph_info = graph_info
         self.vertex_type = vertex_type
         self.edge_type = edge_type
-        self.num_neighbors = [int(v) for v in num_neighbors]
+        self.num_neighbors = [int(v) for v in num_neighbors]  # TODO: review whether casts are needed
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
         self._input_nodes = _as_unique_list(
@@ -207,7 +207,7 @@ class GARNeighborLoader(IterableDataset):
             return
         if self.shuffle:
             order = torch.randperm(total, generator=self._rng).tolist()
-            ordered_nodes = [self._input_nodes[i] for i in order]
+            ordered_nodes = [self._input_nodes[i] for i in order]  # TODO: does it make sense?
         else:
             ordered_nodes = self._input_nodes
         for start in range(0, total, self.batch_size):
@@ -230,9 +230,9 @@ class GARNeighborLoader(IterableDataset):
         )
 
         sampled_nodes = [int(node) for node in sampling.sampled_nodes]
-        n_id_list = _reorder_sampled_nodes(sampled_nodes, seed_nodes)
+        n_id_list = _reorder_sampled_nodes(sampled_nodes, seed_nodes)  # TODO: need to do this in general, not only for seed_nodes
 
-        old_nodes = [int(node) for node in sampling.sampled_nodes]
+        old_nodes = [int(node) for node in sampling.sampled_nodes]  # TODO: comment, what happens below
         old_idx_to_node = old_nodes
         new_idx_by_node = {node: idx for idx, node in enumerate(n_id_list)}
 
@@ -267,8 +267,8 @@ class GARNeighborLoader(IterableDataset):
         batch.batch_size = len(seed_nodes)
         batch.n_id = n_id
         batch.input_id = input_id
-        batch.num_sampled_nodes = torch.tensor(num_sampled_nodes, dtype=torch.long)
-        batch.num_sampled_edges = torch.tensor(num_sampled_edges, dtype=torch.long)
+        batch.num_sampled_nodes = torch.tensor(num_sampled_nodes, dtype=torch.long)  # TODO: why list? need to check
+        batch.num_sampled_edges = torch.tensor(num_sampled_edges, dtype=torch.long)  # TODO: why list? need to check
         batch.vertex_type = self.vertex_type
         batch.edge_type = self.edge_type
         return batch
