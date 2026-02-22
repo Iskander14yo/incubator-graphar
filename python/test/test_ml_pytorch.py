@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import graphar as gar
 import pytest
 import torch
 from torch_geometric.data import Data
 
+import graphar as gar
 from graphar.ml.torch import GARNeighborLoader
 
 
@@ -35,6 +35,12 @@ def _make_loader(
         shuffle=shuffle,
         features=features,
     )
+
+
+def _batch_tensors(batch: Data) -> tuple[torch.Tensor, torch.Tensor]:
+    assert batch.x is not None
+    assert batch.edge_index is not None
+    return batch.x, batch.edge_index
 
 
 def test_loader_yields_data_with_expected_contract(ldbc_graph):
@@ -71,15 +77,16 @@ def test_batch_shape_index_consistency_and_dtypes(ldbc_graph):
         ldbc_graph, input_nodes=[0, 1, 2, 3], features=["id"], batch_size=2, shuffle=False
     )
     batch = next(iter(loader))
+    x, edge_index = _batch_tensors(batch)
 
-    assert len(batch.n_id) == batch.x.size(0)
-    assert tuple(batch.edge_index.shape[:1]) == (2,)
-    if batch.edge_index.numel() > 0:
-        assert int(batch.edge_index.max()) < batch.x.size(0)
-    assert batch.edge_index.dtype == torch.long
+    assert len(batch.n_id) == x.size(0)
+    assert tuple(edge_index.shape[:1]) == (2,)
+    if edge_index.numel() > 0:
+        assert int(edge_index.max()) < x.size(0)
+    assert edge_index.dtype == torch.long
     assert batch.n_id.dtype == torch.long
-    assert isinstance(batch.x, torch.Tensor)
-    assert batch.x.dtype in {torch.float16, torch.float32, torch.float64, torch.long, torch.int64}
+    assert isinstance(x, torch.Tensor)
+    assert x.dtype in {torch.float16, torch.float32, torch.float64, torch.long, torch.int64}
 
 
 def test_batch_size_is_respected_including_last_batch(ldbc_graph):
@@ -91,15 +98,38 @@ def test_batch_size_is_respected_including_last_batch(ldbc_graph):
     assert [batch.batch_size for batch in batches] == [2, 2, 1]
 
 
-def test_shuffle_false_is_deterministic_across_iterations(ldbc_graph):
-    loader = _make_loader(
+def _epoch_signature(loader):
+    return [
+        (
+            batch.input_id.tolist(),
+            batch.n_id.tolist(),
+            batch.edge_index.tolist(),
+        )
+        for batch in loader
+    ]
+
+
+def test_rng_stream_is_deterministic_across_sessions_shuffle_false(ldbc_graph):
+    loader1 = _make_loader(
         ldbc_graph, input_nodes=[0, 1, 2, 3], features=["id"], batch_size=2, shuffle=False
     )
-    first_pass_first_batch = next(iter(loader))
-    second_pass_first_batch = next(iter(loader))
+    loader2 = _make_loader(
+        ldbc_graph, input_nodes=[0, 1, 2, 3], features=["id"], batch_size=2, shuffle=False
+    )
 
-    assert first_pass_first_batch.input_id.tolist() == second_pass_first_batch.input_id.tolist()
-    assert first_pass_first_batch.n_id[:2].tolist() == second_pass_first_batch.n_id[:2].tolist()
+    # Compare two epochs to ensure RNG progression is reproducible, not reset per epoch.
+    assert _epoch_signature(loader1) == _epoch_signature(loader2)
+    assert _epoch_signature(loader1) == _epoch_signature(loader2)
+
+
+def test_rng_stream_is_deterministic_across_sessions_shuffle_true(ldbc_graph):
+    loader1 = _make_loader(
+        ldbc_graph, input_nodes=[0, 1, 2, 3], features=["id"], batch_size=2, shuffle=True
+    )
+    loader2 = _make_loader(
+        ldbc_graph, input_nodes=[0, 1, 2, 3], features=["id"], batch_size=2, shuffle=True
+    )
+    assert _epoch_signature(loader1) == _epoch_signature(loader2)
 
 
 @pytest.mark.parametrize(
@@ -144,7 +174,8 @@ def test_feature_selection_sanity(ldbc_graph, features, expected_dim):
         ldbc_graph, input_nodes=[0, 1, 2], features=features, batch_size=2, shuffle=False
     )
     batch = next(iter(loader))
-    assert batch.x.size(1) == expected_dim
+    x, _ = _batch_tensors(batch)
+    assert x.size(1) == expected_dim
 
 
 def test_features_none_raises_on_non_numeric_properties(ldbc_graph):
@@ -175,7 +206,8 @@ def test_valid_batch_with_zero_fanout(ldbc_graph):
         shuffle=False,
     )
     batch = next(iter(loader))
+    _, edge_index = _batch_tensors(batch)
 
     assert batch.batch_size == 2
     assert batch.n_id.tolist() == [0, 1]
-    assert batch.edge_index.shape == (2, 0)
+    assert edge_index.shape == (2, 0)

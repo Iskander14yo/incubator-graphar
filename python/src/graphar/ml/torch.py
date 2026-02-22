@@ -193,7 +193,8 @@ class GARNeighborLoader(IterableDataset):
             else [str(name) for name in features]
         )
         _validate_numeric_features(graph_info, vertex_type, self.features)
-        self._epoch = 0
+        self._rng = torch.Generator()  # used for both dataset shuffling and sampling seeds
+        self._rng.manual_seed(int(torch.initial_seed()))
 
     def __len__(self) -> int:
         if not self._input_nodes:
@@ -205,7 +206,7 @@ class GARNeighborLoader(IterableDataset):
         if total == 0:
             return
         if self.shuffle:
-            order = torch.randperm(total).tolist()
+            order = torch.randperm(total, generator=self._rng).tolist()
             ordered_nodes = [self._input_nodes[i] for i in order]
         else:
             ordered_nodes = self._input_nodes
@@ -213,9 +214,9 @@ class GARNeighborLoader(IterableDataset):
             yield ordered_nodes[start : start + self.batch_size]
 
     def _sample_seed(self) -> int:
-        if self.shuffle:
-            return int(torch.initial_seed())
-        return self._epoch
+        return int(
+            torch.randint(2**32, (1,), generator=self._rng, dtype=torch.int64).item()
+        )
 
     def _build_batch(self, seed_nodes: list[int]) -> Data:
         seed = self._sample_seed()
@@ -273,9 +274,5 @@ class GARNeighborLoader(IterableDataset):
         return batch
 
     def __iter__(self) -> Iterator[Data]:
-        try:
-            for seed_nodes in self._iter_input_batches():
-                yield self._build_batch(seed_nodes)
-        finally:
-            if not self.shuffle:
-                self._epoch += 1
+        for seed_nodes in self._iter_input_batches():
+            yield self._build_batch(seed_nodes)
