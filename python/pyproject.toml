@@ -60,10 +60,11 @@ include = [
 test = ["pandas ~= 2.0", "typing_extensions ~= 4.0"]
 docs = ["pdoc"]
 ml = ["numpy", "torch", "torch-geometric"]
-ml-benchmark = [
-  "numpy",
-  "torch",
-  "torch-geometric",
+ml-benchmark = [  # in addition to [ml] section
+  "graphar[ml]",
+  "torch<2.6",  # to workaround weights_only logic used in ogb
+  "pyarrow",
+  "pyspark==3.5.1",
   "ogb",
   "neo4j",
   "psutil",
