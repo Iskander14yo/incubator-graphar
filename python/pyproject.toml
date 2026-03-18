@@ -60,6 +60,15 @@ include = [
 test = ["pandas ~= 2.0", "typing_extensions ~= 4.0"]
 docs = ["pdoc"]
 ml = ["numpy", "torch", "torch-geometric"]
+ml-benchmark = [
+  "numpy",
+  "torch",
+  "torch-geometric",
+  "ogb",
+  "neo4j",
+  "psutil",
+  "matplotlib",
+]
 
 [project.scripts]
 graphar = "cli.graphar_cli:main"
