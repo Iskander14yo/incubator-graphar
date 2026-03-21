@@ -12,4 +12,4 @@ if [[ -z "${VERSION}" ]]; then
   exit 1
 fi
 
-echo "maven-projects/spark/graphar/target/graphar-commons-${VERSION}.jar"
+echo "maven-projects/spark/graphar/target/graphar-commons-${VERSION}-shaded.jar"
