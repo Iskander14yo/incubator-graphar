@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
-import struct
 import zipfile
 from pathlib import Path
 
@@ -17,7 +15,7 @@ from pyspark.sql import SparkSession
 from graphar_pyspark import initialize
 from graphar_pyspark.enums import AdjListType, FileType, GarType
 from graphar_pyspark.info import AdjList, EdgeInfo, GraphInfo, Property, PropertyGroup, VertexInfo
-from graphar_pyspark.writer import EdgeWriter
+from graphar_pyspark.writer import EdgeWriter, VertexWriter
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +37,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--spark-master", default="local[*]")
     parser.add_argument("--spark-driver-memory", default="8g")
+    parser.add_argument(
+        "--vertex-write-batch-size",
+        type=int,
+        default=500_000,
+        help="Rows per parquet write batch for vertex staging file.",
+    )
     parser.add_argument(
         "--edge-write-batch-size",
         type=int,
@@ -77,56 +81,41 @@ def _compute_vertex_groups(feat_dim: int, max_dir_name_len: int = 240) -> list[l
     return groups
 
 
-def _write_vertex_chunks_direct(
-    output_dir: Path,
+def _write_vertex_parquet_flat(
+    path: Path,
     node_feat: np.ndarray,
     labels: np.ndarray,
-    vertex_chunk_size: int,
-    vertex_groups: list[list[str]],
+    batch_size: int,
 ) -> None:
-    """Write GAR vertex chunks directly from numpy, bypassing Spark.
-
-    Writes one parquet file per (property-group, chunk) pair.
-    Features are written in their native dtype (float32 for OGB datasets).
-    """
+    """Write all vertex columns to a single flat Parquet for Spark import."""
     num_nodes = node_feat.shape[0]
-    vertex_dir = output_dir / "vertex" / "node"
-    vertex_dir.mkdir(parents=True, exist_ok=True)
-    (vertex_dir / "vertex_count").write_bytes(struct.pack("<q", num_nodes))
-
-    num_chunks = math.ceil(num_nodes / vertex_chunk_size)
+    feat_dim = node_feat.shape[1]
     labels_1d = labels.reshape(-1)
 
-    for group in vertex_groups:
-        pg_dir = vertex_dir / "_".join(group)
-        pg_dir.mkdir(exist_ok=True)
+    col_names = ["_graphArVertexIndex", "id"] + [f"f{i:03d}" for i in range(feat_dim)] + ["label"]
+    schema = pa.schema(
+        [("_graphArVertexIndex", pa.int64()), ("id", pa.int64())]
+        + [(name, pa.float32()) for name in col_names[2:-1]]
+        + [("label", pa.int64())]
+    )
 
-        is_id = group == ["id"]
-        is_label = group == ["label"]
-        col_start = 0 if is_id or is_label else int(group[0][1:])
-        col_end = 0 if is_id or is_label else int(group[-1][1:])
+    if path.exists():
+        path.unlink()
 
-        for chunk_idx in range(num_chunks):
-            start = chunk_idx * vertex_chunk_size
-            end = min(start + vertex_chunk_size, num_nodes)
-            idx_arr = pa.array(np.arange(start, end, dtype=np.int64))
-
-            if is_id:
-                table = pa.table({"_graphArVertexIndex": idx_arr, "id": idx_arr})
-            elif is_label:
-                lbl = pa.array(labels_1d[start:end].astype(np.int64, copy=False))
-                table = pa.table({"_graphArVertexIndex": idx_arr, "label": lbl})
-            else:
-                # Transpose slice so each column is contiguous for fast arrow conversion.
-                feat_T = np.ascontiguousarray(node_feat[start:end, col_start:col_end + 1].T)
-                cols: dict = {"_graphArVertexIndex": idx_arr}
-                for local_i, name in enumerate(group):
-                    cols[name] = pa.array(feat_T[local_i])
-                table = pa.table(cols)
-
-            pq.write_table(table, pg_dir / f"chunk{chunk_idx}", compression="zstd")
-
-        print(f"  vertex group '{pg_dir.name}': {num_chunks} chunk(s)")
+    writer = pq.ParquetWriter(path, schema=schema)
+    try:
+        for start in range(0, num_nodes, batch_size):
+            end = min(start + batch_size, num_nodes)
+            idx = np.arange(start, end, dtype=np.int64)
+            feat_T = np.ascontiguousarray(node_feat[start:end].T)
+            arrays = (
+                [pa.array(idx), pa.array(idx)]
+                + [pa.array(feat_T[i]) for i in range(feat_dim)]
+                + [pa.array(labels_1d[start:end].astype(np.int64, copy=False))]
+            )
+            writer.write_table(pa.table(dict(zip(col_names, arrays)), schema=schema))
+    finally:
+        writer.close()
 
 
 def _write_edges_parquet_chunked(path: Path, edge_index: np.ndarray, batch_size: int) -> None:
@@ -190,7 +179,7 @@ def _build_graph_info(
     edge_chunk_size: int,
     file_type: FileType,
     version: str,
-) -> tuple[GraphInfo, EdgeInfo]:
+) -> tuple[GraphInfo, VertexInfo, EdgeInfo]:
     """Build GraphInfo with split vertex property groups and persist YAML info files."""
     property_groups = _make_vertex_property_groups(vertex_groups, file_type)
     vertex_info = VertexInfo.from_python(
@@ -233,7 +222,7 @@ def _build_graph_info(
     (output_dir / "node_edge_node.edge.yml").write_text(edge_info.dump())
     (output_dir / f"{dataset}.graph.yml").write_text(graph_info.dump())
 
-    return graph_info, edge_info
+    return graph_info, vertex_info, edge_info
 
 
 def _load_ogb_graph(dataset: str, root: str) -> tuple[dict, np.ndarray]:
@@ -285,19 +274,18 @@ def main() -> None:
 
     vertex_groups = _compute_vertex_groups(node_feat.shape[1])
 
-    print("Writing vertex chunks directly from numpy...")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    _write_vertex_chunks_direct(
-        output_dir=output_dir,
-        node_feat=node_feat,
-        labels=labels,
-        vertex_chunk_size=args.vertex_chunk_size,
-        vertex_groups=vertex_groups,
-    )
-
     tmp_dir = Path(args.tmp_root) / args.dataset
     tmp_dir.mkdir(parents=True, exist_ok=True)
+    vertices_parquet = tmp_dir / "vertices.parquet"
     edges_parquet = tmp_dir / "edges.parquet"
+
+    print("Writing vertex parquet for Spark import...")
+    _write_vertex_parquet_flat(
+        path=vertices_parquet,
+        node_feat=node_feat,
+        labels=labels,
+        batch_size=args.vertex_write_batch_size,
+    )
 
     print("Writing edge parquet for Spark import...")
     _write_edges_parquet_chunked(
@@ -321,8 +309,8 @@ def main() -> None:
     )
     initialize(spark)
 
-    print("Building edge adjacency lists via Spark...")
-    graph_info, edge_info = _build_graph_info(
+    output_dir.mkdir(parents=True, exist_ok=True)
+    graph_info, vertex_info, edge_info = _build_graph_info(
         output_dir=output_dir,
         dataset=args.dataset,
         vertex_groups=vertex_groups,
@@ -333,6 +321,18 @@ def main() -> None:
     )
 
     vertex_num = node_feat.shape[0]
+
+    print("Writing vertex chunks via Spark...")
+    vertices_df = spark.read.parquet(str(vertices_parquet))
+    vertex_writer = VertexWriter.from_python(
+        prefix=str(output_dir),
+        vertex_info=vertex_info,
+        vertex_df=vertices_df,
+        num_vertices=vertex_num,
+    )
+    vertex_writer.write_vertex_properties()
+
+    print("Building edge adjacency lists via Spark...")
     edges_df = (
         spark.read.parquet(str(edges_parquet))
         .withColumnRenamed("src_id", "_graphArSrcIndex")
