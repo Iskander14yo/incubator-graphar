@@ -20,4 +20,4 @@ echo "Download dataset: ${DATASET}"
 .venv/bin/python exps/scripts/01_download.py --dataset "${DATASET}"
 
 echo "Convert dataset to GAR: ${DATASET}"
-.venv/bin/python exps/scripts/02_convert_gar.py --dataset "${DATASET}" --spark-jar "${SPARK_JAR}"
+.venv/bin/python exps/scripts/02_convert_gar.py --dataset "${DATASET}"
