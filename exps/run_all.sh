@@ -23,10 +23,13 @@ echo "Convert dataset to GAR: ${DATASET}"
 .venv/bin/python exps/scripts/02_load_gar.py --dataset "${DATASET}"
 
 echo "Load dataset into Neo4j: ${DATASET}"
-.venv/bin/python exps/scripts/03_load_neo4j.py --dataset "${DATASET}" --force
+.venv/bin/python exps/scripts/03_load_neo4j.py --dataset "${DATASET}"
 
 echo "Create Neo4j index: ${DATASET}"
 bash exps/scripts/03b_neo4j_index.sh "${DATASET}"
+
+echo "Configure Neo4j"
+bash exps/scripts/03c_neo4j_conf.sh
 
 echo "Verify GAR and Neo4j: ${DATASET}"
 .venv/bin/python exps/scripts/04_verify_formats.py --dataset "${DATASET}"
