@@ -33,3 +33,9 @@ bash exps/scripts/03c_neo4j_conf.sh
 
 echo "Verify GAR and Neo4j: ${DATASET}"
 .venv/bin/python exps/scripts/04_verify_formats.py --dataset "${DATASET}"
+
+echo "Smoke test: GAR training loop"
+.venv/bin/python exps/scripts/05_smoke_train_gar.py --dataset "${DATASET}"
+
+echo "Smoke test: Neo4j loaders"
+.venv/bin/python exps/scripts/05_smoke_train_neo4j.py --dataset "${DATASET}"
