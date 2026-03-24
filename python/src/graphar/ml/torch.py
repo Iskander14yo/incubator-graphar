@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import struct
+import time
+from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
@@ -55,6 +57,27 @@ def _vertex_count(graph_info, vertex_type: str) -> int:
     if len(data) == 8:
         return int(struct.unpack("<q", data)[0])
     return int(data.decode("utf-8").strip())
+
+
+# _Timer lives here rather than in exps/benchmarks/ so GARNeighborLoader can use it
+# without importing library code from benchmark/experiment code (reversed dependency).
+# timings.py re-exports it so benchmark modules have a single import point.
+class _Timer:
+    """Context manager that appends elapsed seconds to store[name]."""
+
+    __slots__ = ("_name", "_store", "_t")
+
+    def __init__(self, name: str, store: dict) -> None:
+        self._name = name
+        self._store = store
+
+    def __enter__(self) -> _Timer:
+        self._t = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, *_) -> None:
+        if exc_type is None:
+            self._store[self._name].append(time.perf_counter() - self._t)
 
 
 def _is_numeric_type_name(type_name: str) -> bool:
@@ -195,6 +218,7 @@ class GARNeighborLoader(IterableDataset):
         _validate_numeric_features(graph_info, vertex_type, self.features)
         self._rng = torch.Generator()  # used for both dataset shuffling and sampling seeds
         self._rng.manual_seed(int(torch.initial_seed()))
+        self.timings: defaultdict = defaultdict(list)
 
     def __len__(self) -> int:
         if not self._input_nodes:
@@ -220,14 +244,16 @@ class GARNeighborLoader(IterableDataset):
 
     def _build_batch(self, seed_nodes: list[int]) -> Data:
         seed = self._sample_seed()
-        sampling = gar_ml.sample_neighbors(
-            self.graph_info,
-            self.vertex_type,
-            self.edge_type,
-            seed_nodes,
-            self.num_neighbors,
-            seed=seed,
-        )
+
+        with _Timer("sampling", self.timings):
+            sampling = gar_ml.sample_neighbors(
+                self.graph_info,
+                self.vertex_type,
+                self.edge_type,
+                seed_nodes,
+                self.num_neighbors,
+                seed=seed,
+            )
 
         sampled_nodes = [int(node) for node in sampling.sampled_nodes]
         n_id_list = _reorder_sampled_nodes(sampled_nodes, seed_nodes)  # TODO: need to do this in general, not only for seed_nodes
@@ -250,10 +276,12 @@ class GARNeighborLoader(IterableDataset):
             edge_index = torch.empty((2, 0), dtype=torch.long)
 
         if self.features:
-            feature_table = gar_ml.get_node_features(
-                self.graph_info, self.vertex_type, n_id_list, self.features
-            )
-            x = _table_to_feature_tensor(feature_table)
+            with _Timer("feature_fetch", self.timings):
+                feature_table = gar_ml.get_node_features(
+                    self.graph_info, self.vertex_type, n_id_list, self.features
+                )
+            with _Timer("conversion", self.timings):
+                x = _table_to_feature_tensor(feature_table)
         else:
             x = torch.empty((len(n_id_list), 0), dtype=torch.float32)
 
@@ -271,6 +299,7 @@ class GARNeighborLoader(IterableDataset):
         batch.num_sampled_edges = torch.tensor(num_sampled_edges, dtype=torch.long)  # TODO: why list? need to check
         batch.vertex_type = self.vertex_type
         batch.edge_type = self.edge_type
+
         return batch
 
     def __iter__(self) -> Iterator[Data]:
