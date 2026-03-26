@@ -240,9 +240,9 @@ class Neo4jNeighborLoader:
             )
 
         with self._driver.session(database=database) as s:
-            q = f"MATCH (n:{vertex_type}) RETURN n.id AS id ORDER BY id"  # noqa: S608
-            result = s.run(q)  # type: ignore[arg-type]
-            self._input_nodes = [int(r["id"]) for r in result]
+            q = f"MATCH (n:{vertex_type}) RETURN count(n) AS cnt"  # noqa: S608
+            cnt = s.run(q).single()["cnt"]  # type: ignore[index]
+            self._input_nodes = list(range(int(cnt)))
 
         # limit for global strategy: batch_size × ∏(num_neighbors)
         self._global_limit = batch_size * math.prod(num_neighbors)
