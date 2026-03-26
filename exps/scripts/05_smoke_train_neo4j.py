@@ -207,14 +207,13 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _make_loader(args: argparse.Namespace, strategy: Literal["global", "per_node"], train_nodes: list[int]) -> Neo4jNeighborLoader:
+def _make_loader(args: argparse.Namespace, strategy: Literal["global", "per_node"]) -> Neo4jNeighborLoader:
     return Neo4jNeighborLoader(
         uri=args.uri,
         database=args.database,
         vertex_type="node",
         edge_type="edge",
         num_neighbors=_NUM_NEIGHBORS,
-        input_nodes=train_nodes,
         batch_size=_BATCH_SIZE,
         shuffle=True,
         features=_FEATURES,
@@ -247,13 +246,11 @@ def main() -> None:
     _, labels_np = ogb[0]
     labels_all = torch.from_numpy(labels_np.squeeze()).long()
     num_classes = int(labels_all.max().item()) + 1
-    train_nodes = ogb.get_idx_split()["train"].tolist()[:500]
-
     results: dict[str, bool] = {}
 
     # ---------------------------------------------------------------- global
     print(f"\n[global — {_STEPS} steps]")
-    with _make_loader(args, "global", train_nodes) as loader:
+    with _make_loader(args, "global") as loader:
         gen = iter_batches(loader)
         ok_coverage = True
         feat_checked = False
@@ -273,7 +270,7 @@ def main() -> None:
 
     # --------------------------------------------------------------- per_node
     print(f"\n[per_node — {_STEPS} steps: fanout checks]")
-    with _make_loader(args, "per_node", train_nodes) as loader:
+    with _make_loader(args, "per_node") as loader:
         gen = iter_batches(loader)
         ok_coverage_pn = True
         ok_fanout = True
@@ -292,7 +289,7 @@ def main() -> None:
 
     # ------------------------------------------------------- convergence
     print(f"\n[per_node — convergence over {_STEPS} gradient steps]")
-    with _make_loader(args, "per_node", train_nodes) as loader:
+    with _make_loader(args, "per_node") as loader:
         results["convergence"] = _check_convergence(loader, labels_all, num_classes)
 
     # ---------------------------------------------------------------- summary

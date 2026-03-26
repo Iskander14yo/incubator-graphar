@@ -136,12 +136,6 @@ def _clear_caches() -> None:
     subprocess.run(["bash", str(script)], check=True)
 
 
-def _ogb_train_split(dataset: str, ogb_root: str) -> list[int]:
-    from ogb.nodeproppred import NodePropPredDataset
-    ds = NodePropPredDataset(name=dataset, root=ogb_root)
-    return ds.get_idx_split()["train"].tolist()
-
-
 # ---------------------------------------------------------------------------
 # Loader factories
 # ---------------------------------------------------------------------------

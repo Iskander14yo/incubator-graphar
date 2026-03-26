@@ -207,7 +207,6 @@ class Neo4jNeighborLoader:
         vertex_type: str,
         edge_type: str,
         num_neighbors: list[int],
-        input_nodes: list[int] | None = None,
         batch_size: int = 128,
         shuffle: bool = True,
         features: list[str] | None = None,
@@ -240,13 +239,10 @@ class Neo4jNeighborLoader:
                 vertex_type, edge_type, num_hops, self._features, profile=True
             )
 
-        if input_nodes is None:
-            with self._driver.session(database=database) as s:
-                q = f"MATCH (n:{vertex_type}) RETURN n.id AS id ORDER BY id"  # noqa: S608
-                result = s.run(q)  # type: ignore[arg-type]
-                self._input_nodes = [int(r["id"]) for r in result]
-        else:
-            self._input_nodes = list(input_nodes)
+        with self._driver.session(database=database) as s:
+            q = f"MATCH (n:{vertex_type}) RETURN n.id AS id ORDER BY id"  # noqa: S608
+            result = s.run(q)  # type: ignore[arg-type]
+            self._input_nodes = [int(r["id"]) for r in result]
 
         # limit for global strategy: batch_size × ∏(num_neighbors)
         self._global_limit = batch_size * math.prod(num_neighbors)

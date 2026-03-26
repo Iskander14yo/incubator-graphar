@@ -25,18 +25,15 @@ class PyGNeighborLoader:
         dataset_name: str,
         ogb_root: str,
         num_neighbors: list[int],
-        input_nodes: torch.Tensor | None = None,
         batch_size: int = 128,
         shuffle: bool = True,
     ) -> None:
         ogb = PygNodePropPredDataset(name=dataset_name, root=ogb_root)
         self._data = cast(Data, ogb[0])
-        if input_nodes is None:
-            input_nodes = ogb.get_idx_split()["train"]
         self._loader = NeighborLoader(
             self._data,
             num_neighbors=num_neighbors,
-            input_nodes=input_nodes,
+            input_nodes=None,
             batch_size=batch_size,
             shuffle=shuffle,
         )
