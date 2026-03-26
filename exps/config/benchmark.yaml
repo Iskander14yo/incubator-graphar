@@ -1,0 +1,24 @@
+dataset: ogbn-products
+loaders:
+  - gar
+  - neo4j-global
+  - neo4j-per-node
+  - pyg-inmem
+batch_size: 1024
+num_neighbors: [10, 5]   # 2-hop; matches paper's setup
+features: [feat]         # Neo4j property name for the feature array
+num_runs: 4              # 1 cold + 3 warm
+shuffle: false           # false for reproducibility; warm runs become stable
+seed: 42
+ogb_root: exps/datasets/ogb
+
+gar:
+  graph_path: exps/datasets/gar/ogbn-products/ogbn-products.graph.yml
+  vertex_type: node
+  edge_type: edge
+  num_features: 100      # expands to f000-f099
+
+neo4j:
+  uri: bolt://localhost:7687
+  database: neo4j        # Community Edition only supports the default 'neo4j' database
+  profile_every_n: 50    # run PROFILE on every 50th batch; null to disable
