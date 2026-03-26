@@ -88,6 +88,18 @@ pip install --upgrade pip poetry
 (cd pyspark; poetry build; pip install dist/graphar_pyspark-0.0.1.tar.gz)
 pip install -e "./python[ml-benchmark]"
 
+# torch-sparse is required by PyG's NeighborLoader; pick CPU or CUDA wheel
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+  TORCH_CUDA_TAG="cu$(nvidia-smi --query-gpu=driver_model.current --format=csv,noheader 2>/dev/null | head -1 || echo '')"
+  TORCH_VERSION=$(python -c "import torch; v=torch.__version__; print(v.split('+')[0])")
+  CUDA_VERSION=$(python -c "import torch; cv=torch.version.cuda; print('cu'+''.join(cv.split('.')))" 2>/dev/null || echo "cpu")
+  PYG_TORCH_TAG="torch-${TORCH_VERSION}+${CUDA_VERSION}"
+else
+  TORCH_VERSION=$(python -c "import torch; print(torch.__version__.split('+')[0])")
+  PYG_TORCH_TAG="torch-${TORCH_VERSION}+cpu"
+fi
+pip install torch-scatter torch-sparse -f "https://data.pyg.org/whl/${PYG_TORCH_TAG}.html"
+
 install_neo4j_if_missing
 install_java_maven_if_missing
 build_graphar_spark_if_missing
