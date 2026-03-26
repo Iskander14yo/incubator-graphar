@@ -18,3 +18,10 @@ class BatchTimings:
     feature_fetch_ms: float | None = field(default=None)
     # Neo4j-specific (None for other loaders; populated every profile_every_n batches)
     neo4j_profile: dict | None = field(default=None)
+
+@dataclass
+class SystemSample:
+    timestamp_ms: int       # ms since epoch start
+    cpu_pct: float          # process CPU %
+    rss_mb: float           # process RSS
+    disk_read_mb_s: float   # system-wide disk read throughput

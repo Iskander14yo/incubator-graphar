@@ -39,3 +39,6 @@ echo "Smoke test: GAR training loop"
 
 echo "Smoke test: Neo4j loaders"
 .venv/bin/python exps/scripts/05_smoke_train_neo4j.py --dataset "${DATASET}"
+
+echo "Run benchmark"
+.venv/bin/python exps/scripts/04_run_benchmark.py --config exps/config/benchmark.yaml
