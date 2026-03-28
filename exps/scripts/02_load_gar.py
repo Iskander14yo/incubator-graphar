@@ -222,15 +222,8 @@ def _load_ogb_graph(dataset: str, root: str) -> tuple[dict, np.ndarray]:
         return graph, np.asarray(labels_raw)
 
 
-def convert_ogb_to_gar(
-    config: BenchmarkConfig,
-    *,
-    tmp_root: str,
-    vertex_chunk_size: int,
-    edge_chunk_size: int,
-    vertex_write_batch_size: int,
-    edge_write_batch_size: int,
-) -> None:
+def convert_ogb_to_gar(config: BenchmarkConfig) -> None:
+    g = config.gar
     dataset = config.dataset
     ogb_root = config.ogb_root
     output_root = config.gar_root
@@ -250,7 +243,7 @@ def convert_ogb_to_gar(
 
     vertex_groups = _compute_vertex_groups(node_feat.shape[1])
 
-    tmp_dir = Path(tmp_root) / dataset
+    tmp_dir = Path(g.tmp_root) / dataset
     tmp_dir.mkdir(parents=True, exist_ok=True)
     vertices_parquet = tmp_dir / "vertices.parquet"
     edges_parquet = tmp_dir / "edges.parquet"
@@ -260,14 +253,14 @@ def convert_ogb_to_gar(
         path=vertices_parquet,
         node_feat=node_feat,
         labels=labels,
-        batch_size=vertex_write_batch_size,
+        batch_size=g.vertex_write_batch_size,
     )
 
     print("Writing edge parquet for import...")
     _write_edges_parquet_chunked(
         path=edges_parquet,
         edge_index=edge_index,
-        batch_size=edge_write_batch_size,
+        batch_size=g.edge_write_batch_size,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -277,8 +270,8 @@ def convert_ogb_to_gar(
         output_dir=output_dir,
         dataset=dataset,
         vertex_groups=vertex_groups,
-        vertex_chunk_size=vertex_chunk_size,
-        edge_chunk_size=edge_chunk_size,
+        vertex_chunk_size=g.vertex_chunk_size,
+        edge_chunk_size=g.edge_chunk_size,
         vertices_parquet=vertices_parquet,
         edges_parquet=edges_parquet,
     )
@@ -299,20 +292,7 @@ def convert_ogb_to_gar(
 def main() -> None:
     p = argparse.ArgumentParser(description="Convert OGB dataset into GAR format.")
     p.add_argument("--config", type=Path, default=DEFAULT_PATH, help="Benchmark YAML.")
-    p.add_argument("--tmp-root", default="exps/datasets/tmp/gar_import")
-    p.add_argument("--vertex-chunk-size", type=int, default=1_000_000)
-    p.add_argument("--edge-chunk-size", type=int, default=10_000_000)
-    p.add_argument("--vertex-write-batch-size", type=int, default=500_000)
-    p.add_argument("--edge-write-batch-size", type=int, default=5_000_000)
-    ns = p.parse_args()
-    convert_ogb_to_gar(
-        load_config(ns.config),
-        tmp_root=ns.tmp_root,
-        vertex_chunk_size=ns.vertex_chunk_size,
-        edge_chunk_size=ns.edge_chunk_size,
-        vertex_write_batch_size=ns.vertex_write_batch_size,
-        edge_write_batch_size=ns.edge_write_batch_size,
-    )
+    convert_ogb_to_gar(load_config(p.parse_args().config))
 
 
 if __name__ == "__main__":

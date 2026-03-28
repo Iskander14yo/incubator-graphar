@@ -17,6 +17,11 @@ class GarSection:
     vertex_type: str
     edge_type: str
     num_features: int
+    tmp_root: str
+    vertex_chunk_size: int
+    edge_chunk_size: int
+    vertex_write_batch_size: int
+    edge_write_batch_size: int
 
 
 @dataclass(frozen=True)
@@ -24,6 +29,11 @@ class Neo4jSection:
     uri: str
     database: str
     profile_every_n: int | None
+    csv_root: str
+    skip_import: bool
+    node_batch_size: int
+    edge_batch_size: int
+    force: bool
 
 
 @dataclass(frozen=True)

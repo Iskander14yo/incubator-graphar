@@ -1,8 +1,8 @@
 dataset: ogbn-products
 loaders:
-  # - gar
-  # - neo4j-global
-  # - neo4j-per-node
+  - gar
+  - neo4j-global
+  - neo4j-per-node
   - pyg-inmem
 batch_size: 1024
 num_neighbors: [10, 5]   # 2-hop; matches paper's setup
@@ -17,8 +17,18 @@ gar:
   vertex_type: node
   edge_type: edge
   num_features: 1      # expands to f000-f099
+  tmp_root: exps/datasets/tmp/gar_import
+  vertex_chunk_size: 1000000
+  edge_chunk_size: 10000000
+  vertex_write_batch_size: 500000
+  edge_write_batch_size: 5000000
 
 neo4j:
   uri: bolt://localhost:7687
   database: neo4j        # Community Edition only supports the default 'neo4j' database
   profile_every_n: 50    # run PROFILE on every 50th batch; null to disable
+  csv_root: exps/datasets/neo4j_csv
+  skip_import: false
+  node_batch_size: 50000
+  edge_batch_size: 5000000
+  force: false
