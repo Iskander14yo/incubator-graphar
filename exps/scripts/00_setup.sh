@@ -86,6 +86,8 @@ fi
 source .venv/bin/activate
 pip install --upgrade pip poetry
 (cd pyspark; poetry build; pip install dist/graphar_pyspark-0.0.1.tar.gz)
+
+export CXXFLAGS="-g -fno-omit-frame-pointer"  # for perf
 pip install -e "./python[ml-benchmark]"
 
 # torch-sparse is required by PyG's NeighborLoader; pick CPU or CUDA wheel
@@ -103,6 +105,9 @@ pip install torch-scatter torch-sparse -f "https://data.pyg.org/whl/${PYG_TORCH_
 install_neo4j_if_missing
 install_java_maven_if_missing
 build_graphar_spark_if_missing
+
+# install kernel symbols (for perf and flamegraph)
+sudo apt install linux-tools-common linux-tools-generic linux-tools-$(uname -r) libc6-dbg -y
 
 if ! command -v neo4j >/dev/null 2>&1 || ! command -v neo4j-admin >/dev/null 2>&1; then
   echo "Neo4j installation failed or binaries are not in PATH."
