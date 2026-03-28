@@ -9,7 +9,8 @@
 #include "arrow/api.h"
 #include "graphar/arrow/chunk_reader.h"
 #include "graphar/graph_info.h"
-#include "graphar/high-level/graph_reader.h"
+#include "graphar/result.h"
+#include "graphar/types.h"
 
 namespace graphar::ml {
 
@@ -18,67 +19,87 @@ Result<SamplingResult> SampleNeighbors(
     const std::string& vertex_type, const std::string& edge_type,
     const std::vector<IdType>& seed_nodes, const std::vector<int>& fanout,
     uint64_t seed) {
-  // Validate inputs
-  if (seed_nodes.empty()) {
-    return SamplingResult{};
-  }
-  if (fanout.empty()) {
-    return Status::Invalid("Fanout cannot be empty");
-  }
+  if (seed_nodes.empty()) return SamplingResult{};
+  if (fanout.empty()) return Status::Invalid("Fanout cannot be empty");
 
-  // Get edge info for the specified types
   auto edge_info = graph_info->GetEdgeInfo(vertex_type, edge_type, vertex_type);
   if (!edge_info) {
-    return Status::Invalid("Edge type '", edge_type, "' not found for vertex type '",
-                          vertex_type, "'");
+    return Status::Invalid("Edge type '", edge_type,
+                           "' not found for vertex type '", vertex_type, "'");
   }
-
-  // Check if CSR layout is available
   if (!edge_info->HasAdjacentListType(AdjListType::ordered_by_source)) {
     return Status::Invalid(
-        "CSR layout (ordered_by_source) not available for edge type '", edge_type,
-        "'");
+        "CSR layout (ordered_by_source) not available for edge type '",
+        edge_type, "'");
   }
 
-  // Create EdgesCollection with CSR layout
-  auto edges_collection_result = EdgesCollection::Make(
-      graph_info, vertex_type, edge_type, vertex_type,
-      AdjListType::ordered_by_source);
-  GAR_RETURN_NOT_OK(edges_collection_result.status());
-  auto edges_collection = edges_collection_result.value();
+  const std::string& prefix = graph_info->GetPrefix();
+  const auto adj_type = AdjListType::ordered_by_source;
+  const IdType src_chunk_size = edge_info->GetSrcChunkSize();
 
-  // Track all sampled nodes and edges
+  // Persistent readers — chunk caches survive across seeks within the same chunk,
+  // unlike EdgesCollection/EdgeIter which re-create readers per source node.
+  AdjListOffsetArrowChunkReader offset_reader(edge_info, adj_type, prefix);
+  AdjListArrowChunkReader adj_reader(edge_info, adj_type, prefix);
+
   std::unordered_set<IdType> all_sampled_nodes_set(seed_nodes.begin(),
-                                                     seed_nodes.end());
-  std::vector<std::pair<IdType, IdType>> edge_list;  // (src, dst) pairs
-
-  // Current frontier starts with seed nodes
+                                                   seed_nodes.end());
+  std::vector<std::pair<IdType, IdType>> edge_list;
   std::vector<IdType> current_frontier = seed_nodes;
-
-  // Random number generator for deterministic sampling
   std::mt19937 gen(seed);
 
-  // Process each hop
   for (size_t hop = 0; hop < fanout.size(); ++hop) {
     int max_neighbors = fanout[hop];
     std::vector<IdType> next_frontier;
 
-    // For each node in current frontier
-    for (IdType src_node : current_frontier) {
-      // Find edges starting from this node
-      auto edge_iter = edges_collection->find_src(src_node, edges_collection->begin());
-      
-      // Collect all neighbors
-      std::vector<IdType> neighbors;
-      while (edge_iter != edges_collection->end() && 
-             edge_iter.source() == src_node) {
-        IdType dst_node = edge_iter.destination();
-        neighbors.push_back(dst_node);
-        ++edge_iter;
+    // Sort frontier for sequential chunk access — maximizes Parquet cache hits
+    std::vector<IdType> sorted_frontier = current_frontier;
+    std::sort(sorted_frontier.begin(), sorted_frontier.end());
+
+    IdType prev_vertex_chunk = -1;
+
+    for (IdType src_node : sorted_frontier) {
+      IdType vertex_chunk_idx = src_node / src_chunk_size;
+
+      if (vertex_chunk_idx != prev_vertex_chunk) {
+        GAR_RETURN_NOT_OK(adj_reader.seek_chunk_index(vertex_chunk_idx));
+        prev_vertex_chunk = vertex_chunk_idx;
       }
 
-      // Sample up to max_neighbors
-      if (neighbors.size() > static_cast<size_t>(max_neighbors)) {
+      // Read edge range from CSR offset array (cached per vertex chunk)
+      GAR_RETURN_NOT_OK(offset_reader.seek(src_node));
+      GAR_ASSIGN_OR_RAISE(auto offset_arr, offset_reader.GetChunk());
+      auto offsets = std::static_pointer_cast<arrow::Int64Array>(offset_arr);
+      if (offsets->length() < 2) continue;
+
+      IdType begin_off = offsets->Value(0);
+      IdType end_off = offsets->Value(1);
+      if (begin_off >= end_off) continue;
+
+      // Extract destination IDs directly from Arrow arrays — no per-edge
+      // seek/GetChunk/Slice like EdgeIter::destination() does.
+      std::vector<IdType> neighbors;
+      IdType total_edges = end_off - begin_off;
+      neighbors.reserve(total_edges);
+
+      IdType remaining = total_edges;
+      IdType cur_off = begin_off;
+
+      while (remaining > 0) {
+        GAR_RETURN_NOT_OK(adj_reader.seek(cur_off));
+        GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
+        if (!chunk_table) break;
+
+        auto dst_col = std::static_pointer_cast<arrow::Int64Array>(
+            chunk_table->column(1)->chunk(0));
+        IdType batch = std::min(remaining, static_cast<IdType>(dst_col->length()));
+        const int64_t* raw = dst_col->raw_values();
+        neighbors.insert(neighbors.end(), raw, raw + batch);
+        remaining -= batch;
+        cur_off += batch;
+      }
+
+      if (static_cast<int>(neighbors.size()) > max_neighbors) {
         std::shuffle(neighbors.begin(), neighbors.end(), gen);
         neighbors.resize(max_neighbors);
       }
