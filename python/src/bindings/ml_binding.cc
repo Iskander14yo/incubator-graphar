@@ -79,8 +79,11 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
          const std::string& edge_type,
          const std::vector<graphar::IdType>& seed_nodes,
          const std::vector<int>& fanout, uint64_t seed) {
-        auto result = graphar::ml::SampleNeighbors(
-            graph_info, vertex_type, edge_type, seed_nodes, fanout, seed);
+        auto result = [&]() {
+          py::gil_scoped_release release; // release GIL
+          return graphar::ml::SampleNeighbors(
+              graph_info, vertex_type, edge_type, seed_nodes, fanout, seed);
+        }();
         return ThrowOrReturn(result);
       },
       py::arg("graph_info"),
@@ -97,8 +100,11 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
          const std::string& vertex_type,
          const std::vector<graphar::IdType>& node_ids,
          const std::vector<std::string>& properties) {
-        auto result = graphar::ml::GetNodeFeatures(
-            graph_info, vertex_type, node_ids, properties);
+        auto result = [&]() {
+          py::gil_scoped_release release; // release GIL
+          return graphar::ml::GetNodeFeatures(
+              graph_info, vertex_type, node_ids, properties);
+        }();
         auto table = ThrowOrReturn(result);
         return table_to_pyarrow(table);
       },
