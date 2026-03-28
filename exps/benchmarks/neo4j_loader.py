@@ -275,7 +275,7 @@ class Neo4jNeighborLoader:
         with _Timer("retrieval", self.timings):
             with self._driver.session(database=self._database) as session:
                 result = session.run(query, params)  # type: ignore[arg-type]
-                rows = [dict(r) for r in result]
+                raw_rows = list(result)  # drain cursor; data transfer happens here
                 profile_data = None
                 if use_profile:
                     summary = result.consume()
@@ -283,6 +283,7 @@ class Neo4jNeighborLoader:
                         profile_data = _extract_profile(summary.profile)
 
         with _Timer("conversion", self.timings):
+            rows = [dict(r) for r in raw_rows]
             data = _rows_to_data(rows, num_hops, self._features, seed_nodes)
 
         return data, profile_data
