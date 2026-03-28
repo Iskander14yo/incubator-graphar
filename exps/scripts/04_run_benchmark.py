@@ -131,9 +131,32 @@ def _git_sha() -> str:
         return "unknown"
 
 
-def _clear_caches() -> None:
-    script = Path(__file__).parent / "clear_caches.sh"
-    subprocess.run(["bash", str(script)], check=True)
+def _drop_os_cache() -> None:
+    """Drop OS page cache only — safe to call for any loader."""
+    subprocess.run(
+        ["sudo", "sh", "-c", "sync && echo 3 > /proc/sys/vm/drop_caches"], check=True
+    )
+
+
+def _restart_neo4j() -> None:
+    """Flush Neo4j page cache by restarting the service."""
+    subprocess.run(["sudo", "neo4j", "stop"], check=True)
+    subprocess.run(["sudo", "neo4j", "start"], check=True)
+    # wait until bolt is ready
+    for _ in range(60):
+        result = subprocess.run(
+            ["neo4j", "status"], capture_output=True, text=True, check=False
+        )
+        if "Neo4j is running" in result.stdout:
+            break
+        time.sleep(1)
+
+
+def _clear_caches(loader_name: str) -> None:
+    """Drop OS page cache; also restart Neo4j when running a Neo4j loader."""
+    _drop_os_cache()
+    if loader_name.startswith("neo4j"):
+        _restart_neo4j()
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +242,7 @@ def _run_loader(
 
         if run_type == "cold":
             try:
-                _clear_caches()
+                _clear_caches(loader_name)
             except Exception as e:
                 print(f"  WARNING: cache clear failed: {e}", flush=True)
 
