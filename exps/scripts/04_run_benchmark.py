@@ -285,17 +285,14 @@ def run_benchmark(config: BenchmarkConfig) -> None:
     result_dir.mkdir(parents=True, exist_ok=True)
 
     sha = _git_sha()
+    cfg_dump = dataclasses.asdict(config)
+    cfg_dump["gar_root"] = config.gar_root
     run_info = {
         "timestamp": timestamp,
         "git_sha": sha,
-        "dataset": dataset,
-        "batch_size": config.batch_size,
-        "num_neighbors": config.num_neighbors,
-        "seed": seed,
-        "num_runs": num_runs,
-        "shuffle": config.shuffle,
         "hardware": _hardware_info(),
         "notes": "",
+        "config": cfg_dump,
     }
     (result_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
     print(f"Results dir: {result_dir}")
