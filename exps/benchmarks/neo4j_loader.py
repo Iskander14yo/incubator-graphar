@@ -288,6 +288,11 @@ class Neo4jNeighborLoader:
 
         return data, profile_data
 
+    def __len__(self) -> int:
+        if not self._input_nodes:
+            return 0
+        return (len(self._input_nodes) + self._batch_size - 1) // self._batch_size
+
     def close(self) -> None:
         self._driver.close()
 

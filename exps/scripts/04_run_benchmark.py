@@ -17,6 +17,7 @@ import psutil
 import pyarrow  # noqa: F401 - must precede graphar C extension
 import torch
 import yaml
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))  # exps/ → enables `from benchmarks.xxx`
 
@@ -212,12 +213,15 @@ def _make_pyg_loader(cfg: dict) -> PyGNeighborLoader:
 # ---------------------------------------------------------------------------
 
 def _run_epoch(
-    loader, iter_fn, monitor: _SystemMonitor
+    loader, iter_fn, monitor: _SystemMonitor, desc: str
 ) -> tuple[list[BatchTimings], list[SystemSample]]:
+    total = len(loader) # if hasattr(loader, "__len__") else None
     monitor.start()
     batch_timings: list[BatchTimings] = []
-    for _batch, bt in iter_fn(loader):
-        batch_timings.append(bt)
+    with tqdm(iter_fn(loader), total=total, desc=desc, unit="batch", leave=False) as pbar:
+        for _batch, bt in pbar:
+            batch_timings.append(bt)
+            pbar.set_postfix({"ms": f"{bt.total_ms:.0f}"})
     system_samples = monitor.stop()
     return batch_timings, system_samples
 
@@ -246,7 +250,7 @@ def _run_loader(
             except Exception as e:
                 print(f"  WARNING: cache clear failed: {e}", flush=True)
 
-        batch_timings, system_samples = _run_epoch(loader, iter_fn, monitor)
+        batch_timings, system_samples = _run_epoch(loader, iter_fn, monitor, desc=f"{loader_name}/{run_type}")
         mean_ms = (
             sum(bt.total_ms for bt in batch_timings) / len(batch_timings)
             if batch_timings else 0.0

@@ -69,6 +69,7 @@ ml-benchmark = [  # in addition to [ml] section
   "neo4j",
   "psutil",
   "matplotlib",
+  "tqdm",
 ]
 
 [project.scripts]
