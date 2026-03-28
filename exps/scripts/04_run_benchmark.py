@@ -16,10 +16,11 @@ from pathlib import Path
 import psutil
 import pyarrow  # noqa: F401 - must precede graphar C extension
 import torch
-import yaml
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))  # exps/ → enables `from benchmarks.xxx`
+sys.path.insert(0, str(Path(__file__).parent))
+from benchmark_yaml import DEFAULT_PATH, BenchmarkConfig, load_config  # noqa: E402
 
 import graphar as gar
 from benchmarks.gar_loader import iter_batches as _gar_iter
@@ -164,47 +165,45 @@ def _clear_caches(loader_name: str) -> None:
 # Loader factories
 # ---------------------------------------------------------------------------
 
-def _make_gar_loader(cfg: dict) -> GARNeighborLoader:
-    gar_cfg = cfg["gar"]
-    graph_info = gar.GraphInfo.load(str(Path(gar_cfg["graph_path"]).resolve()))
-    num_features = gar_cfg.get("num_features", 100)
-    features = [f"f{i:03d}" for i in range(num_features)]
+def _make_gar_loader(config: BenchmarkConfig) -> GARNeighborLoader:
+    g = config.gar
+    graph_info = gar.GraphInfo.load(str(Path(g.graph_path).resolve()))
+    features = [f"f{i:03d}" for i in range(g.num_features)]
     return GARNeighborLoader(
         graph_info,
-        vertex_type=gar_cfg["vertex_type"],
-        edge_type=gar_cfg["edge_type"],
-        num_neighbors=cfg["num_neighbors"],
-        batch_size=cfg["batch_size"],
-        shuffle=cfg.get("shuffle", False),
+        vertex_type=g.vertex_type,
+        edge_type=g.edge_type,
+        num_neighbors=config.num_neighbors,
+        batch_size=config.batch_size,
+        shuffle=config.shuffle,
         features=features,
     )
 
 
-def _make_neo4j_loader(cfg: dict, loader_name: str) -> Neo4jNeighborLoader:
-    neo4j_cfg = cfg["neo4j"]
+def _make_neo4j_loader(config: BenchmarkConfig, loader_name: str) -> Neo4jNeighborLoader:
+    n = config.neo4j
     strategy = "global" if loader_name == "neo4j-global" else "per_node"
     return Neo4jNeighborLoader(
-        uri=neo4j_cfg["uri"],
-        database=neo4j_cfg["database"],
+        uri=n.uri,
+        database=n.database,
         vertex_type="node",
         edge_type="edge",
-        num_neighbors=cfg["num_neighbors"],
-        batch_size=cfg["batch_size"],
-        shuffle=cfg.get("shuffle", False),
-        features=cfg.get("features", ["feat"]),
-        profile_every_n=neo4j_cfg.get("profile_every_n", 50),
+        num_neighbors=config.num_neighbors,
+        batch_size=config.batch_size,
+        shuffle=config.shuffle,
+        features=config.features,
+        profile_every_n=n.profile_every_n,
         strategy=strategy,
     )
 
 
-def _make_pyg_loader(cfg: dict) -> PyGNeighborLoader:
+def _make_pyg_loader(config: BenchmarkConfig) -> PyGNeighborLoader:
     return PyGNeighborLoader(
-        dataset_name=cfg["dataset"],
-        ogb_root=cfg.get("ogb_root", "exps/datasets/ogb"),
-        num_neighbors=cfg["num_neighbors"],
-        # input_nodes=torch.tensor(train_nodes, dtype=torch.long),
-        batch_size=cfg["batch_size"],
-        shuffle=cfg.get("shuffle", False),
+        dataset_name=config.dataset,
+        ogb_root=config.ogb_root,
+        num_neighbors=config.num_neighbors,
+        batch_size=config.batch_size,
+        shuffle=config.shuffle,
     )
 
 
@@ -273,18 +272,11 @@ def _run_loader(
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="exps/config/benchmark.yaml")
-    args = parser.parse_args()
-
-    cfg = yaml.safe_load(Path(args.config).read_text())
-
-    loaders_to_run = cfg["loaders"]
-    num_runs = cfg["num_runs"]
-    dataset = cfg["dataset"]
-    ogb_root = cfg["ogb_root"]
-    seed = cfg["seed"]
+def run_benchmark(config: BenchmarkConfig) -> None:
+    loaders_to_run = config.loaders
+    num_runs = config.num_runs
+    dataset = config.dataset
+    seed = config.seed
 
     torch.manual_seed(seed)
 
@@ -297,11 +289,11 @@ def main() -> None:
         "timestamp": timestamp,
         "git_sha": sha,
         "dataset": dataset,
-        "batch_size": cfg["batch_size"],
-        "num_neighbors": cfg["num_neighbors"],
+        "batch_size": config.batch_size,
+        "num_neighbors": config.num_neighbors,
         "seed": seed,
         "num_runs": num_runs,
-        "shuffle": cfg.get("shuffle", False),
+        "shuffle": config.shuffle,
         "hardware": _hardware_info(),
         "notes": "",
     }
@@ -313,13 +305,13 @@ def main() -> None:
         loader = None
         try:
             if loader_name == "gar":
-                loader = _make_gar_loader(cfg)
+                loader = _make_gar_loader(config)
                 iter_fn = _gar_iter
             elif loader_name in ("neo4j-global", "neo4j-per-node"):
-                loader = _make_neo4j_loader(cfg, loader_name)
+                loader = _make_neo4j_loader(config, loader_name)
                 iter_fn = _neo4j_iter
             elif loader_name == "pyg-inmem":
-                loader = _make_pyg_loader(cfg)
+                loader = _make_pyg_loader(config)
                 iter_fn = _pyg_iter
             else:
                 print(f"  Unknown loader '{loader_name}', skipping.")
@@ -344,6 +336,12 @@ def main() -> None:
         }) + "\n")
 
     print(f"\nDone.")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--config", type=Path, default=DEFAULT_PATH, help="Benchmark YAML.")
+    run_benchmark(load_config(p.parse_args().config))
 
 
 if __name__ == "__main__":

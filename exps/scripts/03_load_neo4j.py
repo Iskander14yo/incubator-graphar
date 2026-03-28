@@ -5,36 +5,16 @@ from __future__ import annotations
 import argparse
 import io
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 from ogb.nodeproppred import NodePropPredDataset
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Load OGB dataset into Neo4j via CSV bulk import.")
-    parser.add_argument("--dataset", default="ogbn-products")
-    parser.add_argument("--ogb-root", default="exps/datasets/ogb")
-    parser.add_argument("--csv-root", default="exps/datasets/neo4j_csv")
-    parser.add_argument(
-        "--db-name",
-        default="neo4j",
-        help="Neo4j database name (default: 'neo4j'; Community Edition only supports one user database).",
-    )
-    parser.add_argument(
-        "--skip-import",
-        action="store_true",
-        help="Generate CSVs only, skip neo4j-admin import.",
-    )
-    parser.add_argument("--node-batch-size", type=int, default=50_000)
-    parser.add_argument("--edge-batch-size", type=int, default=5_000_000)
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Delete existing CSVs and sentinel, then redo CSV generation and import.",
-    )
-    return parser.parse_args()
+_SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPTS))
+from benchmark_yaml import DEFAULT_PATH, BenchmarkConfig, load_config  # noqa: E402
 
 
 def _write_nodes_csv(
@@ -166,15 +146,23 @@ def _run_import(db_name: str, nodes_csv: Path, rels_csv: Path) -> None:
     _wait_for_neo4j()
 
 
-def main() -> None:
-    args = parse_args()
-    db_name = args.db_name
-
-    csv_dir = Path(args.csv_root) / args.dataset
+def import_ogb_to_neo4j(
+    config: BenchmarkConfig,
+    *,
+    csv_root: str,
+    skip_import: bool,
+    node_batch_size: int,
+    edge_batch_size: int,
+    force: bool,
+) -> None:
+    dataset = config.dataset
+    ogb_root = config.ogb_root
+    db_name = config.neo4j.database
+    csv_dir = Path(csv_root) / dataset
     nodes_csv = csv_dir / "nodes.csv"
     rels_csv = csv_dir / "relationships.csv"
 
-    if args.force:
+    if force:
         for f in (nodes_csv, rels_csv, _import_sentinel(csv_dir)):
             f.unlink(missing_ok=True)
         print("--force: cleared CSVs and import sentinel.")
@@ -182,8 +170,8 @@ def main() -> None:
     if nodes_csv.exists() and rels_csv.exists():
         print(f"CSVs already exist at {csv_dir}, skipping CSV generation.")
     else:
-        print(f"Loading OGB dataset '{args.dataset}'...")
-        ogb = NodePropPredDataset(name=args.dataset, root=args.ogb_root)
+        print(f"Loading OGB dataset '{dataset}'...")
+        ogb = NodePropPredDataset(name=dataset, root=ogb_root)
         graph, labels_raw = ogb[0]
         node_feat: np.ndarray = graph["node_feat"]
         edge_index: np.ndarray = graph["edge_index"]
@@ -191,11 +179,11 @@ def main() -> None:
 
         csv_dir.mkdir(parents=True, exist_ok=True)
         print("Writing nodes CSV (this may take several minutes)...")
-        _write_nodes_csv(nodes_csv, node_feat, labels, args.node_batch_size)
+        _write_nodes_csv(nodes_csv, node_feat, labels, node_batch_size)
         print("Writing relationships CSV...")
-        _write_relationships_csv(rels_csv, edge_index, args.edge_batch_size)
+        _write_relationships_csv(rels_csv, edge_index, edge_batch_size)
 
-    if args.skip_import:
+    if skip_import:
         print("Skipping neo4j-admin import (--skip-import).")
         return
 
@@ -205,7 +193,26 @@ def main() -> None:
 
     _run_import(db_name, nodes_csv, rels_csv)
     _import_sentinel(csv_dir).touch()
-    print(f"Imported '{args.dataset}' into Neo4j database '{db_name}'.")
+    print(f"Imported '{dataset}' into Neo4j database '{db_name}'.")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Load OGB dataset into Neo4j via CSV bulk import.")
+    p.add_argument("--config", type=Path, default=DEFAULT_PATH, help="Benchmark YAML.")
+    p.add_argument("--csv-root", default="exps/datasets/neo4j_csv")
+    p.add_argument("--skip-import", action="store_true")
+    p.add_argument("--node-batch-size", type=int, default=50_000)
+    p.add_argument("--edge-batch-size", type=int, default=5_000_000)
+    p.add_argument("--force", action="store_true")
+    ns = p.parse_args()
+    import_ogb_to_neo4j(
+        load_config(ns.config),
+        csv_root=ns.csv_root,
+        skip_import=ns.skip_import,
+        node_batch_size=ns.node_batch_size,
+        edge_batch_size=ns.edge_batch_size,
+        force=ns.force,
+    )
 
 
 if __name__ == "__main__":

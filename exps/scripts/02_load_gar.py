@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import zipfile
 from pathlib import Path
 
@@ -25,32 +26,9 @@ from graphar.importer.config import (
 )
 from graphar.importer.importer import validate
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert OGB dataset into GAR format.")
-    parser.add_argument("--dataset", default="ogbn-products", help="OGB dataset name.")
-    parser.add_argument("--ogb-root", default="exps/datasets/ogb", help="Path to OGB cache root.")
-    parser.add_argument("--output-root", default="exps/datasets/gar", help="Path to GAR output root.")
-    parser.add_argument(
-        "--tmp-root",
-        default="exps/datasets/tmp/gar_import",
-        help="Path to temporary import artifacts.",
-    )
-    parser.add_argument("--vertex-chunk-size", type=int, default=1_000_000)
-    parser.add_argument("--edge-chunk-size", type=int, default=10_000_000)
-    parser.add_argument(
-        "--vertex-write-batch-size",
-        type=int,
-        default=500_000,
-        help="Rows per parquet write batch for vertex staging file.",
-    )
-    parser.add_argument(
-        "--edge-write-batch-size",
-        type=int,
-        default=5_000_000,
-        help="Rows per parquet write batch for edge table.",
-    )
-    return parser.parse_args()
+_SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPTS))
+from benchmark_yaml import DEFAULT_PATH, BenchmarkConfig, load_config  # noqa: E402
 
 
 def _graph_path(output_dir: Path, dataset: str) -> Path:
@@ -244,13 +222,22 @@ def _load_ogb_graph(dataset: str, root: str) -> tuple[dict, np.ndarray]:
         return graph, np.asarray(labels_raw)
 
 
-def main() -> None:
-    args = parse_args()
+def convert_ogb_to_gar(
+    config: BenchmarkConfig,
+    *,
+    tmp_root: str,
+    vertex_chunk_size: int,
+    edge_chunk_size: int,
+    vertex_write_batch_size: int,
+    edge_write_batch_size: int,
+) -> None:
+    dataset = config.dataset
+    ogb_root = config.ogb_root
+    output_root = config.gar_root
+    output_dir = Path(output_root) / dataset
+    graph_yml = _graph_path(output_dir, dataset)
 
-    output_dir = Path(args.output_root) / args.dataset
-    graph_yml = _graph_path(output_dir, args.dataset)
-
-    graph, labels = _load_ogb_graph(args.dataset, args.ogb_root)
+    graph, labels = _load_ogb_graph(dataset, ogb_root)
     node_feat = graph["node_feat"]
     edge_index = graph["edge_index"]
 
@@ -263,7 +250,7 @@ def main() -> None:
 
     vertex_groups = _compute_vertex_groups(node_feat.shape[1])
 
-    tmp_dir = Path(args.tmp_root) / args.dataset
+    tmp_dir = Path(tmp_root) / dataset
     tmp_dir.mkdir(parents=True, exist_ok=True)
     vertices_parquet = tmp_dir / "vertices.parquet"
     edges_parquet = tmp_dir / "edges.parquet"
@@ -273,14 +260,14 @@ def main() -> None:
         path=vertices_parquet,
         node_feat=node_feat,
         labels=labels,
-        batch_size=args.vertex_write_batch_size,
+        batch_size=vertex_write_batch_size,
     )
 
     print("Writing edge parquet for import...")
     _write_edges_parquet_chunked(
         path=edges_parquet,
         edge_index=edge_index,
-        batch_size=args.edge_write_batch_size,
+        batch_size=edge_write_batch_size,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -288,10 +275,10 @@ def main() -> None:
     print("Building import config...")
     import_config = _build_import_config(
         output_dir=output_dir,
-        dataset=args.dataset,
+        dataset=dataset,
         vertex_groups=vertex_groups,
-        vertex_chunk_size=args.vertex_chunk_size,
-        edge_chunk_size=args.edge_chunk_size,
+        vertex_chunk_size=vertex_chunk_size,
+        edge_chunk_size=edge_chunk_size,
         vertices_parquet=vertices_parquet,
         edges_parquet=edges_parquet,
     )
@@ -300,13 +287,32 @@ def main() -> None:
     print("Importing to GAR via C++ importer...")
     do_import(import_config.model_dump())
 
-    _write_graph_yml(output_dir, args.dataset)
+    _write_graph_yml(output_dir, dataset)
 
     if not graph_yml.exists():
         msg = f"GAR conversion completed but graph file not found: {graph_yml}"
         raise FileNotFoundError(msg)
 
     print(f"Converted dataset to GAR: {graph_yml}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Convert OGB dataset into GAR format.")
+    p.add_argument("--config", type=Path, default=DEFAULT_PATH, help="Benchmark YAML.")
+    p.add_argument("--tmp-root", default="exps/datasets/tmp/gar_import")
+    p.add_argument("--vertex-chunk-size", type=int, default=1_000_000)
+    p.add_argument("--edge-chunk-size", type=int, default=10_000_000)
+    p.add_argument("--vertex-write-batch-size", type=int, default=500_000)
+    p.add_argument("--edge-write-batch-size", type=int, default=5_000_000)
+    ns = p.parse_args()
+    convert_ogb_to_gar(
+        load_config(ns.config),
+        tmp_root=ns.tmp_root,
+        vertex_chunk_size=ns.vertex_chunk_size,
+        edge_chunk_size=ns.edge_chunk_size,
+        vertex_write_batch_size=ns.vertex_write_batch_size,
+        edge_write_batch_size=ns.edge_write_batch_size,
+    )
 
 
 if __name__ == "__main__":

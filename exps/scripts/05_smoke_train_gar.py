@@ -14,6 +14,10 @@ from pathlib import Path
 
 import pyarrow  # noqa: F401 - must precede graphar C extension
 
+_SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPTS))
+from benchmark_yaml import DEFAULT_PATH, BenchmarkConfig, load_config  # noqa: E402
+
 import torch
 import torch.nn.functional as F
 from ogb.nodeproppred import NodePropPredDataset
@@ -40,26 +44,17 @@ class _GraphSAGE(torch.nn.Module):
         return self.conv2(x, edge_index)
 
 
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--dataset", default="ogbn-products")
-    p.add_argument("--gar-root", default="exps/datasets/gar")
-    p.add_argument("--ogb-root", default="exps/datasets/ogb")
-    return p.parse_args()
-
-
-def main() -> None:
-    args = _parse_args()
+def smoke_train_gar(config: BenchmarkConfig) -> None:
     torch.manual_seed(_SEED)
 
-    print(f"Loading OGB labels from {args.ogb_root}...")
-    ogb = NodePropPredDataset(name=args.dataset, root=args.ogb_root)
+    print(f"Loading OGB labels from {config.ogb_root}...")
+    ogb = NodePropPredDataset(name=config.dataset, root=config.ogb_root)
     _, labels_np = ogb[0]
     labels_all = torch.from_numpy(labels_np.squeeze()).long()
     num_classes = int(labels_all.max().item()) + 1
     train_nodes = ogb.get_idx_split()["train"].tolist()
 
-    graph_yml = Path(args.gar_root) / args.dataset / f"{args.dataset}.graph.yml"
+    graph_yml = Path(config.gar_root) / config.dataset / f"{config.dataset}.graph.yml"
     print(f"Loading GAR graph from {graph_yml}...")
     graph_info = gar.GraphInfo.load(str(graph_yml.resolve()))
 
@@ -104,6 +99,12 @@ def main() -> None:
     else:
         print(f"\nFAIL  loss did not decrease: {first:.4f} → {last:.4f}")
         sys.exit(1)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--config", type=Path, default=DEFAULT_PATH, help="Benchmark YAML.")
+    smoke_train_gar(load_config(p.parse_args().config))
 
 
 if __name__ == "__main__":

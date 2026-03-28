@@ -10,6 +10,10 @@ from pathlib import Path
 # pyarrow must be imported before any graphar C extension to avoid absl symbol conflicts
 import pyarrow  # noqa: F401
 
+_SCRIPTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPTS))
+from benchmark_yaml import DEFAULT_PATH, load_config  # noqa: E402
+
 import graphar as gar
 from graphar.importer.data_import import check as gar_check
 from graphar.ml.torch import GARNeighborLoader
@@ -17,15 +21,6 @@ from neo4j import GraphDatabase
 
 
 SEED_NODES = [0, 1_000, 100_000]
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Verify GAR and Neo4j data loads.")
-    parser.add_argument("--dataset", default="ogbn-products")
-    parser.add_argument("--gar-root", default="exps/datasets/gar")
-    parser.add_argument("--neo4j-uri", default="bolt://localhost:7687")
-    parser.add_argument("--neo4j-database", default="neo4j")
-    return parser.parse_args()
 
 
 def _pass(msg: str) -> None:
@@ -165,10 +160,12 @@ def verify_neo4j(uri: str, database: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    args = parse_args()
+    p = argparse.ArgumentParser(description="Verify GAR and Neo4j data loads.")
+    p.add_argument("--config", type=Path, default=DEFAULT_PATH, help="Benchmark YAML.")
+    c = load_config(p.parse_args().config)
 
-    gar_ok = verify_gar(args.dataset, args.gar_root)
-    neo4j_ok = verify_neo4j(args.neo4j_uri, args.neo4j_database)
+    gar_ok = verify_gar(c.dataset, c.gar_root)
+    neo4j_ok = verify_neo4j(c.neo4j.uri, c.neo4j.database)
 
     print()
     if gar_ok and neo4j_ok:

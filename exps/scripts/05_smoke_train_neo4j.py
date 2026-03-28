@@ -19,8 +19,11 @@ from pathlib import Path
 from typing import Literal
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+_SCRIPTS = Path(__file__).resolve().parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(_SCRIPTS))
+from benchmark_yaml import DEFAULT_PATH, BenchmarkConfig, load_config  # noqa: E402
 
 import pyarrow  # noqa: F401 - must precede graphar C extension
 
@@ -198,19 +201,14 @@ def _check_convergence(loader: Neo4jNeighborLoader, labels_all: torch.Tensor, nu
 # Main
 # ---------------------------------------------------------------------------
 
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--dataset", default="ogbn-products")
-    p.add_argument("--ogb-root", default="exps/datasets/ogb")
-    p.add_argument("--uri", default="bolt://localhost:7687")
-    p.add_argument("--database", default="neo4j")
-    return p.parse_args()
-
-
-def _make_loader(args: argparse.Namespace, strategy: Literal["global", "per_node"]) -> Neo4jNeighborLoader:
+def _make_loader(
+    uri: str,
+    database: str,
+    strategy: Literal["global", "per_node"],
+) -> Neo4jNeighborLoader:
     return Neo4jNeighborLoader(
-        uri=args.uri,
-        database=args.database,
+        uri=uri,
+        database=database,
         vertex_type="node",
         edge_type="edge",
         num_neighbors=_NUM_NEIGHBORS,
@@ -235,14 +233,16 @@ def _assert_neo4j_up(uri: str, database: str) -> None:
         sys.exit(1)
 
 
-def main() -> None:
-    args = _parse_args()
+def smoke_neo4j(config: BenchmarkConfig) -> None:
+    uri = config.neo4j.uri
+    database = config.neo4j.database
+
     torch.manual_seed(_SEED)
 
-    _assert_neo4j_up(args.uri, args.database)
+    _assert_neo4j_up(uri, database)
 
-    print(f"Loading OGB labels from {args.ogb_root}...")
-    ogb = NodePropPredDataset(name=args.dataset, root=args.ogb_root)
+    print(f"Loading OGB labels from {config.ogb_root}...")
+    ogb = NodePropPredDataset(name=config.dataset, root=config.ogb_root)
     _, labels_np = ogb[0]
     labels_all = torch.from_numpy(labels_np.squeeze()).long()
     num_classes = int(labels_all.max().item()) + 1
@@ -250,7 +250,7 @@ def main() -> None:
 
     # ---------------------------------------------------------------- global
     print(f"\n[global — {_STEPS} steps]")
-    with _make_loader(args, "global") as loader:
+    with _make_loader(uri, database, "global") as loader:
         gen = iter_batches(loader)
         ok_coverage = True
         feat_checked = False
@@ -264,13 +264,13 @@ def main() -> None:
                 ok_coverage = False
             _log_global_fanout(data, step + 1)
             if not feat_checked:
-                feat_checked = _check_features(data, args.uri, args.database)
+                feat_checked = _check_features(data, uri, database)
     results["global_coverage"] = ok_coverage
     results["feature_spot_check"] = feat_checked
 
     # --------------------------------------------------------------- per_node
     print(f"\n[per_node — {_STEPS} steps: fanout checks]")
-    with _make_loader(args, "per_node") as loader:
+    with _make_loader(uri, database, "per_node") as loader:
         gen = iter_batches(loader)
         ok_coverage_pn = True
         ok_fanout = True
@@ -289,7 +289,7 @@ def main() -> None:
 
     # ------------------------------------------------------- convergence
     print(f"\n[per_node — convergence over {_STEPS} gradient steps]")
-    with _make_loader(args, "per_node") as loader:
+    with _make_loader(uri, database, "per_node") as loader:
         results["convergence"] = _check_convergence(loader, labels_all, num_classes)
 
     # ---------------------------------------------------------------- summary
@@ -303,6 +303,12 @@ def main() -> None:
     print()
     if not all_ok:
         sys.exit(1)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--config", type=Path, default=DEFAULT_PATH, help="Benchmark YAML.")
+    smoke_neo4j(load_config(p.parse_args().config))
 
 
 if __name__ == "__main__":
