@@ -7,6 +7,7 @@
 #include <unordered_set>
 
 #include "arrow/api.h"
+#include "arrow/compute/api.h"
 #include "graphar/arrow/chunk_reader.h"
 #include "graphar/graph_info.h"
 #include "graphar/result.h"
@@ -203,12 +204,12 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
       chunk_to_indices[chunk_id].push_back(i);
     }
 
-    // Build arrays for each property in this group
-    std::unordered_map<std::string, std::vector<std::shared_ptr<arrow::Scalar>>>
-        prop_scalars;
-    for (const auto& prop : props) {
-      prop_scalars[prop].resize(node_ids.size());
-    }
+    // Use bulk Take per chunk instead of per-element GetScalar.
+    // Collect taken arrays and output positions, then Concatenate + reorder.
+    std::unordered_map<std::string, std::vector<std::shared_ptr<arrow::Array>>>
+        prop_taken;
+    std::vector<int64_t> concat_to_output;
+    concat_to_output.reserve(node_ids.size());
 
     // Read each chunk and extract needed rows
     for (const auto& [chunk_id, indices] : chunk_to_indices) {
@@ -221,55 +222,67 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
       GAR_RETURN_NOT_OK(chunk_result.status());
       auto chunk_table = chunk_result.value();
 
-      // Extract values for each node_id in this chunk
+      // Build Take indices (row offsets within this chunk)
+      arrow::Int64Builder idx_builder;
+      auto st = idx_builder.Reserve(indices.size());
+      if (!st.ok()) return Status::ArrowError(st.ToString());
       for (size_t idx : indices) {
-        IdType node_id = node_ids[idx];
-        IdType row_in_chunk = node_id - chunk_start_node;
+        IdType row_in_chunk = node_ids[idx] - chunk_start_node;
+        idx_builder.UnsafeAppend(row_in_chunk);
+      }
+      std::shared_ptr<arrow::Array> take_indices;
+      st = idx_builder.Finish(&take_indices);
+      if (!st.ok()) return Status::ArrowError(st.ToString());
 
-        // Extract value for each property
-        for (const auto& prop : props) {
-          auto column = chunk_table->GetColumnByName(prop);
-          if (!column) {
-            return Status::Invalid("Column '", prop, "' not found in chunk");
-          }
-          auto scalar_result = column->chunk(0)->GetScalar(row_in_chunk);
-          if (!scalar_result.ok()) {
-            return Status::ArrowError(scalar_result.status().ToString());
-          }
-          prop_scalars[prop][idx] = scalar_result.ValueOrDie();
+      // Extract value for each property
+      for (const auto& prop : props) {
+        auto column = chunk_table->GetColumnByName(prop);
+        if (!column) {
+          return Status::Invalid("Column '", prop, "' not found in chunk");
         }
+        auto take_result =
+            arrow::compute::Take(column->chunk(0), take_indices);
+        if (!take_result.ok()) {
+          return Status::ArrowError(take_result.status().ToString());
+        }
+        prop_taken[prop].push_back(take_result.ValueOrDie().make_array());
+      }
+
+      for (size_t idx : indices) {
+        concat_to_output.push_back(static_cast<int64_t>(idx));
       }
     }
 
-    // Convert scalars to arrays for each property
+    // Build inverse permutation: result[j] = concat[inv[j]]
+    std::vector<int64_t> inv_perm(node_ids.size());
+    for (size_t i = 0; i < concat_to_output.size(); i++) {
+      inv_perm[concat_to_output[i]] = static_cast<int64_t>(i);
+    }
+    arrow::Int64Builder perm_builder;
+    auto pst = perm_builder.AppendValues(inv_perm);
+    if (!pst.ok()) return Status::ArrowError(pst.ToString());
+    std::shared_ptr<arrow::Array> perm_array;
+    pst = perm_builder.Finish(&perm_array);
+    if (!pst.ok()) return Status::ArrowError(pst.ToString());
+
     for (const auto& prop : props) {
+      auto concat_result = arrow::Concatenate(prop_taken[prop]);
+      if (!concat_result.ok()) {
+        return Status::ArrowError(concat_result.status().ToString());
+      }
+      auto reorder_result =
+          arrow::compute::Take(concat_result.ValueOrDie(), perm_array);
+      if (!reorder_result.ok()) {
+        return Status::ArrowError(reorder_result.status().ToString());
+      }
+
       auto prop_type_result = vertex_info->GetPropertyType(prop);
       GAR_RETURN_NOT_OK(prop_type_result.status());
-      auto prop_type = prop_type_result.value();
-
-      // Build arrow array from scalars
-      auto arrow_type = DataType::DataTypeToArrowDataType(prop_type);
-      auto builder_result = arrow::MakeBuilder(arrow_type, arrow::default_memory_pool());
-      if (!builder_result.ok()) {
-        return Status::ArrowError(builder_result.status().ToString());
-      }
-      auto builder = std::move(builder_result).ValueOrDie();
-
-      for (const auto& scalar : prop_scalars[prop]) {
-        auto append_status = builder->AppendScalar(*scalar);
-        if (!append_status.ok()) {
-          return Status::ArrowError(append_status.ToString());
-        }
-      }
-
-      std::shared_ptr<arrow::Array> array;
-      auto finish_status = builder->Finish(&array);
-      if (!finish_status.ok()) {
-        return Status::ArrowError(finish_status.ToString());
-      }
+      auto arrow_type =
+          DataType::DataTypeToArrowDataType(prop_type_result.value());
 
       schema_fields.push_back(arrow::field(prop, arrow_type));
-      result_arrays.push_back(array);
+      result_arrays.push_back(reorder_result.ValueOrDie().make_array());
     }
   }
 
