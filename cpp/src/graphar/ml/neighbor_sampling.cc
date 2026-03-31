@@ -49,96 +49,71 @@ Result<SamplingResult> SampleNeighbors(
   std::vector<IdType> current_frontier = seed_nodes;
   std::mt19937 gen(seed);
 
-  const IdType edge_chunk_size = edge_info->GetChunkSize();
-
   for (size_t hop = 0; hop < fanout.size(); ++hop) {
     int max_neighbors = fanout[hop];
     std::vector<IdType> next_frontier;
 
+    // Sort frontier for sequential chunk access — maximizes Parquet cache hits
     std::vector<IdType> sorted_frontier = current_frontier;
     std::sort(sorted_frontier.begin(), sorted_frontier.end());
 
-    for (size_t fi = 0; fi < sorted_frontier.size();) {
-      IdType vchunk = sorted_frontier[fi] / src_chunk_size;
+    IdType prev_vertex_chunk = -1;
 
-      size_t group_end = fi + 1;
-      while (group_end < sorted_frontier.size() &&
-             sorted_frontier[group_end] / src_chunk_size == vchunk) {
-        ++group_end;
+    for (IdType src_node : sorted_frontier) {
+      IdType vertex_chunk_idx = src_node / src_chunk_size;
+
+      if (vertex_chunk_idx != prev_vertex_chunk) {
+        GAR_RETURN_NOT_OK(adj_reader.seek_chunk_index(vertex_chunk_idx));
+        prev_vertex_chunk = vertex_chunk_idx;
       }
 
-      // Read the full offset array for this vertex chunk once
-      GAR_RETURN_NOT_OK(offset_reader.seek(vchunk * src_chunk_size));
+      // Read edge range from CSR offset array (cached per vertex chunk)
+      GAR_RETURN_NOT_OK(offset_reader.seek(src_node));
       GAR_ASSIGN_OR_RAISE(auto offset_arr, offset_reader.GetChunk());
-      auto full_offsets =
-          std::static_pointer_cast<arrow::Int64Array>(offset_arr);
-      const int64_t* raw_offsets = full_offsets->raw_values();
-      IdType offset_len = full_offsets->length();
+      auto offsets = std::static_pointer_cast<arrow::Int64Array>(offset_arr);
+      if (offsets->length() < 2) continue;
 
-      GAR_RETURN_NOT_OK(adj_reader.seek_chunk_index(vchunk));
+      IdType begin_off = offsets->Value(0);
+      IdType end_off = offsets->Value(1);
+      if (begin_off >= end_off) continue;
 
-      // Edge chunk cache — avoids repeated seek+GetChunk+Slice for nodes
-      // whose edges fall in the same edge chunk.
-      IdType cached_ec = -1;
-      const int64_t* cached_dst = nullptr;
-      IdType cached_dst_len = 0;
-      std::shared_ptr<arrow::Array> cached_dst_keepalive;
+      // Extract destination IDs directly from Arrow arrays — no per-edge
+      // seek/GetChunk/Slice like EdgeIter::destination() does.
+      std::vector<IdType> neighbors;
+      IdType total_edges = end_off - begin_off;
+      neighbors.reserve(total_edges);
 
-      for (size_t si = fi; si < group_end; ++si) {
-        IdType src_node = sorted_frontier[si];
-        IdType local_idx = src_node - vchunk * src_chunk_size;
+      IdType remaining = total_edges;
+      IdType cur_off = begin_off;
 
-        if (local_idx + 1 >= offset_len) continue;
-        IdType begin_off = raw_offsets[local_idx];
-        IdType end_off = raw_offsets[local_idx + 1];
-        if (begin_off >= end_off) continue;
+      while (remaining > 0) {
+        GAR_RETURN_NOT_OK(adj_reader.seek(cur_off));
+        GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
+        if (!chunk_table) break;
 
-        std::vector<IdType> neighbors;
-        IdType total_edges = end_off - begin_off;
-        neighbors.reserve(total_edges);
-
-        IdType remaining = total_edges;
-        IdType cur_off = begin_off;
-
-        while (remaining > 0) {
-          IdType ec = cur_off / edge_chunk_size;
-
-          if (ec != cached_ec) {
-            GAR_RETURN_NOT_OK(adj_reader.seek(ec * edge_chunk_size));
-            GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
-            if (!chunk_table) break;
-
-            cached_dst_keepalive = chunk_table->column(1)->chunk(0);
-            auto dst_typed = std::static_pointer_cast<arrow::Int64Array>(
-                cached_dst_keepalive);
-            cached_dst = dst_typed->raw_values();
-            cached_dst_len = dst_typed->length();
-            cached_ec = ec;
-          }
-
-          IdType local_off = cur_off - ec * edge_chunk_size;
-          IdType batch = std::min(
-              remaining, static_cast<IdType>(cached_dst_len - local_off));
-          neighbors.insert(neighbors.end(), cached_dst + local_off,
-                           cached_dst + local_off + batch);
-          remaining -= batch;
-          cur_off += batch;
-        }
-
-        if (static_cast<int>(neighbors.size()) > max_neighbors) {
-          std::shuffle(neighbors.begin(), neighbors.end(), gen);
-          neighbors.resize(max_neighbors);
-        }
-
-        for (IdType dst_node : neighbors) {
-          edge_list.emplace_back(src_node, dst_node);
-          if (all_sampled_nodes_set.insert(dst_node).second) {
-            next_frontier.push_back(dst_node);
-          }
-        }
+        auto dst_col = std::static_pointer_cast<arrow::Int64Array>(
+            chunk_table->column(1)->chunk(0));
+        IdType batch = std::min(remaining, static_cast<IdType>(dst_col->length()));
+        const int64_t* raw = dst_col->raw_values();
+        neighbors.insert(neighbors.end(), raw, raw + batch);
+        remaining -= batch;
+        cur_off += batch;
       }
 
-      fi = group_end;
+      if (static_cast<int>(neighbors.size()) > max_neighbors) {
+        std::shuffle(neighbors.begin(), neighbors.end(), gen);
+        neighbors.resize(max_neighbors);
+      }
+
+      // Add sampled neighbors to results
+      for (IdType dst_node : neighbors) {
+        edge_list.emplace_back(src_node, dst_node);
+        
+        // Add to sampled nodes set and next frontier
+        if (all_sampled_nodes_set.insert(dst_node).second) {
+          next_frontier.push_back(dst_node);
+        }
+      }
     }
 
     current_frontier = std::move(next_frontier);
