@@ -71,35 +71,6 @@ class Int64ChunkedArrayCursor {
   std::shared_ptr<arrow::Int64Array> current_chunk_;
 };
 
-std::vector<IdType> SampleRelativeOffsets(IdType total_edges, IdType sample_size,
-                                          std::mt19937& gen) {
-  std::vector<IdType> sampled_offsets;
-  if (sample_size <= 0) return sampled_offsets;
-  sampled_offsets.reserve(static_cast<size_t>(sample_size));
-
-  if (sample_size >= total_edges) {
-    for (IdType offset = 0; offset < total_edges; ++offset) {
-      sampled_offsets.push_back(offset);
-    }
-    return sampled_offsets;
-  }
-
-  std::unordered_set<IdType> selected;
-  selected.reserve(static_cast<size_t>(sample_size) * 2);
-
-  for (IdType j = total_edges - sample_size; j < total_edges; ++j) {
-    std::uniform_int_distribution<IdType> dist(0, j);
-    IdType candidate = dist(gen);
-    if (!selected.insert(candidate).second) {
-      selected.insert(j);
-    }
-  }
-
-  sampled_offsets.assign(selected.begin(), selected.end());
-  std::sort(sampled_offsets.begin(), sampled_offsets.end());
-  return sampled_offsets;
-}
-
 }  // namespace
 
 Result<SamplingResult> SampleNeighbors(
@@ -141,39 +112,42 @@ Result<SamplingResult> SampleNeighbors(
     int max_neighbors = fanout[hop];
     std::vector<IdType> next_frontier;
 
-    // Sort frontier for sequential chunk access — maximizes Parquet cache hits
     std::vector<IdType> sorted_frontier = current_frontier;
     std::sort(sorted_frontier.begin(), sorted_frontier.end());
+    for (size_t fi = 0; fi < sorted_frontier.size();) {
+      IdType vertex_chunk_idx = sorted_frontier[fi] / src_chunk_size;
 
-    IdType prev_vertex_chunk = -1;
-
-    for (IdType src_node : sorted_frontier) {
-      IdType vertex_chunk_idx = src_node / src_chunk_size;
-
-      if (vertex_chunk_idx != prev_vertex_chunk) {
-        GAR_RETURN_NOT_OK(adj_reader.seek_chunk_index(vertex_chunk_idx));
-        prev_vertex_chunk = vertex_chunk_idx;
+      size_t group_end = fi + 1;
+      while (group_end < sorted_frontier.size() &&
+             sorted_frontier[group_end] / src_chunk_size == vertex_chunk_idx) {
+        ++group_end;
       }
 
-      // Read edge range from CSR offset array (cached per vertex chunk)
-      GAR_RETURN_NOT_OK(offset_reader.seek(src_node));
+      GAR_RETURN_NOT_OK(offset_reader.seek(vertex_chunk_idx * src_chunk_size));
       GAR_ASSIGN_OR_RAISE(auto offset_arr, offset_reader.GetChunk());
-      auto offsets = std::static_pointer_cast<arrow::Int64Array>(offset_arr);
-      if (offsets->length() < 2) continue;
+      auto full_offsets = std::static_pointer_cast<arrow::Int64Array>(offset_arr);
+      const int64_t* raw_offsets = full_offsets->raw_values();
+      IdType offset_len = full_offsets->length();
 
-      IdType begin_off = offsets->Value(0);
-      IdType end_off = offsets->Value(1);
-      if (begin_off >= end_off) continue;
+      GAR_RETURN_NOT_OK(adj_reader.seek_chunk_index(vertex_chunk_idx));
 
-      IdType total_edges = end_off - begin_off;
-      IdType sample_size =
-          std::min(total_edges, static_cast<IdType>(std::max(max_neighbors, 0)));
-      if (sample_size == 0) continue;
+      IdType cached_edge_chunk_idx = -1;
+      std::shared_ptr<arrow::ChunkedArray> cached_dst_column;
+      std::shared_ptr<Int64ChunkedArrayCursor> cached_cursor;
 
-      std::vector<IdType> neighbors;
-      neighbors.reserve(sample_size);
+      for (size_t si = fi; si < group_end; ++si) {
+        IdType src_node = sorted_frontier[si];
+        IdType local_idx = src_node - vertex_chunk_idx * src_chunk_size;
+        if (local_idx + 1 >= offset_len) continue;
 
-      if (sample_size == total_edges) {
+        IdType begin_off = raw_offsets[local_idx];
+        IdType end_off = raw_offsets[local_idx + 1];
+        if (begin_off >= end_off) continue;
+
+        IdType total_edges = end_off - begin_off;
+        std::vector<IdType> neighbors;
+        neighbors.reserve(total_edges);
+
         IdType cur_off = begin_off;
         while (cur_off < end_off) {
           IdType edge_chunk_idx = cur_off / edge_chunk_size;
@@ -181,17 +155,23 @@ Result<SamplingResult> SampleNeighbors(
           IdType edge_chunk_end =
               std::min(end_off, edge_chunk_start + edge_chunk_size);
 
-          GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
-          GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
-          if (!chunk_table) break;
+          if (edge_chunk_idx != cached_edge_chunk_idx) {
+            GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
+            GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
+            if (!chunk_table) break;
 
-          Int64ChunkedArrayCursor cursor(chunk_table->column(1));
+            cached_dst_column = chunk_table->column(1);
+            cached_cursor =
+                std::make_shared<Int64ChunkedArrayCursor>(cached_dst_column);
+            cached_edge_chunk_idx = edge_chunk_idx;
+          }
+
           IdType row = cur_off - edge_chunk_start;
           IdType row_end = edge_chunk_end - edge_chunk_start;
-
           while (row < row_end) {
             IdType available = 0;
-            GAR_ASSIGN_OR_RAISE(auto raw, cursor.RawValuesAt(row, &available));
+            GAR_ASSIGN_OR_RAISE(auto raw,
+                                cached_cursor->RawValuesAt(row, &available));
             IdType batch = std::min(row_end - row, available);
             neighbors.insert(neighbors.end(), raw, raw + batch);
             row += batch;
@@ -199,41 +179,21 @@ Result<SamplingResult> SampleNeighbors(
 
           cur_off = edge_chunk_end;
         }
-      } else {
-        auto sampled_relative_offsets =
-            SampleRelativeOffsets(total_edges, sample_size, gen);
 
-        for (size_t i = 0; i < sampled_relative_offsets.size();) {
-          IdType absolute_off = begin_off + sampled_relative_offsets[i];
-          IdType edge_chunk_idx = absolute_off / edge_chunk_size;
-          IdType edge_chunk_start = edge_chunk_idx * edge_chunk_size;
+        if (static_cast<int>(neighbors.size()) > max_neighbors) {
+          std::shuffle(neighbors.begin(), neighbors.end(), gen);
+          neighbors.resize(max_neighbors);
+        }
 
-          GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
-          GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
-          if (!chunk_table) break;
-
-          Int64ChunkedArrayCursor cursor(chunk_table->column(1));
-          while (i < sampled_relative_offsets.size()) {
-            absolute_off = begin_off + sampled_relative_offsets[i];
-            if (absolute_off / edge_chunk_size != edge_chunk_idx) break;
-
-            GAR_ASSIGN_OR_RAISE(auto dst_node,
-                                cursor.ValueAt(absolute_off - edge_chunk_start));
-            neighbors.push_back(dst_node);
-            ++i;
+        for (IdType dst_node : neighbors) {
+          edge_list.emplace_back(src_node, dst_node);
+          if (all_sampled_nodes_set.insert(dst_node).second) {
+            next_frontier.push_back(dst_node);
           }
         }
       }
 
-      // Add sampled neighbors to results
-      for (IdType dst_node : neighbors) {
-        edge_list.emplace_back(src_node, dst_node);
-        
-        // Add to sampled nodes set and next frontier
-        if (all_sampled_nodes_set.insert(dst_node).second) {
-          next_frontier.push_back(dst_node);
-        }
-      }
+      fi = group_end;
     }
 
     current_frontier = std::move(next_frontier);
