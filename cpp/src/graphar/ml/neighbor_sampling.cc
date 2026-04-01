@@ -81,7 +81,6 @@ Result<SamplingResult> SampleNeighbors(
   std::vector<std::pair<IdType, IdType>> edge_list;
   std::vector<IdType> current_frontier = seed_nodes;
   std::mt19937 gen(seed);
-  const IdType edge_chunk_size = edge_info->GetChunkSize();
 
   for (size_t hop = 0; hop < fanout.size(); ++hop) {
     int max_neighbors = fanout[hop];
@@ -141,34 +140,19 @@ Result<SamplingResult> SampleNeighbors(
         auto sampled_relative_offsets =
             SampleRelativeOffsets(total_edges, sample_size, gen);
 
-        IdType cached_chunk_idx = -1;
-        const int64_t* cached_dst = nullptr;
-        IdType cached_dst_len = 0;
-        std::shared_ptr<arrow::Array> cached_dst_keepalive;
-
         for (IdType relative_off : sampled_relative_offsets) {
           IdType absolute_off = begin_off + relative_off;
-          IdType chunk_idx = absolute_off / edge_chunk_size;
+          GAR_RETURN_NOT_OK(adj_reader.seek(absolute_off));
+          GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
+          if (!chunk_table) break;
 
-          if (chunk_idx != cached_chunk_idx) {
-            GAR_RETURN_NOT_OK(adj_reader.seek(chunk_idx * edge_chunk_size));
-            GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
-            if (!chunk_table) break;
-
-            cached_dst_keepalive = chunk_table->column(1)->chunk(0);
-            auto dst_col = std::static_pointer_cast<arrow::Int64Array>(
-                cached_dst_keepalive);
-            cached_dst = dst_col->raw_values();
-            cached_dst_len = dst_col->length();
-            cached_chunk_idx = chunk_idx;
-          }
-
-          IdType row_in_chunk = absolute_off - chunk_idx * edge_chunk_size;
-          if (row_in_chunk >= cached_dst_len) {
+          auto dst_col = std::static_pointer_cast<arrow::Int64Array>(
+              chunk_table->column(1)->chunk(0));
+          if (dst_col->length() == 0) {
             return Status::Invalid("Sampled edge offset ", absolute_off,
                                    " is out of range in edge chunk");
           }
-          neighbors.push_back(cached_dst[row_in_chunk]);
+          neighbors.push_back(dst_col->Value(0));
         }
       }
 
