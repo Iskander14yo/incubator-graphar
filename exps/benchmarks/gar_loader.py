@@ -17,7 +17,7 @@ def iter_batches(loader: GARNeighborLoader) -> Iterator[tuple[Data, BatchTimings
 
     gen = iter(loader)
     batch_id = 0
-    while True:
+    while batch_id < 50:
         t_start = time.perf_counter()
         try:
             batch = next(gen)

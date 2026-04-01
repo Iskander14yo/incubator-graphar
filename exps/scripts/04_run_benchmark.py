@@ -321,17 +321,6 @@ def run_benchmark(config: BenchmarkConfig) -> None:
             if loader is not None and hasattr(loader, "close"):
                 loader.close()
 
-    manifest = Path("exps/results/runs_manifest.jsonl")
-    manifest.parent.mkdir(parents=True, exist_ok=True)
-    with manifest.open("a") as f:
-        f.write(json.dumps({
-            "timestamp": timestamp,
-            "dataset": dataset,
-            "git_sha": sha,
-            "result_dir": str(result_dir) + "/",
-            "notes": "",
-        }) + "\n")
-
     print(f"\nDone.")
 
 
