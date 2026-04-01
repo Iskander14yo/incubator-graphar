@@ -1,269 +1,220 @@
 #include <algorithm>
-#include <cmath>
-#include <filesystem>
-#include <iostream>
-#include <memory>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "graphar/api/high_level_writer.h"
+#include "arrow/api.h"
+#include "graphar/graph_info.h"
 #include "graphar/ml/neighbor_sampling.h"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "../util.h"
+
 namespace graphar::ml {
+namespace {
 
-// Test fixture that creates a small test graph
-struct SamplingTestFixture {
-  SamplingTestFixture() {
-    test_dir = "/tmp/graphar_ml_test";
-    CreateTestGraph();
+constexpr const char* kGraphPath = "/ldbc_sample/parquet/ldbc_sample.graph.yml";
+constexpr const char* kVertexType = "person";
+constexpr const char* kEdgeType = "knows";
+
+std::shared_ptr<GraphInfo> LoadLdbcSampleGraph(const std::string& test_data_dir) {
+  auto maybe_graph_info = GraphInfo::Load(test_data_dir + kGraphPath);
+  REQUIRE(maybe_graph_info.status().ok());
+  return maybe_graph_info.value();
+}
+
+std::vector<std::pair<IdType, IdType>> ToNodeEdges(
+    const SamplingResult& sampling) {
+  std::vector<std::pair<IdType, IdType>> edges;
+  edges.reserve(sampling.src_indices.size());
+  for (size_t i = 0; i < sampling.src_indices.size(); ++i) {
+    edges.emplace_back(sampling.sampled_nodes[sampling.src_indices[i]],
+                       sampling.sampled_nodes[sampling.dst_indices[i]]);
   }
+  return edges;
+}
 
-  ~SamplingTestFixture() {
-    // Cleanup test data
-    std::filesystem::remove_all(test_dir);
-  }
-
-  void CreateTestGraph() {
-    // Create vertex info: Node type with id and feature properties
-    std::vector<Property> vertex_properties = {
-        Property("id", int64(), false, false),
-        Property("feature", float32(), false, true)};
-    auto vertex_property_group =
-        CreatePropertyGroup(vertex_properties, FileType::PARQUET);
-    auto vertex_info =
-        CreateVertexInfo("Node", 100, {vertex_property_group}, {}, "", nullptr);
-
-    // Create edge info: edge type with CSR layout
-    auto adj_list = CreateAdjacentList(AdjListType::ordered_by_source,
-                                       FileType::PARQUET);
-    auto edge_info =
-        CreateEdgeInfo("Node", "edge", "Node", 100, 100, 100, true, {adj_list},
-                       {}, "", nullptr);
-
-    // Create graph info
-    graph_info =
-        CreateGraphInfo("test_graph", {vertex_info}, {edge_info}, {}, test_dir);
-
-    // Build vertices using VerticesBuilder
-    auto builder_result =
-        builder::VerticesBuilder::Make(vertex_info, test_dir, 0);
-    REQUIRE(!builder_result.has_error());
-    auto vertex_builder = builder_result.value();
-
-    // Add vertices and save them
-    for (int64_t i = 0; i < 6; i++) {
-      builder::Vertex v;
-      v.AddProperty("id", i);
-      v.AddProperty("feature", static_cast<float>(i * 0.1f));
-      REQUIRE(vertex_builder->AddVertex(v).ok());
+std::vector<IdType> Int64Values(
+    const std::shared_ptr<arrow::ChunkedArray>& column) {
+  std::vector<IdType> values;
+  values.reserve(column->length());
+  for (const auto& chunk : column->chunks()) {
+    auto array = std::static_pointer_cast<arrow::Int64Array>(chunk);
+    for (int64_t i = 0; i < array->length(); ++i) {
+      values.push_back(array->Value(i));
     }
-    REQUIRE(vertex_builder->Dump().ok());
-
-    // Add edges and save them
-    // Graph structure:
-    // 0 -> 1, 2
-    // 1 -> 2, 3
-    // 2 -> 3, 4
-    // 3 -> 4
-    // 4 -> (none)
-    // 5 (isolated)
-    auto edges_builder_result = builder::EdgesBuilder::Make(
-        edge_info, test_dir, AdjListType::ordered_by_source, 6);
-    REQUIRE(!edges_builder_result.has_error());
-    auto edges_builder = edges_builder_result.value();
-
-    std::vector<std::pair<int64_t, int64_t>> edges = {
-        {0, 1}, {0, 2}, {1, 2}, {1, 3}, {2, 3}, {2, 4}, {3, 4}};
-
-    for (const auto& [src, dst] : edges) {
-      builder::Edge e(src, dst);
-      REQUIRE(edges_builder->AddEdge(e).ok());
-    }
-    REQUIRE(edges_builder->Dump().ok());
-
-    // Save graph info
-    REQUIRE(graph_info->Save(test_dir + "/test_graph.graph.yml").ok());
   }
+  return values;
+}
 
-  std::string test_dir;
-  std::shared_ptr<GraphInfo> graph_info;
-};
+std::vector<std::string> StringValues(
+    const std::shared_ptr<arrow::ChunkedArray>& column) {
+  std::vector<std::string> values;
+  values.reserve(column->length());
+  for (const auto& chunk : column->chunks()) {
+    if (chunk->type()->id() == arrow::Type::STRING) {
+      auto array = std::static_pointer_cast<arrow::StringArray>(chunk);
+      for (int64_t i = 0; i < array->length(); ++i) {
+        values.push_back(array->GetString(i));
+      }
+      continue;
+    }
+    auto array = std::static_pointer_cast<arrow::LargeStringArray>(chunk);
+    for (int64_t i = 0; i < array->length(); ++i) {
+      values.push_back(array->GetString(i));
+    }
+  }
+  return values;
+}
+
+}  // namespace
 
 //////////////////////////// SampleNeighbors /////////////////////////////////////
 
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - single hop") {
-  std::vector<IdType> seeds = {0};
-  std::vector<int> fanout = {10};  // Request more than available
+TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - single hop on ldbc_sample") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
+  auto result = SampleNeighbors(graph_info, kVertexType, kEdgeType, {0}, {10}, 42);
   REQUIRE(result.status().ok());
 
-  auto& sampling = result.value();
-  
-  // Should have seed (0) + its neighbors (1,2)
-  REQUIRE(sampling.sampled_nodes.size() == 3);
+  const auto& sampling = result.value();
+  REQUIRE(sampling.sampled_nodes == std::vector<IdType>{0, 87, 623, 849});
+  REQUIRE(ToNodeEdges(sampling) == std::vector<std::pair<IdType, IdType>>{
+                                      {0, 87}, {0, 623}, {0, 849}});
+}
 
-  // Verify seed is in sampled_nodes
-  REQUIRE(std::find(sampling.sampled_nodes.begin(),
-                    sampling.sampled_nodes.end(), 0) !=
-          sampling.sampled_nodes.end());
+TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - fanout respected on ldbc_sample") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  // Verify edges consistency
+  auto result = SampleNeighbors(graph_info, kVertexType, kEdgeType, {0}, {2}, 42);
+  REQUIRE(result.status().ok());
+
+  const auto& sampling = result.value();
+  const auto edges = ToNodeEdges(sampling);
+  const std::set<IdType> expected_neighbors = {87, 623, 849};
+
+  REQUIRE(edges.size() == 2);
   REQUIRE(sampling.src_indices.size() == sampling.dst_indices.size());
-  
-  // All edges should start from node 0 (index of 0 in sampled_nodes)
-  auto seed_idx = std::find(sampling.sampled_nodes.begin(),
-                           sampling.sampled_nodes.end(), 0) -
-                 sampling.sampled_nodes.begin();
-  for (size_t i = 0; i < sampling.src_indices.size(); i++) {
-    REQUIRE(sampling.src_indices[i] == seed_idx);
+  REQUIRE(sampling.sampled_nodes.size() == 3);
+  for (const auto& [src, dst] : edges) {
+    REQUIRE(src == 0);
+    REQUIRE(expected_neighbors.count(dst) == 1);
   }
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - fanout limit") {
-  std::vector<IdType> seeds = {0};
-  std::vector<int> fanout = {1};  // Limit to 1 neighbor
+TEST_CASE_METHOD(GlobalFixture,
+                 "SampleNeighbors - deterministic with seed on ldbc_sample") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
-  REQUIRE(result.status().ok());
-
-  auto& sampling = result.value();
-  
-  // Should have exactly 1 edge (fanout limit)
-  REQUIRE(sampling.src_indices.size() == 1);
-  REQUIRE(sampling.dst_indices.size() == 1);
-  
-  // Should have seed + 1 neighbor
-  REQUIRE(sampling.sampled_nodes.size() == 2);
-}
-
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - deterministic with seed") {
-  std::vector<IdType> seeds = {0};
-  std::vector<int> fanout = {1};
-  uint64_t seed = 12345;
-
-  auto result1 = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, seed);
-  auto result2 = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, seed);
+  auto result1 =
+      SampleNeighbors(graph_info, kVertexType, kEdgeType, {0}, {2}, 12345);
+  auto result2 =
+      SampleNeighbors(graph_info, kVertexType, kEdgeType, {0}, {2}, 12345);
   REQUIRE(result1.status().ok());
   REQUIRE(result2.status().ok());
 
-  const auto& sampling1 = result1.value();
-  const auto& sampling2 = result2.value();
-  REQUIRE(sampling1.sampled_nodes == sampling2.sampled_nodes);
-  REQUIRE(sampling1.src_indices == sampling2.src_indices);
-  REQUIRE(sampling1.dst_indices == sampling2.dst_indices);
+  REQUIRE(result1.value().sampled_nodes == result2.value().sampled_nodes);
+  REQUIRE(result1.value().src_indices == result2.value().src_indices);
+  REQUIRE(result1.value().dst_indices == result2.value().dst_indices);
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - multi-hop") {
-  std::vector<IdType> seeds = {0};
-  std::vector<int> fanout = {2, 2};  // 2-hop, 2 neighbors per hop
+TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - multi-hop on ldbc_sample") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
+  auto result =
+      SampleNeighbors(graph_info, kVertexType, kEdgeType, {0}, {3, 2}, 42);
   REQUIRE(result.status().ok());
 
-  auto& sampling = result.value();
-  
-  // Should have seed in sampled_nodes
-  REQUIRE(std::find(sampling.sampled_nodes.begin(),
-                    sampling.sampled_nodes.end(), 0) !=
-          sampling.sampled_nodes.end());
+  const auto& sampling = result.value();
+  const auto edges = ToNodeEdges(sampling);
 
-  // Should have edges from both hops
-  REQUIRE(sampling.src_indices.size() > 0);
-  REQUIRE(sampling.src_indices.size() == sampling.dst_indices.size());
-  
-  // Verify sampled_nodes contains more than just immediate neighbors
-  REQUIRE(sampling.sampled_nodes.size() >= 2);
+  REQUIRE(sampling.src_indices.size() == 9);
+  REQUIRE(sampling.dst_indices.size() == 9);
+  REQUIRE(std::count_if(edges.begin(), edges.end(),
+                        [](const auto& edge) { return edge.first == 0; }) == 3);
+  REQUIRE(std::any_of(edges.begin(), edges.end(),
+                      [](const auto& edge) { return edge.first != 0; }));
+  REQUIRE(std::find(sampling.sampled_nodes.begin(), sampling.sampled_nodes.end(),
+                    87) != sampling.sampled_nodes.end());
+  REQUIRE(std::find(sampling.sampled_nodes.begin(), sampling.sampled_nodes.end(),
+                    623) != sampling.sampled_nodes.end());
+  REQUIRE(std::find(sampling.sampled_nodes.begin(), sampling.sampled_nodes.end(),
+                    849) != sampling.sampled_nodes.end());
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - isolated node") {
-  std::vector<IdType> seeds = {5};  // Node 5 has no edges
-  std::vector<int> fanout = {2};
+TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - isolated node on ldbc_sample") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
+  auto result = SampleNeighbors(graph_info, kVertexType, kEdgeType, {2}, {5}, 42);
   REQUIRE(result.status().ok());
 
-  auto& sampling = result.value();
-  
-  // Should only have the seed node
-  REQUIRE(sampling.sampled_nodes.size() == 1);
-  REQUIRE(sampling.sampled_nodes[0] == 5);
-  
-  // Should have no edges
+  const auto& sampling = result.value();
+  REQUIRE(sampling.sampled_nodes == std::vector<IdType>{2});
   REQUIRE(sampling.src_indices.empty());
   REQUIRE(sampling.dst_indices.empty());
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - multiple seeds") {
-  std::vector<IdType> seeds = {0, 1};
-  std::vector<int> fanout = {2};
+TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - multiple seeds on ldbc_sample") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
+  auto result =
+      SampleNeighbors(graph_info, kVertexType, kEdgeType, {0, 1}, {10}, 42);
   REQUIRE(result.status().ok());
 
-  auto& sampling = result.value();
-  
-  // Should have both seeds
-  REQUIRE(std::find(sampling.sampled_nodes.begin(),
-                    sampling.sampled_nodes.end(), 0) !=
-          sampling.sampled_nodes.end());
-  REQUIRE(std::find(sampling.sampled_nodes.begin(),
-                    sampling.sampled_nodes.end(), 1) !=
-          sampling.sampled_nodes.end());
-
-  // Should have edges from both seeds
-  REQUIRE(sampling.src_indices.size() > 0);
+  const auto& sampling = result.value();
+  REQUIRE(sampling.sampled_nodes ==
+          std::vector<IdType>{0, 1, 58, 87, 318, 538, 539, 623, 696, 849});
+  REQUIRE(ToNodeEdges(sampling) == std::vector<std::pair<IdType, IdType>>{
+                                      {0, 87},  {0, 623}, {0, 849}, {1, 58},
+                                      {1, 318}, {1, 538}, {1, 539}, {1, 696}});
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - empty seed list") {
-  std::vector<IdType> seeds = {};
-  std::vector<int> fanout = {2};
+TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - empty seed list") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
+  auto result = SampleNeighbors(graph_info, kVertexType, kEdgeType, {}, {5}, 42);
   REQUIRE(result.status().ok());
 
-  auto& sampling = result.value();
+  const auto& sampling = result.value();
   REQUIRE(sampling.sampled_nodes.empty());
   REQUIRE(sampling.src_indices.empty());
   REQUIRE(sampling.dst_indices.empty());
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - invalid vertex type") {
-  std::vector<IdType> seeds = {0};
-  std::vector<int> fanout = {2};
+TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - invalid vertex type") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
   auto result =
-      SampleNeighbors(graph_info, "InvalidType", "edge", seeds, fanout, 42);
+      SampleNeighbors(graph_info, "invalid_person", kEdgeType, {0}, {5}, 42);
   REQUIRE(result.has_error());
   REQUIRE(result.status().IsInvalid());
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - invalid edge type") {
-  std::vector<IdType> seeds = {0};
-  std::vector<int> fanout = {2};
+TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - invalid edge type") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
   auto result =
-      SampleNeighbors(graph_info, "Node", "invalid_edge", seeds, fanout, 42);
+      SampleNeighbors(graph_info, kVertexType, "invalid_edge", {0}, {5}, 42);
   REQUIRE(result.has_error());
   REQUIRE(result.status().IsInvalid());
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "SampleNeighbors - empty fanout") {
-  std::vector<IdType> seeds = {0};
-  std::vector<int> fanout = {};
+TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - empty fanout") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = SampleNeighbors(graph_info, "Node", "edge", seeds, fanout, 42);
+  auto result = SampleNeighbors(graph_info, kVertexType, kEdgeType, {0}, {}, 42);
   REQUIRE(result.has_error());
   REQUIRE(result.status().IsInvalid());
 }
 
 //////////////////////////// GetNodeFeatures /////////////////////////////////////
 
-TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - single property") {
-  std::vector<IdType> node_ids = {0, 1, 2};
-  std::vector<std::string> properties = {"id"};
+TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - single property on ldbc_sample") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
+  auto result = GetNodeFeatures(graph_info, kVertexType, {0, 1, 2}, {"id"});
   REQUIRE(result.status().ok());
 
   auto table = result.value();
@@ -272,100 +223,79 @@ TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - single property") {
 
   auto id_column = table->GetColumnByName("id");
   REQUIRE(id_column != nullptr);
-  
-  // Verify values
-  auto id_array = std::static_pointer_cast<arrow::Int64Array>(id_column->chunk(0));
-  REQUIRE(id_array->Value(0) == 0);
-  REQUIRE(id_array->Value(1) == 1);
-  REQUIRE(id_array->Value(2) == 2);
+  REQUIRE(Int64Values(id_column) ==
+          std::vector<IdType>{933, 6597069767117, 10995116278700});
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - multiple properties") {
-  std::vector<IdType> node_ids = {0, 2, 4};
-  std::vector<std::string> properties = {"id", "feature"};
+TEST_CASE_METHOD(GlobalFixture,
+                 "GetNodeFeatures - multiple properties on ldbc_sample") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
+  auto result =
+      GetNodeFeatures(graph_info, kVertexType, {0, 1}, {"id", "firstName"});
   REQUIRE(result.status().ok());
 
   auto table = result.value();
-  REQUIRE(table->num_rows() == 3);
+  REQUIRE(table->num_rows() == 2);
   REQUIRE(table->num_columns() == 2);
 
-  // Verify id column
   auto id_column = table->GetColumnByName("id");
   REQUIRE(id_column != nullptr);
-  auto id_array = std::static_pointer_cast<arrow::Int64Array>(id_column->chunk(0));
-  REQUIRE(id_array->Value(0) == 0);
-  REQUIRE(id_array->Value(1) == 2);
-  REQUIRE(id_array->Value(2) == 4);
+  REQUIRE(Int64Values(id_column) == std::vector<IdType>{933, 6597069767117});
 
-  // Verify feature column
-  auto feature_column = table->GetColumnByName("feature");
-  REQUIRE(feature_column != nullptr);
-  auto feature_array = std::static_pointer_cast<arrow::FloatArray>(feature_column->chunk(0));
-  REQUIRE(std::abs(feature_array->Value(0) - 0.0f) < 0.001f);
-  REQUIRE(std::abs(feature_array->Value(1) - 0.2f) < 0.001f);
-  REQUIRE(std::abs(feature_array->Value(2) - 0.4f) < 0.001f);
+  auto first_name_column = table->GetColumnByName("firstName");
+  REQUIRE(first_name_column != nullptr);
+  REQUIRE(StringValues(first_name_column) ==
+          std::vector<std::string>{"Mahinda", "Eli"});
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - empty node list") {
-  std::vector<IdType> node_ids = {};
-  std::vector<std::string> properties = {"id"};
+TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - empty node list") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
+  auto result = GetNodeFeatures(graph_info, kVertexType, {}, {"id"});
   REQUIRE(result.status().ok());
 
   auto table = result.value();
   REQUIRE(table->num_rows() == 0);
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - empty properties") {
-  std::vector<IdType> node_ids = {0};
-  std::vector<std::string> properties = {};
+TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - empty properties") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
+  auto result = GetNodeFeatures(graph_info, kVertexType, {0}, {});
   REQUIRE(result.has_error());
   REQUIRE(result.status().IsInvalid());
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - invalid property") {
-  std::vector<IdType> node_ids = {0};
-  std::vector<std::string> properties = {"non_existent"};
+TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - invalid property") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
+  auto result = GetNodeFeatures(graph_info, kVertexType, {0},
+                                {"nonexistent_property"});
   REQUIRE(result.has_error());
   REQUIRE(result.status().IsInvalid());
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - invalid vertex type") {
-  std::vector<IdType> node_ids = {0};
-  std::vector<std::string> properties = {"id"};
+TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - invalid vertex type") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = GetNodeFeatures(graph_info, "InvalidType", node_ids, properties);
+  auto result = GetNodeFeatures(graph_info, "invalid_person", {0}, {"id"});
   REQUIRE(result.has_error());
   REQUIRE(result.status().IsInvalid());
 }
 
-TEST_CASE_METHOD(SamplingTestFixture, "GetNodeFeatures - unordered node ids") {
-  std::vector<IdType> node_ids = {5, 1, 3, 0};
-  std::vector<std::string> properties = {"id"};
+TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - unordered node ids") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 
-  auto result = GetNodeFeatures(graph_info, "Node", node_ids, properties);
-  if (!result.status().ok()) {
-    std::cerr << "Error: " << result.status().message() << std::endl;
-  }
+  auto result = GetNodeFeatures(graph_info, kVertexType, {5, 1, 3, 0}, {"id"});
   REQUIRE(result.status().ok());
 
   auto table = result.value();
-  REQUIRE(table->num_rows() == 4);
-
-  // Values should be in the same order as input node_ids
   auto id_column = table->GetColumnByName("id");
-  auto id_array = std::static_pointer_cast<arrow::Int64Array>(id_column->chunk(0));
-  REQUIRE(id_array->Value(0) == 5);
-  REQUIRE(id_array->Value(1) == 1);
-  REQUIRE(id_array->Value(2) == 3);
-  REQUIRE(id_array->Value(3) == 0);
+  REQUIRE(id_column != nullptr);
+  REQUIRE(Int64Values(id_column) == std::vector<IdType>{
+                                       28587302322727, 6597069767117,
+                                       21990232556027, 933});
 }
 
 }  // namespace graphar::ml
