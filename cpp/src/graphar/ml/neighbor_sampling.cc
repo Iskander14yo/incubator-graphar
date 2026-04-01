@@ -17,6 +17,60 @@ namespace graphar::ml {
 
 namespace {
 
+class Int64ChunkedArrayCursor {
+ public:
+  explicit Int64ChunkedArrayCursor(
+      std::shared_ptr<arrow::ChunkedArray> chunked_array)
+      : chunked_array_(std::move(chunked_array)),
+        chunk_index_(0),
+        chunk_begin_(0),
+        chunk_length_(0) {
+    if (chunked_array_ != nullptr && chunked_array_->num_chunks() > 0) {
+      current_chunk_ = std::static_pointer_cast<arrow::Int64Array>(
+          chunked_array_->chunk(chunk_index_));
+      chunk_length_ = current_chunk_->length();
+    }
+  }
+
+  Status AdvanceTo(IdType row) {
+    if (chunked_array_ == nullptr || chunked_array_->num_chunks() == 0) {
+      return Status::Invalid("Adjacency chunk has no destination rows");
+    }
+
+    while (row >= chunk_begin_ + chunk_length_) {
+      chunk_begin_ += chunk_length_;
+      ++chunk_index_;
+      if (chunk_index_ >= chunked_array_->num_chunks()) {
+        return Status::Invalid("Adjacency row ", row,
+                               " is out of range in chunked array");
+      }
+      current_chunk_ = std::static_pointer_cast<arrow::Int64Array>(
+          chunked_array_->chunk(chunk_index_));
+      chunk_length_ = current_chunk_->length();
+    }
+    return Status::OK();
+  }
+
+  Result<IdType> ValueAt(IdType row) {
+    GAR_RETURN_NOT_OK(AdvanceTo(row));
+    return current_chunk_->Value(row - chunk_begin_);
+  }
+
+  Result<const int64_t*> RawValuesAt(IdType row, IdType* available) {
+    GAR_RETURN_NOT_OK(AdvanceTo(row));
+    IdType local_row = row - chunk_begin_;
+    *available = chunk_length_ - local_row;
+    return current_chunk_->raw_values() + local_row;
+  }
+
+ private:
+  std::shared_ptr<arrow::ChunkedArray> chunked_array_;
+  int chunk_index_;
+  IdType chunk_begin_;
+  IdType chunk_length_;
+  std::shared_ptr<arrow::Int64Array> current_chunk_;
+};
+
 std::vector<IdType> SampleRelativeOffsets(IdType total_edges, IdType sample_size,
                                           std::mt19937& gen) {
   std::vector<IdType> sampled_offsets;
@@ -81,6 +135,7 @@ Result<SamplingResult> SampleNeighbors(
   std::vector<std::pair<IdType, IdType>> edge_list;
   std::vector<IdType> current_frontier = seed_nodes;
   std::mt19937 gen(seed);
+  const IdType edge_chunk_size = edge_info->GetChunkSize();
 
   for (size_t hop = 0; hop < fanout.size(); ++hop) {
     int max_neighbors = fanout[hop];
@@ -119,40 +174,54 @@ Result<SamplingResult> SampleNeighbors(
       neighbors.reserve(sample_size);
 
       if (sample_size == total_edges) {
-        IdType remaining = total_edges;
         IdType cur_off = begin_off;
+        while (cur_off < end_off) {
+          IdType edge_chunk_idx = cur_off / edge_chunk_size;
+          IdType edge_chunk_start = edge_chunk_idx * edge_chunk_size;
+          IdType edge_chunk_end =
+              std::min(end_off, edge_chunk_start + edge_chunk_size);
 
-        while (remaining > 0) {
-          GAR_RETURN_NOT_OK(adj_reader.seek(cur_off));
+          GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
           GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
           if (!chunk_table) break;
 
-          auto dst_col = std::static_pointer_cast<arrow::Int64Array>(
-              chunk_table->column(1)->chunk(0));
-          IdType batch =
-              std::min(remaining, static_cast<IdType>(dst_col->length()));
-          const int64_t* raw = dst_col->raw_values();
-          neighbors.insert(neighbors.end(), raw, raw + batch);
-          remaining -= batch;
-          cur_off += batch;
+          Int64ChunkedArrayCursor cursor(chunk_table->column(1));
+          IdType row = cur_off - edge_chunk_start;
+          IdType row_end = edge_chunk_end - edge_chunk_start;
+
+          while (row < row_end) {
+            IdType available = 0;
+            GAR_ASSIGN_OR_RAISE(auto raw, cursor.RawValuesAt(row, &available));
+            IdType batch = std::min(row_end - row, available);
+            neighbors.insert(neighbors.end(), raw, raw + batch);
+            row += batch;
+          }
+
+          cur_off = edge_chunk_end;
         }
       } else {
         auto sampled_relative_offsets =
             SampleRelativeOffsets(total_edges, sample_size, gen);
 
-        for (IdType relative_off : sampled_relative_offsets) {
-          IdType absolute_off = begin_off + relative_off;
-          GAR_RETURN_NOT_OK(adj_reader.seek(absolute_off));
+        for (size_t i = 0; i < sampled_relative_offsets.size();) {
+          IdType absolute_off = begin_off + sampled_relative_offsets[i];
+          IdType edge_chunk_idx = absolute_off / edge_chunk_size;
+          IdType edge_chunk_start = edge_chunk_idx * edge_chunk_size;
+
+          GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
           GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
           if (!chunk_table) break;
 
-          auto dst_col = std::static_pointer_cast<arrow::Int64Array>(
-              chunk_table->column(1)->chunk(0));
-          if (dst_col->length() == 0) {
-            return Status::Invalid("Sampled edge offset ", absolute_off,
-                                   " is out of range in edge chunk");
+          Int64ChunkedArrayCursor cursor(chunk_table->column(1));
+          while (i < sampled_relative_offsets.size()) {
+            absolute_off = begin_off + sampled_relative_offsets[i];
+            if (absolute_off / edge_chunk_size != edge_chunk_idx) break;
+
+            GAR_ASSIGN_OR_RAISE(auto dst_node,
+                                cursor.ValueAt(absolute_off - edge_chunk_start));
+            neighbors.push_back(dst_node);
+            ++i;
           }
-          neighbors.push_back(dst_col->Value(0));
         }
       }
 
