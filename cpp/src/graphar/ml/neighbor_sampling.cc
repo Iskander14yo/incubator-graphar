@@ -9,6 +9,7 @@
 #include "arrow/api.h"
 #include "arrow/compute/api.h"
 #include "graphar/arrow/chunk_reader.h"
+#include "graphar/filesystem.h"
 #include "graphar/graph_info.h"
 #include "graphar/result.h"
 #include "graphar/types.h"
@@ -25,16 +26,16 @@ class Int64ChunkedArrayCursor {
         chunk_index_(0),
         chunk_begin_(0),
         chunk_length_(0) {
-    if (chunked_array_ != nullptr && chunked_array_->num_chunks() > 0) {
-      current_chunk_ = std::static_pointer_cast<arrow::Int64Array>(
-          chunked_array_->chunk(chunk_index_));
-      chunk_length_ = current_chunk_->length();
-    }
+    Reset();
   }
 
   Status AdvanceTo(IdType row) {
     if (chunked_array_ == nullptr || chunked_array_->num_chunks() == 0) {
-      return Status::Invalid("Adjacency chunk has no destination rows");
+      return Status::Invalid("Chunked int64 column has no rows");
+    }
+
+    if (row < chunk_begin_) {
+      Reset();
     }
 
     while (row >= chunk_begin_ + chunk_length_) {
@@ -64,12 +65,41 @@ class Int64ChunkedArrayCursor {
   }
 
  private:
+  void Reset() {
+    chunk_index_ = 0;
+    chunk_begin_ = 0;
+    chunk_length_ = 0;
+    current_chunk_.reset();
+    if (chunked_array_ != nullptr && chunked_array_->num_chunks() > 0) {
+      current_chunk_ = std::static_pointer_cast<arrow::Int64Array>(
+          chunked_array_->chunk(chunk_index_));
+      chunk_length_ = current_chunk_->length();
+    }
+  }
+
   std::shared_ptr<arrow::ChunkedArray> chunked_array_;
   int chunk_index_;
   IdType chunk_begin_;
   IdType chunk_length_;
   std::shared_ptr<arrow::Int64Array> current_chunk_;
 };
+
+Result<std::shared_ptr<arrow::ChunkedArray>> LoadOffsetColumn(
+    const std::shared_ptr<FileSystem>& fs, const std::string& prefix,
+    const std::shared_ptr<EdgeInfo>& edge_info, AdjListType adj_list_type,
+    IdType vertex_chunk_idx) {
+  GAR_ASSIGN_OR_RAISE(
+      auto chunk_file_path,
+      edge_info->GetAdjListOffsetFilePath(vertex_chunk_idx, adj_list_type));
+  auto file_type = edge_info->GetAdjacentList(adj_list_type)->GetFileType();
+  GAR_ASSIGN_OR_RAISE(auto table,
+                      fs->ReadFileToTable(prefix + chunk_file_path, file_type));
+  if (table->num_columns() == 0) {
+    return Status::Invalid("Offset file for edge type '",
+                           edge_info->GetEdgeType(), "' has no columns");
+  }
+  return table->column(0);
+}
 
 }  // namespace
 
@@ -93,12 +123,15 @@ Result<SamplingResult> SampleNeighbors(
   }
 
   const std::string& prefix = graph_info->GetPrefix();
+  std::string normalized_prefix;
+  GAR_ASSIGN_OR_RAISE(auto fs,
+                      FileSystemFromUriOrPath(prefix, &normalized_prefix));
   const auto adj_type = AdjListType::ordered_by_source;
   const IdType src_chunk_size = edge_info->GetSrcChunkSize();
 
-  // Persistent readers — chunk caches survive across seeks within the same chunk,
-  // unlike EdgesCollection/EdgeIter which re-create readers per source node.
-  AdjListOffsetArrowChunkReader offset_reader(edge_info, adj_type, prefix);
+  // Persistent reader — chunk caches survive across seeks within the same
+  // chunk, unlike EdgesCollection/EdgeIter which re-create readers per source
+  // node.
   AdjListArrowChunkReader adj_reader(edge_info, adj_type, prefix);
 
   std::unordered_set<IdType> all_sampled_nodes_set(seed_nodes.begin(),
@@ -123,11 +156,11 @@ Result<SamplingResult> SampleNeighbors(
         ++group_end;
       }
 
-      GAR_RETURN_NOT_OK(offset_reader.seek(vertex_chunk_idx * src_chunk_size));
-      GAR_ASSIGN_OR_RAISE(auto offset_arr, offset_reader.GetChunk());
-      auto full_offsets = std::static_pointer_cast<arrow::Int64Array>(offset_arr);
-      const int64_t* raw_offsets = full_offsets->raw_values();
-      IdType offset_len = full_offsets->length();
+      GAR_ASSIGN_OR_RAISE(
+          auto offset_column, LoadOffsetColumn(fs, normalized_prefix, edge_info,
+                                               adj_type, vertex_chunk_idx));
+      Int64ChunkedArrayCursor offset_cursor(offset_column);
+      IdType offset_len = offset_column->length();
 
       GAR_RETURN_NOT_OK(adj_reader.seek_chunk_index(vertex_chunk_idx));
 
@@ -140,8 +173,8 @@ Result<SamplingResult> SampleNeighbors(
         IdType local_idx = src_node - vertex_chunk_idx * src_chunk_size;
         if (local_idx + 1 >= offset_len) continue;
 
-        IdType begin_off = raw_offsets[local_idx];
-        IdType end_off = raw_offsets[local_idx + 1];
+        GAR_ASSIGN_OR_RAISE(auto begin_off, offset_cursor.ValueAt(local_idx));
+        GAR_ASSIGN_OR_RAISE(auto end_off, offset_cursor.ValueAt(local_idx + 1));
         if (begin_off >= end_off) continue;
 
         IdType total_edges = end_off - begin_off;
@@ -201,7 +234,7 @@ Result<SamplingResult> SampleNeighbors(
 
   // Convert to result format
   SamplingResult result;
-  
+
   // Create ordered list of sampled nodes
   result.sampled_nodes.assign(all_sampled_nodes_set.begin(),
                               all_sampled_nodes_set.end());
