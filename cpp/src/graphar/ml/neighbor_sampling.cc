@@ -18,6 +18,29 @@ namespace graphar::ml {
 
 namespace {
 
+void AppendReservoirSample(std::vector<IdType>* neighbors, IdType* seen_neighbors,
+                           const int64_t* values, IdType count, int max_neighbors,
+                           std::mt19937* gen) {
+  if (max_neighbors == 0) {
+    *seen_neighbors += count;
+    return;
+  }
+
+  for (IdType i = 0; i < count; ++i) {
+    IdType current = *seen_neighbors;
+    if (neighbors->size() < static_cast<size_t>(max_neighbors)) {
+      neighbors->push_back(values[i]);
+    } else {
+      std::uniform_int_distribution<IdType> dist(0, current);
+      IdType replace_idx = dist(*gen);
+      if (replace_idx < max_neighbors) {
+        (*neighbors)[replace_idx] = values[i];
+      }
+    }
+    *seen_neighbors = current + 1;
+  }
+}
+
 class Int64ChunkedArrayCursor {
  public:
   explicit Int64ChunkedArrayCursor(
@@ -110,6 +133,11 @@ Result<SamplingResult> SampleNeighbors(
     uint64_t seed) {
   if (seed_nodes.empty()) return SamplingResult{};
   if (fanout.empty()) return Status::Invalid("Fanout cannot be empty");
+  for (size_t hop = 0; hop < fanout.size(); ++hop) {
+    if (fanout[hop] < 0) {
+      return Status::Invalid("Fanout at hop ", hop, " cannot be negative");
+    }
+  }
 
   auto edge_info = graph_info->GetEdgeInfo(vertex_type, edge_type, vertex_type);
   if (!edge_info) {
@@ -179,7 +207,8 @@ Result<SamplingResult> SampleNeighbors(
 
         IdType total_edges = end_off - begin_off;
         std::vector<IdType> neighbors;
-        neighbors.reserve(total_edges);
+        neighbors.reserve(std::min<IdType>(total_edges, max_neighbors));
+        IdType seen_neighbors = 0;
 
         IdType cur_off = begin_off;
         while (cur_off < end_off) {
@@ -206,16 +235,16 @@ Result<SamplingResult> SampleNeighbors(
             GAR_ASSIGN_OR_RAISE(auto raw,
                                 cached_cursor->RawValuesAt(row, &available));
             IdType batch = std::min(row_end - row, available);
-            neighbors.insert(neighbors.end(), raw, raw + batch);
+            AppendReservoirSample(&neighbors, &seen_neighbors, raw, batch,
+                                  max_neighbors, &gen);
             row += batch;
           }
 
           cur_off = edge_chunk_end;
         }
 
-        if (static_cast<int>(neighbors.size()) > max_neighbors) {
+        if (total_edges > max_neighbors) {
           std::shuffle(neighbors.begin(), neighbors.end(), gen);
-          neighbors.resize(max_neighbors);
         }
 
         for (IdType dst_node : neighbors) {
