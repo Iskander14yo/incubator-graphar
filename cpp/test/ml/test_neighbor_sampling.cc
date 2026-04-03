@@ -209,6 +209,14 @@ TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - empty fanout") {
   REQUIRE(result.status().IsInvalid());
 }
 
+TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - negative fanout") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+
+  auto result = SampleNeighbors(graph_info, kVertexType, kEdgeType, {0}, {-1}, 42);
+  REQUIRE(result.has_error());
+  REQUIRE(result.status().IsInvalid());
+}
+
 //////////////////////////// GetNodeFeatures /////////////////////////////////////
 
 TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - single property on ldbc_sample") {
