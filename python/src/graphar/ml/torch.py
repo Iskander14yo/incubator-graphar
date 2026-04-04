@@ -122,12 +122,6 @@ def _as_unique_list(values: Sequence[int]) -> list[int]:
         unique_values.append(value)
     return unique_values
 
-# TODO: check this invariant in source
-def _reorder_sampled_nodes(sampled_nodes: Sequence[int], seed_nodes: Sequence[int]) -> list[int]:
-    seed_set = set(seed_nodes)
-    rest = [node for node in sampled_nodes if node not in seed_set]
-    return [*seed_nodes, *rest]
-
 # TODO: unclear what this function does
 def _hop_stats(
     num_hops: int, seed_count: int, edge_index: torch.Tensor
@@ -229,20 +223,9 @@ class GARNeighborLoader(IterableDataset):
             seed=seed,
         )
 
-        sampled_nodes = [int(node) for node in sampling.sampled_nodes]
-        n_id_list = _reorder_sampled_nodes(sampled_nodes, seed_nodes)  # TODO: need to do this in general, not only for seed_nodes
-
-        old_nodes = [int(node) for node in sampling.sampled_nodes]  # TODO: comment, what happens below
-        old_idx_to_node = old_nodes
-        new_idx_by_node = {node: idx for idx, node in enumerate(n_id_list)}
-
-        src_list: list[int] = []
-        dst_list: list[int] = []
-        for src_idx, dst_idx in zip(sampling.src_indices, sampling.dst_indices):
-            src_node = old_idx_to_node[int(src_idx)]
-            dst_node = old_idx_to_node[int(dst_idx)]
-            src_list.append(new_idx_by_node[src_node])
-            dst_list.append(new_idx_by_node[dst_node])
+        n_id_list = [int(node) for node in sampling.sampled_nodes]
+        src_list = [int(src_idx) for src_idx in sampling.src_indices]
+        dst_list = [int(dst_idx) for dst_idx in sampling.dst_indices]
 
         if src_list:
             edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
