@@ -46,4 +46,6 @@ echo "Smoke test: Neo4j loaders"
 .venv/bin/python exps/scripts/05_smoke_train_neo4j.py --config "${BENCHMARK_CONFIG}"
 
 echo "Run benchmark"
-.venv/bin/python exps/scripts/04_run_benchmark.py --config "${BENCHMARK_CONFIG}"
+sudo perf record -g -F 99 --call-graph dwarf .venv/bin/python exps/scripts/04_run_benchmark.py --config "${BENCHMARK_CONFIG}"
+sudo perf report --stdio > exps/results/profiles/gar_perf.txt
+sudo perf script | ./FlameGraph/stackcollapse-perf.pl > out.folded
