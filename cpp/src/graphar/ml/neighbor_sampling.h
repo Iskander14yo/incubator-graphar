@@ -16,7 +16,7 @@ namespace graphar::ml {
  * Result of neighbor sampling operation.
  */
 struct SamplingResult {
-  std::vector<IdType> sampled_nodes;  // Unique internal IDs [N]
+  std::vector<IdType> sampled_nodes;  // Unique internal IDs in sampling order [N]
   std::vector<IdType> src_indices;    // Edge sources as indices [E]
   std::vector<IdType> dst_indices;    // Edge dests as indices [E]
 };

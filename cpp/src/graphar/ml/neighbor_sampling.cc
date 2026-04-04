@@ -162,8 +162,14 @@ Result<SamplingResult> SampleNeighbors(
   // node.
   AdjListArrowChunkReader adj_reader(edge_info, adj_type, prefix);
 
-  std::unordered_set<IdType> all_sampled_nodes_set(seed_nodes.begin(),
-                                                   seed_nodes.end());
+  std::unordered_set<IdType> all_sampled_nodes_set;
+  std::vector<IdType> sampled_nodes;
+  sampled_nodes.reserve(seed_nodes.size());
+  for (IdType seed_node : seed_nodes) {
+    if (all_sampled_nodes_set.insert(seed_node).second) {
+      sampled_nodes.push_back(seed_node);
+    }
+  }
   std::vector<std::pair<IdType, IdType>> edge_list;
   std::vector<IdType> current_frontier = seed_nodes;
   std::mt19937 gen(seed);
@@ -250,6 +256,7 @@ Result<SamplingResult> SampleNeighbors(
         for (IdType dst_node : neighbors) {
           edge_list.emplace_back(src_node, dst_node);
           if (all_sampled_nodes_set.insert(dst_node).second) {
+            sampled_nodes.push_back(dst_node);
             next_frontier.push_back(dst_node);
           }
         }
@@ -265,9 +272,7 @@ Result<SamplingResult> SampleNeighbors(
   SamplingResult result;
 
   // Create ordered list of sampled nodes
-  result.sampled_nodes.assign(all_sampled_nodes_set.begin(),
-                              all_sampled_nodes_set.end());
-  std::sort(result.sampled_nodes.begin(), result.sampled_nodes.end());
+  result.sampled_nodes = std::move(sampled_nodes);
 
   // Create node ID to index mapping
   std::unordered_map<IdType, IdType> node_to_index;

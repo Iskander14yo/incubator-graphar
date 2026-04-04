@@ -165,7 +165,7 @@ TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - multiple seeds on ldbc_sample
 
   const auto& sampling = result.value();
   REQUIRE(sampling.sampled_nodes ==
-          std::vector<IdType>{0, 1, 58, 87, 318, 538, 539, 623, 696, 849});
+          std::vector<IdType>{0, 1, 87, 623, 849, 58, 318, 538, 539, 696});
   REQUIRE(ToNodeEdges(sampling) == std::vector<std::pair<IdType, IdType>>{
                                       {0, 87},  {0, 623}, {0, 849}, {1, 58},
                                       {1, 318}, {1, 538}, {1, 539}, {1, 696}});

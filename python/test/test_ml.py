@@ -119,3 +119,22 @@ def test_sample_neighbors_deterministic_with_seed(ldbc_graph):
     assert result1.sampled_nodes == result2.sampled_nodes
     assert result1.src_indices == result2.src_indices
     assert result1.dst_indices == result2.dst_indices
+
+
+def test_sample_neighbors_preserves_sampling_order(ldbc_graph):
+    seeds = [0, 1]
+    fanout = [10]
+
+    result = gar_ml.sample_neighbors(ldbc_graph, "person", "knows", seeds, fanout, seed=42)
+
+    assert result.sampled_nodes == [0, 1, 87, 623, 849, 58, 318, 538, 539, 696]
+    assert list(zip(result.src_indices, result.dst_indices)) == [
+        (0, 2),
+        (0, 3),
+        (0, 4),
+        (1, 5),
+        (1, 6),
+        (1, 7),
+        (1, 8),
+        (1, 9),
+    ]

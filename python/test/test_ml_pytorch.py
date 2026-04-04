@@ -211,3 +211,21 @@ def test_valid_batch_with_zero_fanout(ldbc_graph):
     assert batch.batch_size == 2
     assert batch.n_id.tolist() == [0, 1]
     assert edge_index.shape == (2, 0)
+
+
+def test_loader_keeps_sampler_order(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1],
+        num_neighbors=[10],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+    )
+    batch = next(iter(loader))
+
+    assert batch.n_id.tolist() == [0, 1, 87, 623, 849, 58, 318, 538, 539, 696]
+    assert batch.edge_index.tolist() == [
+        [0, 0, 0, 1, 1, 1, 1, 1],
+        [2, 3, 4, 5, 6, 7, 8, 9],
+    ]
