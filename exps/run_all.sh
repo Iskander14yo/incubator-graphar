@@ -45,7 +45,15 @@ echo "Smoke test: GAR training loop"
 echo "Smoke test: Neo4j loaders"
 .venv/bin/python exps/scripts/05_smoke_train_neo4j.py --config "${BENCHMARK_CONFIG}"
 
-echo "Run benchmark"
-sudo perf record -g -F 99 --call-graph dwarf .venv/bin/python exps/scripts/04_run_benchmark.py --config "${BENCHMARK_CONFIG}"
-sudo perf report --stdio > exps/results/profiles/gar_perf.txt
-sudo perf script | ./FlameGraph/stackcollapse-perf.pl > out.folded
+DATASET=$(grep '^dataset:' "${BENCHMARK_CONFIG}" | awk '{print $2}')
+RESULT_DIR="exps/results/${DATASET}/$(date +%Y%m%d-%H%M)"
+mkdir -p "${RESULT_DIR}"
+
+echo "Run benchmark (result dir: ${RESULT_DIR})"
+sudo perf record -g -F 99 --call-graph dwarf \
+  .venv/bin/python exps/scripts/04_run_benchmark.py --config "${BENCHMARK_CONFIG}" --result-dir "${RESULT_DIR}"
+sudo perf report --stdio > "${RESULT_DIR}/gar_perf.txt"
+sudo perf script | ./FlameGraph/stackcollapse-perf.pl > "${RESULT_DIR}/out.folded"
+
+echo "Analyze results"
+sudo .venv/bin/python exps/analyze.py "${RESULT_DIR}" --plots

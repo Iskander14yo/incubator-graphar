@@ -272,7 +272,7 @@ def _run_loader(
 # Main
 # ---------------------------------------------------------------------------
 
-def run_benchmark(config: BenchmarkConfig) -> None:
+def run_benchmark(config: BenchmarkConfig, result_dir: Path | None = None) -> None:
     loaders_to_run = config.loaders
     num_runs = config.num_runs
     dataset = config.dataset
@@ -280,9 +280,13 @@ def run_benchmark(config: BenchmarkConfig) -> None:
 
     torch.manual_seed(seed)
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M")
-    result_dir = Path("exps/results") / dataset / timestamp
-    result_dir.mkdir(parents=True, exist_ok=True)
+    if result_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M")
+        result_dir = Path("exps/results") / dataset / timestamp
+        result_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        result_dir = Path(result_dir)
+        timestamp = result_dir.name
 
     sha = _git_sha()
     cfg_dump = dataclasses.asdict(config)
@@ -327,7 +331,9 @@ def run_benchmark(config: BenchmarkConfig) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", type=Path, default=DEFAULT_PATH, help="Benchmark YAML.")
-    run_benchmark(load_config(p.parse_args().config))
+    p.add_argument("--result-dir", type=Path, default=None, help="Pre-created output directory.")
+    args = p.parse_args()
+    run_benchmark(load_config(args.config), result_dir=args.result_dir)
 
 
 if __name__ == "__main__":
