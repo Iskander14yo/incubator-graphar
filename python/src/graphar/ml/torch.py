@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pyarrow as pa
@@ -165,6 +166,7 @@ class GARNeighborLoader(IterableDataset):
         batch_size: int = 128,
         shuffle: bool = True,
         features: list[str] | None = None,
+        num_workers: int = 0,
     ) -> None:
         if batch_size <= 0:
             msg = "batch_size must be > 0"
@@ -172,12 +174,16 @@ class GARNeighborLoader(IterableDataset):
         if not num_neighbors:
             msg = "num_neighbors must not be empty"
             raise ValueError(msg)
+        if num_workers < 0:
+            msg = "num_workers must be >= 0"
+            raise ValueError(msg)
         self.graph_info = graph_info
         self.vertex_type = vertex_type
         self.edge_type = edge_type
         self.num_neighbors = [int(v) for v in num_neighbors]  # TODO: review whether casts are needed
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
+        self.num_workers = int(num_workers)
         self._input_nodes = _as_unique_list(
             _normalize_input_nodes(graph_info, vertex_type, input_nodes)
         )
@@ -212,8 +218,7 @@ class GARNeighborLoader(IterableDataset):
             torch.randint(2**32, (1,), generator=self._rng, dtype=torch.int64).item()
         )
 
-    def _build_batch(self, seed_nodes: list[int]) -> Data:
-        seed = self._sample_seed()
+    def _build_batch(self, seed_nodes: list[int], seed: int) -> Data:
         sampling = gar_ml.sample_neighbors(
             self.graph_info,
             self.vertex_type,
@@ -257,5 +262,8 @@ class GARNeighborLoader(IterableDataset):
         return batch
 
     def __iter__(self) -> Iterator[Data]:
-        for seed_nodes in self._iter_input_batches():
-            yield self._build_batch(seed_nodes)
+        jobs = [(seed_nodes, self._sample_seed()) for seed_nodes in self._iter_input_batches()]
+        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = [executor.submit(self._build_batch, seed_nodes, seed) for seed_nodes, seed in jobs]
+            for future in futures:
+                yield future.result()

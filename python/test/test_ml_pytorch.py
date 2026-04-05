@@ -22,11 +22,12 @@ def _make_loader(
     batch_size=2,
     shuffle=False,
     features=None,
+    num_workers=0,
 ):
     if num_neighbors is None:
         num_neighbors = [5]
-    return GARNeighborLoader(
-        ldbc_graph,
+    kwargs = dict(
+        graph_info=ldbc_graph,
         vertex_type="person",
         edge_type="knows",
         num_neighbors=num_neighbors,
@@ -34,7 +35,9 @@ def _make_loader(
         batch_size=batch_size,
         shuffle=shuffle,
         features=features,
+        num_workers=num_workers,
     )
+    return GARNeighborLoader(**kwargs)
 
 
 def _batch_tensors(batch: Data) -> tuple[torch.Tensor, torch.Tensor]:
@@ -229,3 +232,59 @@ def test_loader_keeps_sampler_order(ldbc_graph):
         [0, 0, 0, 1, 1, 1, 1, 1],
         [2, 3, 4, 5, 6, 7, 8, 9],
     ]
+
+
+def test_multi_worker_matches_single_worker_shuffle_false(ldbc_graph):
+    single_worker_loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3, 4, 5],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        num_workers=0,
+    )
+    multi_worker_loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3, 4, 5],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        num_workers=2,
+    )
+
+    assert _epoch_signature(single_worker_loader) == _epoch_signature(multi_worker_loader)
+
+
+def test_multi_worker_shuffle_false_keeps_batch_order(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3, 4, 5],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        num_workers=2,
+    )
+
+    assert [batch.input_id.tolist() for batch in loader] == [[0, 1], [2, 3], [4, 5]]
+
+
+def test_multi_worker_is_deterministic_across_sessions(ldbc_graph):
+    loader1 = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3, 4, 5],
+        features=["id"],
+        batch_size=2,
+        shuffle=True,
+        num_workers=2,
+    )
+    loader2 = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3, 4, 5],
+        features=["id"],
+        batch_size=2,
+        shuffle=True,
+        num_workers=2,
+    )
+
+    assert _epoch_signature(loader1) == _epoch_signature(loader2)
+    assert _epoch_signature(loader1) == _epoch_signature(loader2)
