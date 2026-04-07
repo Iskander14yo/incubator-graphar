@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import struct
+import time
+from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -11,6 +13,25 @@ from torch.utils.data import IterableDataset
 from torch_geometric.data import Data
 
 import graphar.ml as gar_ml
+
+
+# _Timer lives here for debugging/benching purposes
+class _Timer:
+    """Context manager that appends elapsed seconds to store[name]."""
+
+    __slots__ = ("_name", "_store", "_t")
+
+    def __init__(self, name: str, store: dict) -> None:
+        self._name = name
+        self._store = store
+
+    def __enter__(self) -> _Timer:
+        self._t = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, *_) -> None:
+        if exc_type is None:
+            self._store[self._name].append(time.perf_counter() - self._t)
 
 
 def _chunked_array_to_tensor(column: pa.ChunkedArray) -> torch.Tensor:
@@ -195,6 +216,7 @@ class GARNeighborLoader(IterableDataset):
         _validate_numeric_features(graph_info, vertex_type, self.features)
         self._rng = torch.Generator()  # used for both dataset shuffling and sampling seeds
         self._rng.manual_seed(int(torch.initial_seed()))
+        self._timings: defaultdict = defaultdict(list)
 
     def __len__(self) -> int:
         if not self._input_nodes:
@@ -218,15 +240,18 @@ class GARNeighborLoader(IterableDataset):
             torch.randint(2**32, (1,), generator=self._rng, dtype=torch.int64).item()
         )
 
-    def _build_batch(self, seed_nodes: list[int], seed: int) -> Data:
-        sampling = gar_ml.sample_neighbors(
-            self.graph_info,
-            self.vertex_type,
-            self.edge_type,
-            seed_nodes,
-            self.num_neighbors,
-            seed=seed,
-        )
+    def _build_batch(self, seed_nodes: list[int], seed: int) -> tuple[Data, defaultdict]:
+        t: defaultdict = defaultdict(list)
+
+        with _Timer("sampling", t):
+            sampling = gar_ml.sample_neighbors(
+                self.graph_info,
+                self.vertex_type,
+                self.edge_type,
+                seed_nodes,
+                self.num_neighbors,
+                seed=seed,
+            )
 
         n_id_list = [int(node) for node in sampling.sampled_nodes]
         src_list = [int(src_idx) for src_idx in sampling.src_indices]
@@ -238,10 +263,12 @@ class GARNeighborLoader(IterableDataset):
             edge_index = torch.empty((2, 0), dtype=torch.long)
 
         if self.features:
-            feature_table = gar_ml.get_node_features(
-                self.graph_info, self.vertex_type, n_id_list, self.features
-            )
-            x = _table_to_feature_tensor(feature_table)
+            with _Timer("feature_fetch", t):
+                feature_table = gar_ml.get_node_features(
+                    self.graph_info, self.vertex_type, n_id_list, self.features
+                )
+            with _Timer("conversion", t):
+                x = _table_to_feature_tensor(feature_table)
         else:
             x = torch.empty((len(n_id_list), 0), dtype=torch.float32)
 
@@ -259,11 +286,14 @@ class GARNeighborLoader(IterableDataset):
         batch.num_sampled_edges = torch.tensor(num_sampled_edges, dtype=torch.long)  # TODO: why list? need to check
         batch.vertex_type = self.vertex_type
         batch.edge_type = self.edge_type
-        return batch
+        return batch, t
 
     def __iter__(self) -> Iterator[Data]:
         jobs = [(seed_nodes, self._sample_seed()) for seed_nodes in self._iter_input_batches()]
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
             futures = [executor.submit(self._build_batch, seed_nodes, seed) for seed_nodes, seed in jobs]
             for future in futures:
-                yield future.result()
+                batch, t = future.result()
+                for key, values in t.items():
+                    self._timings[key].extend(values)
+                yield batch
