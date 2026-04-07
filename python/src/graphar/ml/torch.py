@@ -290,10 +290,15 @@ class GARNeighborLoader(IterableDataset):
 
     def __iter__(self) -> Iterator[Data]:
         jobs = [(seed_nodes, self._sample_seed()) for seed_nodes in self._iter_input_batches()]
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            futures = [executor.submit(self._build_batch, seed_nodes, seed) for seed_nodes, seed in jobs]
+        executor = ThreadPoolExecutor(max_workers=self.num_workers)
+        futures = [executor.submit(self._build_batch, seed_nodes, seed) for seed_nodes, seed in jobs]
+        try:
             for future in futures:
                 batch, t = future.result()
                 for key, values in t.items():
                     self._timings[key].extend(values)
                 yield batch
+        finally:
+            # Cancel queued futures that haven't started yet (e.g. early consumer exit).
+            # cancel_futures=True (3.9+) avoids blocking on the full pre-submitted queue.
+            executor.shutdown(wait=True, cancel_futures=True)
