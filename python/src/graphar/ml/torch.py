@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import struct
 import time
-from collections import defaultdict, deque
+from collections import deque
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import pyarrow as pa
@@ -15,23 +16,13 @@ from torch_geometric.data import Data
 import graphar.ml as gar_ml
 
 
-# _Timer lives here for debugging/benching purposes
-class _Timer:
-    """Context manager that appends elapsed seconds to store[name]."""
-
-    __slots__ = ("_name", "_store", "_t")
-
-    def __init__(self, name: str, store: dict) -> None:
-        self._name = name
-        self._store = store
-
-    def __enter__(self) -> _Timer:
-        self._t = time.perf_counter()
-        return self
-
-    def __exit__(self, exc_type, *_) -> None:
-        if exc_type is None:
-            self._store[self._name].append(time.perf_counter() - self._t)
+@dataclass
+class BatchProfile:
+    """Per-batch timing breakdown produced by GARNeighborLoader.profile()."""
+    total_ms: float
+    sampling_ms: float
+    feature_fetch_ms: float
+    conversion_ms: float
 
 
 def _chunked_array_to_tensor(column: pa.ChunkedArray) -> torch.Tensor:
@@ -216,7 +207,6 @@ class GARNeighborLoader(IterableDataset):
         _validate_numeric_features(graph_info, vertex_type, self.features)
         self._rng = torch.Generator()  # used for both dataset shuffling and sampling seeds
         self._rng.manual_seed(int(torch.initial_seed()))
-        self._timings: defaultdict = defaultdict(list)
 
     def __len__(self) -> int:
         if not self._input_nodes:
@@ -240,18 +230,19 @@ class GARNeighborLoader(IterableDataset):
             torch.randint(2**32, (1,), generator=self._rng, dtype=torch.int64).item()
         )
 
-    def _build_batch(self, seed_nodes: list[int], seed: int) -> tuple[Data, defaultdict]:
-        t: defaultdict = defaultdict(list)
+    def _build_batch(self, seed_nodes: list[int], seed: int) -> tuple[Data, BatchProfile]:
+        t_total = time.perf_counter()
 
-        with _Timer("sampling", t):
-            sampling = gar_ml.sample_neighbors(
-                self.graph_info,
-                self.vertex_type,
-                self.edge_type,
-                seed_nodes,
-                self.num_neighbors,
-                seed=seed,
-            )
+        t_s = time.perf_counter()
+        sampling = gar_ml.sample_neighbors(
+            self.graph_info,
+            self.vertex_type,
+            self.edge_type,
+            seed_nodes,
+            self.num_neighbors,
+            seed=seed,
+        )
+        sampling_ms = (time.perf_counter() - t_s) * 1000
 
         n_id_list = [int(node) for node in sampling.sampled_nodes]
         src_list = [int(src_idx) for src_idx in sampling.src_indices]
@@ -262,13 +253,18 @@ class GARNeighborLoader(IterableDataset):
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
 
+        feature_fetch_ms = 0.0
+        conversion_ms = 0.0
         if self.features:
-            with _Timer("feature_fetch", t):
-                feature_table = gar_ml.get_node_features(
-                    self.graph_info, self.vertex_type, n_id_list, self.features
-                )
-            with _Timer("conversion", t):
-                x = _table_to_feature_tensor(feature_table)
+            t_s = time.perf_counter()
+            feature_table = gar_ml.get_node_features(
+                self.graph_info, self.vertex_type, n_id_list, self.features
+            )
+            feature_fetch_ms = (time.perf_counter() - t_s) * 1000
+
+            t_s = time.perf_counter()
+            x = _table_to_feature_tensor(feature_table)
+            conversion_ms = (time.perf_counter() - t_s) * 1000
         else:
             x = torch.empty((len(n_id_list), 0), dtype=torch.float32)
 
@@ -286,15 +282,24 @@ class GARNeighborLoader(IterableDataset):
         batch.num_sampled_edges = torch.tensor(num_sampled_edges, dtype=torch.long)  # TODO: why list? need to check
         batch.vertex_type = self.vertex_type
         batch.edge_type = self.edge_type
-        return batch, t
+
+        prof = BatchProfile(
+            total_ms=(time.perf_counter() - t_total) * 1000,
+            sampling_ms=sampling_ms,
+            feature_fetch_ms=feature_fetch_ms,
+            conversion_ms=conversion_ms,
+        )
+        return batch, prof
 
     def __iter__(self) -> Iterator[Data]:
-        for batch, t in self._iter_batches():
-            for key, values in t.items():
-                self._timings[key].extend(values)
+        for batch, _ in self._iter_batches():
             yield batch
 
-    def _iter_batches(self) -> Iterator[tuple[Data, defaultdict]]:
+    def profile(self) -> Iterator[tuple[Data, BatchProfile]]:
+        """Like __iter__, but yields (batch, BatchProfile) with per-batch timings."""
+        yield from self._iter_batches()
+
+    def _iter_batches(self) -> Iterator[tuple[Data, BatchProfile]]:
         """Yields (batch, timings) for both sequential and parallel modes."""
         jobs = ((nodes, self._sample_seed()) for nodes in self._iter_input_batches())
         if self.num_workers == 0:
