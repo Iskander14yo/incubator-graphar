@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import struct
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -289,16 +289,24 @@ class GARNeighborLoader(IterableDataset):
         return batch, t
 
     def __iter__(self) -> Iterator[Data]:
-        jobs = [(seed_nodes, self._sample_seed()) for seed_nodes in self._iter_input_batches()]
-        executor = ThreadPoolExecutor(max_workers=self.num_workers)
-        futures = [executor.submit(self._build_batch, seed_nodes, seed) for seed_nodes, seed in jobs]
-        try:
-            for future in futures:
-                batch, t = future.result()
-                for key, values in t.items():
-                    self._timings[key].extend(values)
-                yield batch
-        finally:
-            # Cancel queued futures that haven't started yet (e.g. early consumer exit).
-            # cancel_futures=True (3.9+) avoids blocking on the full pre-submitted queue.
-            executor.shutdown(wait=True, cancel_futures=True)
+        for batch, t in self._iter_batches():
+            for key, values in t.items():
+                self._timings[key].extend(values)
+            yield batch
+
+    def _iter_batches(self) -> Iterator[tuple[Data, defaultdict]]:
+        """Yields (batch, timings) for both sequential and parallel modes."""
+        jobs = ((nodes, self._sample_seed()) for nodes in self._iter_input_batches())
+        if self.num_workers == 0:
+            for seed_nodes, seed in jobs:
+                yield self._build_batch(seed_nodes, seed)
+        else:
+            in_flight: deque = deque()
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                for seed_nodes, seed in jobs:
+                    in_flight.append(executor.submit(self._build_batch, seed_nodes, seed))
+                    if len(in_flight) < self.num_workers:
+                        continue
+                    yield in_flight.popleft().result()
+                while in_flight:
+                    yield in_flight.popleft().result()
