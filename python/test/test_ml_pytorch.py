@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import threading
+import unittest.mock as mock
+
 import pytest
 import torch
 from torch_geometric.data import Data
 
 import graphar as gar
-from graphar.ml.torch import GARNeighborLoader
+from graphar.ml.torch import BatchProfile, GARNeighborLoader
 
 
 @pytest.fixture
@@ -288,3 +291,93 @@ def test_multi_worker_is_deterministic_across_sessions(ldbc_graph):
 
     assert _epoch_signature(loader1) == _epoch_signature(loader2)
     assert _epoch_signature(loader1) == _epoch_signature(loader2)
+
+
+# ---------------------------------------------------------------------------
+# profile()
+# ---------------------------------------------------------------------------
+
+def test_profile_yields_batch_profile_pairs(ldbc_graph):
+    loader = _make_loader(ldbc_graph, input_nodes=[0, 1, 2, 3], features=["id"], batch_size=2)
+    for batch, prof in loader.profile():
+        assert isinstance(batch, Data)
+        assert isinstance(prof, BatchProfile)
+
+
+def test_profile_timings_are_non_negative(ldbc_graph):
+    loader = _make_loader(ldbc_graph, input_nodes=[0, 1, 2, 3], features=["id"], batch_size=2)
+    for _, prof in loader.profile():
+        assert prof.total_ms >= 0
+        assert prof.sampling_ms >= 0
+        assert prof.feature_fetch_ms >= 0
+        assert prof.conversion_ms >= 0
+
+
+def test_profile_total_covers_stages(ldbc_graph):
+    loader = _make_loader(ldbc_graph, input_nodes=[0, 1, 2, 3], features=["id"], batch_size=2)
+    for _, prof in loader.profile():
+        assert prof.total_ms >= prof.sampling_ms + prof.feature_fetch_ms + prof.conversion_ms
+
+
+def test_profile_batches_match_iter(ldbc_graph):
+    """profile() must yield the same batches as __iter__."""
+    iter_loader = _make_loader(
+        ldbc_graph, input_nodes=[0, 1, 2, 3, 4, 5], features=["id"], batch_size=2, shuffle=False
+    )
+    prof_loader = _make_loader(
+        ldbc_graph, input_nodes=[0, 1, 2, 3, 4, 5], features=["id"], batch_size=2, shuffle=False
+    )
+
+    iter_sig = _epoch_signature(iter_loader)
+    prof_sig = [
+        (batch.input_id.tolist(), batch.n_id.tolist(), batch.edge_index.tolist())
+        for batch, _ in prof_loader.profile()
+    ]
+    assert iter_sig == prof_sig
+
+
+def test_profile_works_with_multi_worker(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph, input_nodes=[0, 1, 2, 3, 4, 5], features=["id"], batch_size=2, num_workers=2
+    )
+    pairs = list(loader.profile())
+    assert all(isinstance(prof, BatchProfile) for _, prof in pairs)
+    assert all(prof.total_ms >= 0 for _, prof in pairs)
+
+
+# ---------------------------------------------------------------------------
+# bounded prefetch
+# ---------------------------------------------------------------------------
+
+def test_bounded_prefetch_limits_concurrency(ldbc_graph):
+    """At most num_workers _build_batch calls should run simultaneously."""
+    num_workers = 2
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=list(range(8)),
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+
+    peak = 0
+    active = 0
+    lock = threading.Lock()
+    real_build = loader._build_batch
+
+    def tracked_build(seed_nodes, seed):
+        nonlocal peak, active
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            return real_build(seed_nodes, seed)
+        finally:
+            with lock:
+                active -= 1
+
+    with mock.patch.object(loader, "_build_batch", side_effect=tracked_build):
+        list(loader)
+
+    assert peak <= num_workers
