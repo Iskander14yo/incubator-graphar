@@ -79,16 +79,6 @@ def _normalize_input_nodes(
         return [idx for idx, keep in enumerate(input_nodes) if keep]
     return [int(node) for node in input_nodes]
 
-# TODO: do we need this strange function?
-def _as_unique_list(values: Sequence[int]) -> list[int]:
-    seen: set[int] = set()
-    unique_values: list[int] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        unique_values.append(value)
-    return unique_values
 
 
 class GARNeighborLoader(IterableDataset):
@@ -122,9 +112,9 @@ class GARNeighborLoader(IterableDataset):
         self.batch_size = int(batch_size)
         self.shuffle = bool(shuffle)
         self.num_workers = int(num_workers)
-        self._input_nodes = _as_unique_list(
+        self._input_nodes = list(dict.fromkeys(  #  dict.fromkeys preserves insertion order
             _normalize_input_nodes(graph_info, vertex_type, input_nodes)
-        )
+        ))
         self.features = (
             _properties_for_vertex(graph_info, vertex_type)
             if features is None
