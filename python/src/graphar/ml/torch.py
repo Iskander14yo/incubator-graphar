@@ -41,6 +41,7 @@ def _chunked_array_to_tensor(column: pa.ChunkedArray, name: str) -> torch.Tensor
 
 
 def _table_to_feature_tensor(table: pa.Table) -> torch.Tensor:
+    """Convert pyarrow Table (from cpp binding) to pytorch Tensor"""
     if table.num_columns == 0:
         return torch.empty((table.num_rows, 0), dtype=torch.float32)
     columns = [_chunked_array_to_tensor(table.column(i), table.schema.field(i).name) for i in range(table.num_columns)]
@@ -51,7 +52,7 @@ def _properties_for_vertex(graph_info, vertex_type: str) -> list[str]:
     """Collect all properties when features=None"""
     vertex_info = graph_info.get_vertex_info(vertex_type)
     if vertex_info is None:
-        msg = f"Vertex type '{vertex_type}' not found"  # TODO: separate error type or function?
+        msg = f"Vertex type '{vertex_type}' not found"
         raise ValueError(msg)
     properties: list[str] = []
     for group in vertex_info.get_property_groups():
@@ -60,13 +61,12 @@ def _properties_for_vertex(graph_info, vertex_type: str) -> list[str]:
     return properties
 
 
-
-# TODO: add comments and/or simplify
 def _normalize_input_nodes(
     graph_info,
     vertex_type: str,
     input_nodes: Sequence[int] | torch.Tensor | None,
 ) -> list[int]:
+    """For 3 input shapes: None / bool-mask / int-list"""
     if input_nodes is None:
         return list(range(graph_info.get_vertex_count(vertex_type)))
     if isinstance(input_nodes, torch.Tensor):
@@ -108,18 +108,14 @@ class GARNeighborLoader(IterableDataset):
         self.graph_info = graph_info
         self.vertex_type = vertex_type
         self.edge_type = edge_type
-        self.num_neighbors = [int(v) for v in num_neighbors]  # TODO: review whether casts are needed
-        self.batch_size = int(batch_size)
-        self.shuffle = bool(shuffle)
-        self.num_workers = int(num_workers)
+        self.num_neighbors = num_neighbors
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.num_workers = num_workers
         self._input_nodes = list(dict.fromkeys(  #  dict.fromkeys preserves insertion order
             _normalize_input_nodes(graph_info, vertex_type, input_nodes)
         ))
-        self.features = (
-            _properties_for_vertex(graph_info, vertex_type)
-            if features is None
-            else [str(name) for name in features]
-        )
+        self.features = features or _properties_for_vertex(graph_info, vertex_type)
         self._rng = torch.Generator()  # used for both dataset shuffling and sampling seeds
         self._rng.manual_seed(int(torch.initial_seed()))
 
@@ -134,7 +130,7 @@ class GARNeighborLoader(IterableDataset):
             return
         if self.shuffle:
             order = torch.randperm(total, generator=self._rng).tolist()
-            ordered_nodes = [self._input_nodes[i] for i in order]  # TODO: does it make sense?
+            ordered_nodes = [self._input_nodes[i] for i in order]
         else:
             ordered_nodes = self._input_nodes
         for start in range(0, total, self.batch_size):
@@ -210,7 +206,7 @@ class GARNeighborLoader(IterableDataset):
             yield batch
 
     def profile(self) -> Iterator[tuple[Data, BatchProfile]]:
-        """Like __iter__, but yields (batch, BatchProfile) with per-batch timings."""
+        """Like __iter__, but yields (batch, BatchProfile) with per-batch timings for performance debugging."""
         yield from self._iter_batches()
 
     def _iter_batches(self) -> Iterator[tuple[Data, BatchProfile]]:
