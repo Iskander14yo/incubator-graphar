@@ -23,18 +23,27 @@ class BatchProfile:
     conversion_ms: float
 
 
-def _chunked_array_to_tensor(column: pa.ChunkedArray) -> torch.Tensor:
+def _chunked_array_to_tensor(column: pa.ChunkedArray, name: str) -> torch.Tensor:
     combined = column.combine_chunks()
     numpy_array = combined.to_numpy(zero_copy_only=False)
-    # from_numpy may warn if underlying array is read-only; this loader is read-only so it's ok
-    tensor = torch.from_numpy(numpy_array)
+    # it's possible to validate types on initialization:
+    # `graph_info.get_vertex_info().get_property_type(column).to_type_name()`
+    # but it requires hardcoding all numeric GAR types as strings making validation brittle
+    # therefore try-except is used
+    # no performance penalty is expected since exception isn't supposed to be raised
+    try:
+        # from_numpy may warn if underlying array is read-only; this loader is read-only so it's ok
+        tensor = torch.from_numpy(numpy_array)
+    except TypeError:
+        msg = f"Feature '{name}' cannot be converted to a tensor (non-numeric type: {column.type})"
+        raise TypeError(msg) from None
     return tensor.to(torch.float32)
 
 
 def _table_to_feature_tensor(table: pa.Table) -> torch.Tensor:
     if table.num_columns == 0:
         return torch.empty((table.num_rows, 0), dtype=torch.float32)
-    columns = [_chunked_array_to_tensor(table.column(i)) for i in range(table.num_columns)]
+    columns = [_chunked_array_to_tensor(table.column(i), table.schema.field(i).name) for i in range(table.num_columns)]
     return torch.stack(columns, dim=1)
 
 
@@ -51,41 +60,6 @@ def _properties_for_vertex(graph_info, vertex_type: str) -> list[str]:
     return properties
 
 
-def _is_numeric_type_name(type_name: str) -> bool:
-    return type_name in {  # TODO: refactor to constant
-        "int8",
-        "int16",
-        "int32",
-        "int64",
-        "uint8",
-        "uint16",
-        "uint32",
-        "uint64",
-        "float",
-        "float16",
-        "float32",
-        "float64",
-        "double",
-        "bool",
-    }
-
-
-def _validate_numeric_features(graph_info, vertex_type: str, features: Sequence[str]) -> None:
-    if not features:
-        return
-    vertex_info = graph_info.get_vertex_info(vertex_type)
-    if vertex_info is None:
-        msg = f"Vertex type '{vertex_type}' not found"
-        raise ValueError(msg)
-    invalid: list[tuple[str, str]] = []
-    for name in features:
-        type_name = vertex_info.get_property_type(name).to_type_name()  # TODO: add type mapping to original module?
-        if not _is_numeric_type_name(type_name):
-            invalid.append((name, type_name))
-    if invalid:
-        details = ", ".join(f"{name}:{type_name}" for name, type_name in invalid)
-        msg = f"Only numeric features are supported. Got non-numeric: {details}"
-        raise ValueError(msg)
 
 # TODO: add comments and/or simplify
 def _normalize_input_nodes(
@@ -156,7 +130,6 @@ class GARNeighborLoader(IterableDataset):
             if features is None
             else [str(name) for name in features]
         )
-        _validate_numeric_features(graph_info, vertex_type, self.features)
         self._rng = torch.Generator()  # used for both dataset shuffling and sampling seeds
         self._rng.manual_seed(int(torch.initial_seed()))
 
