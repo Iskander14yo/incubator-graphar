@@ -131,7 +131,12 @@ Result<SamplingResult> SampleNeighbors(
     const std::string& vertex_type, const std::string& edge_type,
     const std::vector<IdType>& seed_nodes, const std::vector<int>& fanout,
     uint64_t seed) {
-  if (seed_nodes.empty()) return SamplingResult{};
+  if (seed_nodes.empty()) {
+    SamplingResult result;
+    result.num_sampled_nodes_per_hop.assign(fanout.size() + 1, 0);
+    result.num_sampled_edges_per_hop.assign(fanout.size(), 0);
+    return result;
+  }
   if (fanout.empty()) return Status::Invalid("Fanout cannot be empty");
   for (size_t hop = 0; hop < fanout.size(); ++hop) {
     if (fanout[hop] < 0) {
@@ -174,10 +179,17 @@ Result<SamplingResult> SampleNeighbors(
   std::vector<IdType> current_frontier = seed_nodes;
   std::mt19937 gen(seed);
   const IdType edge_chunk_size = edge_info->GetChunkSize();
+  std::vector<IdType> num_sampled_nodes_per_hop;
+  num_sampled_nodes_per_hop.reserve(fanout.size() + 1);
+  num_sampled_nodes_per_hop.push_back(sampled_nodes.size());
+  std::vector<IdType> num_sampled_edges_per_hop;
+  num_sampled_edges_per_hop.reserve(fanout.size());
 
   for (size_t hop = 0; hop < fanout.size(); ++hop) {
     int max_neighbors = fanout[hop];
     std::vector<IdType> next_frontier;
+    IdType hop_num_sampled_nodes = 0;
+    IdType hop_num_sampled_edges = 0;
 
     std::vector<IdType> sorted_frontier = current_frontier;
     std::sort(sorted_frontier.begin(), sorted_frontier.end());
@@ -255,9 +267,11 @@ Result<SamplingResult> SampleNeighbors(
 
         for (IdType dst_node : neighbors) {
           edge_list.emplace_back(src_node, dst_node);
+          ++hop_num_sampled_edges;
           if (all_sampled_nodes_set.insert(dst_node).second) {
             sampled_nodes.push_back(dst_node);
             next_frontier.push_back(dst_node);
+            ++hop_num_sampled_nodes;
           }
         }
       }
@@ -265,6 +279,8 @@ Result<SamplingResult> SampleNeighbors(
       fi = group_end;
     }
 
+    num_sampled_nodes_per_hop.push_back(hop_num_sampled_nodes);
+    num_sampled_edges_per_hop.push_back(hop_num_sampled_edges);
     current_frontier = std::move(next_frontier);
   }
 
@@ -273,6 +289,8 @@ Result<SamplingResult> SampleNeighbors(
 
   // Create ordered list of sampled nodes
   result.sampled_nodes = std::move(sampled_nodes);
+  result.num_sampled_nodes_per_hop = std::move(num_sampled_nodes_per_hop);
+  result.num_sampled_edges_per_hop = std::move(num_sampled_edges_per_hop);
 
   // Create node ID to index mapping
   std::unordered_map<IdType, IdType> node_to_index;

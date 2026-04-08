@@ -19,6 +19,8 @@ struct SamplingResult {
   std::vector<IdType> sampled_nodes;  // Unique internal IDs in sampling order [N]
   std::vector<IdType> src_indices;    // Edge sources as indices [E]
   std::vector<IdType> dst_indices;    // Edge dests as indices [E]
+  std::vector<IdType> num_sampled_nodes_per_hop;  // [num_seeds, hop_0, ...]
+  std::vector<IdType> num_sampled_edges_per_hop;  // [hop_0, hop_1, ...]
 };
 
 /**

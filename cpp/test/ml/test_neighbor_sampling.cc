@@ -81,6 +81,8 @@ TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - single hop on ldbc_sample") {
 
   const auto& sampling = result.value();
   REQUIRE(sampling.sampled_nodes == std::vector<IdType>{0, 87, 623, 849});
+  REQUIRE(sampling.num_sampled_nodes_per_hop == std::vector<IdType>{1, 3});
+  REQUIRE(sampling.num_sampled_edges_per_hop == std::vector<IdType>{3});
   REQUIRE(ToNodeEdges(sampling) == std::vector<std::pair<IdType, IdType>>{
                                       {0, 87}, {0, 623}, {0, 849}});
 }
@@ -166,6 +168,8 @@ TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - multiple seeds on ldbc_sample
   const auto& sampling = result.value();
   REQUIRE(sampling.sampled_nodes ==
           std::vector<IdType>{0, 1, 87, 623, 849, 58, 318, 538, 539, 696});
+  REQUIRE(sampling.num_sampled_nodes_per_hop == std::vector<IdType>{2, 8});
+  REQUIRE(sampling.num_sampled_edges_per_hop == std::vector<IdType>{8});
   REQUIRE(ToNodeEdges(sampling) == std::vector<std::pair<IdType, IdType>>{
                                       {0, 87},  {0, 623}, {0, 849}, {1, 58},
                                       {1, 318}, {1, 538}, {1, 539}, {1, 696}});
@@ -181,6 +185,8 @@ TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - empty seed list") {
   REQUIRE(sampling.sampled_nodes.empty());
   REQUIRE(sampling.src_indices.empty());
   REQUIRE(sampling.dst_indices.empty());
+  REQUIRE(sampling.num_sampled_nodes_per_hop == std::vector<IdType>{0, 0});
+  REQUIRE(sampling.num_sampled_edges_per_hop == std::vector<IdType>{0});
 }
 
 TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - invalid vertex type") {

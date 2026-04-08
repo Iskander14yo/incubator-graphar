@@ -217,6 +217,8 @@ def test_valid_batch_with_zero_fanout(ldbc_graph):
     assert batch.batch_size == 2
     assert batch.n_id.tolist() == [0, 1]
     assert edge_index.shape == (2, 0)
+    assert batch.num_sampled_nodes.tolist() == [2, 0]
+    assert batch.num_sampled_edges.tolist() == [0]
 
 
 def test_loader_keeps_sampler_order(ldbc_graph):
@@ -235,6 +237,8 @@ def test_loader_keeps_sampler_order(ldbc_graph):
         [0, 0, 0, 1, 1, 1, 1, 1],
         [2, 3, 4, 5, 6, 7, 8, 9],
     ]
+    assert batch.num_sampled_nodes.tolist() == [2, 8]
+    assert batch.num_sampled_edges.tolist() == [8]
 
 
 def test_multi_worker_matches_single_worker_shuffle_false(ldbc_graph):

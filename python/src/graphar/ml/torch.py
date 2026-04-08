@@ -116,35 +116,6 @@ def _as_unique_list(values: Sequence[int]) -> list[int]:
         unique_values.append(value)
     return unique_values
 
-# TODO: unclear what this function does
-def _hop_stats(
-    num_hops: int, seed_count: int, edge_index: torch.Tensor
-) -> tuple[list[int], list[int]]:
-    if seed_count == 0:
-        return [0] * num_hops, [0] * num_hops
-    if edge_index.numel() == 0:
-        return [0] * num_hops, [0] * num_hops
-
-    sources = edge_index[0].tolist()
-    targets = edge_index[1].tolist()
-    depth_by_node = dict.fromkeys(range(seed_count), 0)
-    num_sampled_edges = [0] * num_hops
-    num_sampled_nodes = [0] * num_hops
-
-    for hop in range(num_hops):
-        new_nodes: set[int] = set()
-        for src, dst in zip(sources, targets):
-            src_depth = depth_by_node.get(src)
-            if src_depth != hop:
-                continue
-            num_sampled_edges[hop] += 1
-            if dst in depth_by_node:
-                continue
-            depth_by_node[dst] = hop + 1
-            new_nodes.add(dst)
-        num_sampled_nodes[hop] = len(new_nodes)
-    return num_sampled_nodes, num_sampled_edges
-
 
 class GARNeighborLoader(IterableDataset):
     """Minimal PyG-compatible neighbor loader over GraphAr APIs."""
@@ -251,16 +222,15 @@ class GARNeighborLoader(IterableDataset):
 
         n_id = torch.tensor(n_id_list, dtype=torch.long)
         input_id = torch.tensor(seed_nodes, dtype=torch.long)
-        num_sampled_nodes, num_sampled_edges = _hop_stats(
-            len(self.num_neighbors), len(seed_nodes), edge_index
-        )
+        num_sampled_nodes = torch.tensor(list(sampling.num_sampled_nodes_per_hop), dtype=torch.long)
+        num_sampled_edges = torch.tensor(list(sampling.num_sampled_edges_per_hop), dtype=torch.long)
 
         batch = Data(x=x, edge_index=edge_index)
         batch.batch_size = len(seed_nodes)
         batch.n_id = n_id
         batch.input_id = input_id
-        batch.num_sampled_nodes = torch.tensor(num_sampled_nodes, dtype=torch.long)  # TODO: why list? need to check
-        batch.num_sampled_edges = torch.tensor(num_sampled_edges, dtype=torch.long)  # TODO: why list? need to check
+        batch.num_sampled_nodes = num_sampled_nodes
+        batch.num_sampled_edges = num_sampled_edges
         batch.vertex_type = self.vertex_type
         batch.edge_type = self.edge_type
 

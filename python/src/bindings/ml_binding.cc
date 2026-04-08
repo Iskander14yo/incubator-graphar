@@ -70,7 +70,11 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def(py::init<>())
       .def_readwrite("sampled_nodes", &graphar::ml::SamplingResult::sampled_nodes)
       .def_readwrite("src_indices", &graphar::ml::SamplingResult::src_indices)
-      .def_readwrite("dst_indices", &graphar::ml::SamplingResult::dst_indices);
+      .def_readwrite("dst_indices", &graphar::ml::SamplingResult::dst_indices)
+      .def_readwrite("num_sampled_nodes_per_hop",
+                     &graphar::ml::SamplingResult::num_sampled_nodes_per_hop)
+      .def_readwrite("num_sampled_edges_per_hop",
+                     &graphar::ml::SamplingResult::num_sampled_edges_per_hop);
 
   // Bind sample_neighbors function
   m.def("sample_neighbors", 
