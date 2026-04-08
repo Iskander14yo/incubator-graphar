@@ -63,6 +63,10 @@ def test_graph_info_basics(sample_graph_info):
     assert sample_graph_info.version().get_version() == 1
 
 
+def test_graph_info_get_vertex_count(sample_graph_info):
+    assert sample_graph_info.get_vertex_count("person") == 903
+
+
 def test_person_vertex_info_basics(sample_graph_vertex):
     """Test person vertex info basics."""
     assert sample_graph_vertex.get_type() == "person"

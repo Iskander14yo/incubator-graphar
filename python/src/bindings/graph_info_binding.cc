@@ -22,6 +22,7 @@
 #include "utils/pybind_util.h"
 
 #include "graphar/graph_info.h"
+#include "graphar/reader_util.h"
 #include "graphar/types.h"
 #include "graphar/version_parser.h"
 
@@ -366,6 +367,16 @@ extern "C" void bind_graph_info(pybind11::module_& m) {
       .def("get_vertex_info",
            [](const graphar::GraphInfo& self, const std::string& type) {
              return self.GetVertexInfo(type);
+           })
+      .def("get_vertex_count",
+           [](const graphar::GraphInfo& self, const std::string& vertex_type) {
+             auto vertex_info = self.GetVertexInfo(vertex_type);
+             if (vertex_info == nullptr) {
+               throw py::value_error("Vertex type '" + vertex_type +
+                                     "' not found");
+             }
+             return ThrowOrReturn(
+                 graphar::util::GetVertexNum(self.GetPrefix(), vertex_info));
            })
       .def("get_edge_info",
            [](const graphar::GraphInfo& self, const std::string& src_type,

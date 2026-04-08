@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import struct
 import time
 from collections import deque
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from pathlib import Path
 
 import pyarrow as pa
 import torch
@@ -53,23 +51,6 @@ def _properties_for_vertex(graph_info, vertex_type: str) -> list[str]:
     return properties
 
 
-def _vertex_count(graph_info, vertex_type: str) -> int:
-    vertex_info = graph_info.get_vertex_info(vertex_type)
-    if vertex_info is None:
-        msg = f"Vertex type '{vertex_type}' not found"
-        raise ValueError(msg)
-    relative_path = vertex_info.get_vertices_num_file_path()
-    prefix = graph_info.get_prefix()
-    if prefix.startswith("file://"):  # TODO: possible? need to check
-        prefix = prefix.removeprefix("file://")
-    path = prefix.rstrip("/") + "/" + relative_path.lstrip("/")
-    with Path(path).open("rb") as f:
-        data = f.read()
-    if len(data) == 8:
-        return int(struct.unpack("<q", data)[0])
-    return int(data.decode("utf-8").strip())
-
-
 def _is_numeric_type_name(type_name: str) -> bool:
     return type_name in {  # TODO: refactor to constant
         "int8",
@@ -113,7 +94,7 @@ def _normalize_input_nodes(
     input_nodes: Sequence[int] | torch.Tensor | None,
 ) -> list[int]:
     if input_nodes is None:
-        return list(range(_vertex_count(graph_info, vertex_type)))
+        return list(range(graph_info.get_vertex_count(vertex_type)))
     if isinstance(input_nodes, torch.Tensor):
         if input_nodes.dtype == torch.bool:
             return input_nodes.nonzero(as_tuple=False).view(-1).tolist()
