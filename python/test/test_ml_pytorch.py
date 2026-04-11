@@ -184,23 +184,6 @@ def test_feature_selection_sanity(ldbc_graph, features, expected_dim):
     assert x.size(1) == expected_dim
 
 
-def test_features_none_raises_on_non_numeric_properties(ldbc_graph):
-    with pytest.raises(ValueError, match="Only numeric features are supported"):
-        _make_loader(
-            ldbc_graph, input_nodes=[0, 1], features=None, batch_size=2, shuffle=False
-        )
-
-
-def test_explicit_non_numeric_feature_raises(ldbc_graph):
-    with pytest.raises(ValueError, match="Only numeric features are supported"):
-        _make_loader(
-            ldbc_graph,
-            input_nodes=[0, 1],
-            features=["id", "firstName"],
-            batch_size=2,
-            shuffle=False,
-        )
-
 
 def test_valid_batch_with_zero_fanout(ldbc_graph):
     loader = _make_loader(

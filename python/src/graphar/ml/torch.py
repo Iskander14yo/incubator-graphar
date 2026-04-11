@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections import deque
 from collections.abc import Iterator, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 import pyarrow as pa
@@ -115,7 +115,7 @@ class GARNeighborLoader(IterableDataset):
         self._input_nodes = list(dict.fromkeys(  #  dict.fromkeys preserves insertion order
             _normalize_input_nodes(graph_info, vertex_type, input_nodes)
         ))
-        self.features = features or _properties_for_vertex(graph_info, vertex_type)
+        self.features = _properties_for_vertex(graph_info, vertex_type) if features is None else features
         self._rng = torch.Generator()  # used for both dataset shuffling and sampling seeds
         self._rng.manual_seed(int(torch.initial_seed()))
 
@@ -216,7 +216,7 @@ class GARNeighborLoader(IterableDataset):
             for seed_nodes, seed in jobs:
                 yield self._build_batch(seed_nodes, seed)
         else:
-            in_flight: deque = deque()
+            in_flight: deque[Future] = deque()
             with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
                 for seed_nodes, seed in jobs:
                     in_flight.append(executor.submit(self._build_batch, seed_nodes, seed))
