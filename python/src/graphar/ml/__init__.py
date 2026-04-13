@@ -1,3 +1,3 @@
-from .._core import sample_neighbors, get_node_features
+from .._core import FeatureCache, get_node_features, sample_neighbors
 
-__all__ = ["sample_neighbors", "get_node_features"]
+__all__ = ["FeatureCache", "get_node_features", "sample_neighbors"]

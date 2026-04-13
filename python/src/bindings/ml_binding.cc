@@ -23,6 +23,7 @@
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
+#include "graphar/ml/feature_cache.h"
 #include "graphar/ml/neighbor_sampling.h"
 #include "graphar/graph_info.h"
 
@@ -65,6 +66,32 @@ py::object table_to_pyarrow(const std::shared_ptr<arrow::Table>& table) {
 }  // namespace
 
 extern "C" void bind_ml_api(pybind11::module_& m) {
+  // Bind FeatureCache class
+  py::class_<graphar::ml::FeatureCache>(m, "FeatureCache",
+      "Thread-safe O(1) LFU cache for node feature chunks.")
+      .def(py::init<size_t>(), py::arg("max_bytes"),
+           "Create a cache with the given byte budget.")
+      .def_property_readonly("hits", &graphar::ml::FeatureCache::hits,
+           "Total cache hit count.")
+      .def_property_readonly("misses", &graphar::ml::FeatureCache::misses,
+           "Total cache miss count.")
+      .def_property_readonly("hit_rate", &graphar::ml::FeatureCache::hit_rate,
+           "hits / (hits + misses), or 0.0 if no lookups yet.")
+      .def_property_readonly("num_chunks", &graphar::ml::FeatureCache::num_chunks,
+           "Number of chunks currently in the cache.")
+      .def_property_readonly("size_mb",
+           [](const graphar::ml::FeatureCache& c) {
+             return static_cast<double>(c.size_bytes()) / (1024.0 * 1024.0);
+           },
+           "Current cache size in megabytes.")
+      .def_property_readonly("max_size_mb",
+           [](const graphar::ml::FeatureCache& c) {
+             return static_cast<double>(c.max_bytes()) / (1024.0 * 1024.0);
+           },
+           "Cache byte budget in megabytes.")
+      .def("clear", &graphar::ml::FeatureCache::Clear,
+           "Remove all cached entries (stats are preserved).");
+
   // Bind SamplingResult struct
   py::class_<graphar::ml::SamplingResult>(m, "SamplingResult")
       .def(py::init<>())
@@ -103,11 +130,12 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       [](const std::shared_ptr<graphar::GraphInfo>& graph_info,
          const std::string& vertex_type,
          const std::vector<graphar::IdType>& node_ids,
-         const std::vector<std::string>& properties) {
+         const std::vector<std::string>& properties,
+         graphar::ml::FeatureCache* cache) {
         auto result = [&]() {
           py::gil_scoped_release release; // release GIL
           return graphar::ml::GetNodeFeatures(
-              graph_info, vertex_type, node_ids, properties);
+              graph_info, vertex_type, node_ids, properties, cache);
         }();
         auto table = ThrowOrReturn(result);
         return table_to_pyarrow(table);
@@ -116,5 +144,6 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       py::arg("vertex_type"),
       py::arg("node_ids"),
       py::arg("properties"),
+      py::arg("cache").none(true) = static_cast<graphar::ml::FeatureCache*>(nullptr),
       "Fetch node properties for given internal IDs");
 }

@@ -1,6 +1,8 @@
 #include "graphar/ml/neighbor_sampling.h"
 
 #include <algorithm>
+
+#include "graphar/ml/feature_cache.h"
 #include <map>
 #include <random>
 #include <unordered_map>
@@ -312,7 +314,7 @@ Result<SamplingResult> SampleNeighbors(
 Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
     const std::shared_ptr<GraphInfo>& graph_info,
     const std::string& vertex_type, const std::vector<IdType>& node_ids,
-    const std::vector<std::string>& properties) {
+    const std::vector<std::string>& properties, FeatureCache* cache) {
   // Return empty table for empty input
   if (node_ids.empty()) {
     std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
@@ -378,14 +380,18 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
 
     // Read each chunk and extract needed rows
     for (const auto& [chunk_id, indices] : chunk_to_indices) {
-      // Seek to the beginning of this chunk
       IdType chunk_start_node = chunk_id * chunk_size;
-      GAR_RETURN_NOT_OK(reader->seek(chunk_start_node));
 
-      // Read the chunk
-      auto chunk_result = reader->GetChunk();
-      GAR_RETURN_NOT_OK(chunk_result.status());
-      auto chunk_table = chunk_result.value();
+      // Check cache before disk I/O
+      std::shared_ptr<arrow::Table> chunk_table;
+      if (cache) chunk_table = cache->Get(graph_info.get(), pg.get(), chunk_id);
+      if (!chunk_table) {
+        GAR_RETURN_NOT_OK(reader->seek(chunk_start_node));
+        auto chunk_result = reader->GetChunk();
+        GAR_RETURN_NOT_OK(chunk_result.status());
+        chunk_table = chunk_result.value();
+        if (cache) cache->Put(graph_info.get(), pg.get(), chunk_id, chunk_table);
+      }
 
       // Build Take indices (row offsets within this chunk)
       arrow::Int64Builder idx_builder;

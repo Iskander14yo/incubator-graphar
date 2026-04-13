@@ -12,6 +12,8 @@ class Table;
 
 namespace graphar::ml {
 
+class FeatureCache;
+
 /**
  * Result of neighbor sampling operation.
  */
@@ -51,6 +53,7 @@ Result<SamplingResult> SampleNeighbors(
 Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
     const std::shared_ptr<GraphInfo>& graph_info,
     const std::string& vertex_type, const std::vector<IdType>& node_ids,
-    const std::vector<std::string>& properties);
+    const std::vector<std::string>& properties,
+    FeatureCache* cache = nullptr);
 
 }  // namespace graphar::ml

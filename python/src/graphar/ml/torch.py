@@ -95,6 +95,7 @@ class GARNeighborLoader(IterableDataset):
         shuffle: bool = True,
         features: list[str] | None = None,
         num_workers: int = 0,
+        feature_cache=None,
     ) -> None:
         if batch_size <= 0:
             msg = "batch_size must be > 0"
@@ -118,6 +119,7 @@ class GARNeighborLoader(IterableDataset):
         self.features = _properties_for_vertex(graph_info, vertex_type) if features is None else features
         self._rng = torch.Generator()  # used for both dataset shuffling and sampling seeds
         self._rng.manual_seed(int(torch.initial_seed()))
+        self.feature_cache = feature_cache
 
     def __len__(self) -> int:
         if not self._input_nodes:
@@ -169,7 +171,8 @@ class GARNeighborLoader(IterableDataset):
         if self.features:
             t_s = time.perf_counter()
             feature_table = gar_ml.get_node_features(
-                self.graph_info, self.vertex_type, n_id_list, self.features
+                self.graph_info, self.vertex_type, n_id_list, self.features,
+                cache=self.feature_cache,
             )
             feature_fetch_ms = (time.perf_counter() - t_s) * 1000
 

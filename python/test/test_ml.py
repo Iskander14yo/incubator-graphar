@@ -121,6 +121,61 @@ def test_sample_neighbors_deterministic_with_seed(ldbc_graph):
     assert result1.dst_indices == result2.dst_indices
 
 
+def test_feature_cache_basic(ldbc_graph):
+    """Test FeatureCache hit/miss counting and stats API."""
+    cache = gar_ml.FeatureCache(64 * 1024 * 1024)
+    assert cache.hits == 0
+    assert cache.misses == 0
+    assert cache.hit_rate == 0.0
+    assert cache.num_chunks == 0
+    assert cache.size_mb == pytest.approx(0.0)
+    assert cache.max_size_mb == pytest.approx(64.0)
+
+    # First call — misses (chunks read from disk)
+    gar_ml.get_node_features(ldbc_graph, "person", [0, 1, 2], ["id"], cache=cache)
+    assert cache.misses > 0
+    assert cache.hits == 0
+    assert cache.num_chunks > 0
+
+    misses_after_first = cache.misses
+
+    # Second identical call — chunks now in cache
+    gar_ml.get_node_features(ldbc_graph, "person", [0, 1, 2], ["id"], cache=cache)
+    assert cache.hits > 0
+    assert cache.misses == misses_after_first  # no new misses
+    assert cache.hit_rate > 0.0
+
+
+def test_feature_cache_returns_same_results(ldbc_graph):
+    """Cached and uncached get_node_features must return identical data."""
+    cache = gar_ml.FeatureCache(64 * 1024 * 1024)
+    node_ids = [0, 1, 2, 5, 10]
+    props = ["id", "firstName"]
+
+    no_cache = gar_ml.get_node_features(ldbc_graph, "person", node_ids, props)
+    first_cached = gar_ml.get_node_features(ldbc_graph, "person", node_ids, props, cache=cache)
+    second_cached = gar_ml.get_node_features(ldbc_graph, "person", node_ids, props, cache=cache)
+
+    assert no_cache.to_pydict() == first_cached.to_pydict()
+    assert no_cache.to_pydict() == second_cached.to_pydict()
+
+
+def test_feature_cache_clear(ldbc_graph):
+    """Clear empties entries but preserves cumulative hit/miss stats."""
+    cache = gar_ml.FeatureCache(64 * 1024 * 1024)
+    gar_ml.get_node_features(ldbc_graph, "person", [0], ["id"], cache=cache)
+    gar_ml.get_node_features(ldbc_graph, "person", [0], ["id"], cache=cache)
+
+    misses = cache.misses
+    hits = cache.hits
+    cache.clear()
+
+    assert cache.num_chunks == 0
+    assert cache.size_mb == pytest.approx(0.0)
+    assert cache.misses == misses  # stats preserved
+    assert cache.hits == hits
+
+
 def test_sample_neighbors_preserves_sampling_order(ldbc_graph):
     seeds = [0, 1]
     fanout = [10]
