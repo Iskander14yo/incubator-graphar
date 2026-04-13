@@ -160,4 +160,19 @@ double FeatureCache::hit_rate() const {
   return total == 0 ? 0.0 : static_cast<double>(h) / static_cast<double>(total);
 }
 
+double FeatureCache::io_saved_pct() const {
+  size_t r = chunks_read_.load(std::memory_order_relaxed);
+  size_t s = chunks_skipped_.load(std::memory_order_relaxed);
+  size_t total = r + s;
+  return total == 0 ? 0.0 : 100.0 * static_cast<double>(s) / static_cast<double>(total);
+}
+
+void FeatureCache::RecordChunksRead(size_t n) {
+  chunks_read_.fetch_add(n, std::memory_order_relaxed);
+}
+
+void FeatureCache::RecordChunksSkipped(size_t n) {
+  chunks_skipped_.fetch_add(n, std::memory_order_relaxed);
+}
+
 }  // namespace graphar::ml

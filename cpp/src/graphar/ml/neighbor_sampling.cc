@@ -375,6 +375,14 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
       if (!node_data[i]) chunk_to_miss[node_ids[i] / chunk_size].push_back(i);
     }
 
+    // Record I/O stats: chunks actually read vs chunks fully served from cache
+    if (cache) {
+      std::unordered_set<IdType> all_chunk_ids;
+      for (auto id : node_ids) all_chunk_ids.insert(id / chunk_size);
+      cache->RecordChunksRead(chunk_to_miss.size());
+      cache->RecordChunksSkipped(all_chunk_ids.size() - chunk_to_miss.size());
+    }
+
     // Step 2: read each chunk once; bulk-Take all missed rows; cache per node.
     for (const auto& [chunk_id, miss_idxs] : chunk_to_miss) {
       IdType chunk_start = chunk_id * chunk_size;

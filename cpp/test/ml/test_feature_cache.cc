@@ -185,6 +185,32 @@ TEST_CASE("FeatureCache - entry too large for budget is silently dropped") {
 // Integration tests: FeatureCache + GetNodeFeatures
 // =============================================================================
 
+TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - I/O stats: first call reads, second skips") {
+  auto maybe_graph = GraphInfo::Load(test_data_dir + "/ldbc_sample/parquet/ldbc_sample.graph.yml");
+  REQUIRE(maybe_graph.status().ok());
+  auto graph = maybe_graph.value();
+
+  FeatureCache cache(64 * 1024 * 1024);
+  std::vector<IdType> node_ids = {0, 1, 2};
+
+  REQUIRE(cache.chunks_read() == 0);
+  REQUIRE(cache.chunks_skipped() == 0);
+
+  // First call: all misses → chunks are read from disk
+  auto r1 = GetNodeFeatures(graph, "person", node_ids, {"id"}, &cache);
+  REQUIRE(r1.status().ok());
+  REQUIRE(cache.chunks_read() > 0);
+  REQUIRE(cache.chunks_skipped() == 0);
+  size_t reads_after_first = cache.chunks_read();
+
+  // Second call: same nodes → all in cache, no disk reads
+  auto r2 = GetNodeFeatures(graph, "person", node_ids, {"id"}, &cache);
+  REQUIRE(r2.status().ok());
+  REQUIRE(cache.chunks_read() == reads_after_first);   // no new reads
+  REQUIRE(cache.chunks_skipped() > 0);                  // chunks skipped
+  REQUIRE(cache.io_saved_pct() > 0.0);
+}
+
 TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - node-cached result equals uncached") {
   auto maybe_graph = GraphInfo::Load(test_data_dir + "/ldbc_sample/parquet/ldbc_sample.graph.yml");
   REQUIRE(maybe_graph.status().ok());

@@ -77,6 +77,12 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
            "Total cache miss count.")
       .def_property_readonly("hit_rate", &graphar::ml::FeatureCache::hit_rate,
            "hits / (hits + misses), or 0.0 if no lookups yet.")
+      .def_property_readonly("chunks_read", &graphar::ml::FeatureCache::chunks_read,
+           "Total property-group chunk reads performed (disk I/O calls).")
+      .def_property_readonly("chunks_skipped", &graphar::ml::FeatureCache::chunks_skipped,
+           "Chunk reads avoided because all needed nodes were in cache.")
+      .def_property_readonly("io_saved_pct", &graphar::ml::FeatureCache::io_saved_pct,
+           "chunks_skipped / (chunks_read + chunks_skipped) as a percentage.")
       .def_property_readonly("num_nodes", &graphar::ml::FeatureCache::num_nodes,
            "Number of node rows currently in the cache.")
       .def_property_readonly("size_mb",

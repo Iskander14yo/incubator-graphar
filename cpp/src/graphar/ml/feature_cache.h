@@ -74,6 +74,14 @@ class FeatureCache {
   size_t misses() const { return misses_.load(); }
   double hit_rate() const;
 
+  size_t chunks_read() const { return chunks_read_.load(); }
+  size_t chunks_skipped() const { return chunks_skipped_.load(); }
+  double io_saved_pct() const;
+
+  /** Called by GetNodeFeatures to record chunk-level I/O outcomes. */
+  void RecordChunksRead(size_t n);
+  void RecordChunksSkipped(size_t n);
+
  private:
   struct CacheKey {
     const void* graph_info_ptr;
@@ -117,6 +125,8 @@ class FeatureCache {
   mutable std::mutex mutex_;
   std::atomic<size_t> hits_{0};
   std::atomic<size_t> misses_{0};
+  std::atomic<size_t> chunks_read_{0};
+  std::atomic<size_t> chunks_skipped_{0};
 };
 
 }  // namespace graphar::ml
