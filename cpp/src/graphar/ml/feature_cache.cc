@@ -46,8 +46,8 @@ FeatureCache::FeatureCache(size_t max_bytes) : max_bytes_(max_bytes) {}
 
 std::shared_ptr<arrow::Table> FeatureCache::Get(const void* graph_info_ptr,
                                                  const void* pg_ptr,
-                                                 IdType chunk_id) {
-  CacheKey key{graph_info_ptr, pg_ptr, chunk_id};
+                                                 IdType node_id) {
+  CacheKey key{graph_info_ptr, pg_ptr, node_id};
   std::lock_guard<std::mutex> lock(mutex_);
 
   auto it = key_to_entry_.find(key);
@@ -77,11 +77,11 @@ std::shared_ptr<arrow::Table> FeatureCache::Get(const void* graph_info_ptr,
 }
 
 void FeatureCache::Put(const void* graph_info_ptr, const void* pg_ptr,
-                       IdType chunk_id, std::shared_ptr<arrow::Table> table) {
+                       IdType node_id, std::shared_ptr<arrow::Table> table) {
   size_t size = static_cast<size_t>(TableBufferSize(*table));
   if (size > max_bytes_) return;  // will never fit; skip silently
 
-  CacheKey key{graph_info_ptr, pg_ptr, chunk_id};
+  CacheKey key{graph_info_ptr, pg_ptr, node_id};
   std::lock_guard<std::mutex> lock(mutex_);
 
   if (key_to_entry_.count(key)) return;  // already cached
@@ -91,7 +91,7 @@ void FeatureCache::Put(const void* graph_info_ptr, const void* pg_ptr,
       full_logged_ = true;
       std::fprintf(stderr,
                    "[graphar::ml::FeatureCache] Cache full "
-                   "(%.1f / %.1f MB, %zu chunks). "
+                   "(%.1f / %.1f MB, %zu nodes cached). "
                    "LFU eviction starting.\n",
                    static_cast<double>(current_bytes_) / (1024.0 * 1024.0),
                    static_cast<double>(max_bytes_) / (1024.0 * 1024.0),
@@ -148,7 +148,7 @@ size_t FeatureCache::size_bytes() const {
   return current_bytes_;
 }
 
-size_t FeatureCache::num_chunks() const {
+size_t FeatureCache::num_nodes() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return key_to_entry_.size();
 }

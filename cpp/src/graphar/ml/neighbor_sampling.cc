@@ -355,97 +355,88 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
   std::vector<std::shared_ptr<arrow::Field>> schema_fields;
   std::vector<std::shared_ptr<arrow::Array>> result_arrays;
 
+  const IdType chunk_size = vertex_info->GetChunkSize();
+
   // For each property group, read the data
   for (const auto& [pg, props] : pg_to_props) {
-    // Create reader for this property group
     auto reader_result =
         VertexPropertyArrowChunkReader::Make(graph_info, vertex_type, pg);
     GAR_RETURN_NOT_OK(reader_result.status());
     auto reader = reader_result.value();
 
-    // Group node_ids by chunk to minimize chunk reads
-    IdType chunk_size = vertex_info->GetChunkSize();
-    std::map<IdType, std::vector<size_t>> chunk_to_indices;
+    // node_data[i] = 1-row Table for node_ids[i] (all columns in pg).
+    // Pre-populated from cache; remaining entries filled by chunk reads below.
+    std::vector<std::shared_ptr<arrow::Table>> node_data(node_ids.size());
+
+    // Step 1: cache lookup per node; collect misses grouped by chunk.
+    std::map<IdType, std::vector<size_t>> chunk_to_miss;
     for (size_t i = 0; i < node_ids.size(); i++) {
-      IdType chunk_id = node_ids[i] / chunk_size;
-      chunk_to_indices[chunk_id].push_back(i);
+      if (cache) node_data[i] = cache->Get(graph_info.get(), pg.get(), node_ids[i]);
+      if (!node_data[i]) chunk_to_miss[node_ids[i] / chunk_size].push_back(i);
     }
 
-    // Use bulk Take per chunk instead of per-element GetScalar.
-    // Collect taken arrays and output positions, then Concatenate + reorder.
-    std::unordered_map<std::string, std::vector<std::shared_ptr<arrow::Array>>>
-        prop_taken;
-    std::vector<int64_t> concat_to_output;
-    concat_to_output.reserve(node_ids.size());
+    // Step 2: read each chunk once; bulk-Take all missed rows; cache per node.
+    for (const auto& [chunk_id, miss_idxs] : chunk_to_miss) {
+      IdType chunk_start = chunk_id * chunk_size;
+      GAR_RETURN_NOT_OK(reader->seek(chunk_start));
+      auto chunk_res = reader->GetChunk();
+      GAR_RETURN_NOT_OK(chunk_res.status());
+      auto chunk_tbl = chunk_res.value();
 
-    // Read each chunk and extract needed rows
-    for (const auto& [chunk_id, indices] : chunk_to_indices) {
-      IdType chunk_start_node = chunk_id * chunk_size;
-
-      // Check cache before disk I/O
-      std::shared_ptr<arrow::Table> chunk_table;
-      if (cache) chunk_table = cache->Get(graph_info.get(), pg.get(), chunk_id);
-      if (!chunk_table) {
-        GAR_RETURN_NOT_OK(reader->seek(chunk_start_node));
-        auto chunk_result = reader->GetChunk();
-        GAR_RETURN_NOT_OK(chunk_result.status());
-        chunk_table = chunk_result.value();
-        if (cache) cache->Put(graph_info.get(), pg.get(), chunk_id, chunk_table);
-      }
-
-      // Build Take indices (row offsets within this chunk)
-      arrow::Int64Builder idx_builder;
-      auto st = idx_builder.Reserve(indices.size());
+      // Bulk Take: one Arrow call per column for all missed rows in this chunk
+      arrow::Int64Builder idx_b;
+      auto st = idx_b.Reserve(miss_idxs.size());
       if (!st.ok()) return Status::ArrowError(st.ToString());
-      for (size_t idx : indices) {
-        IdType row_in_chunk = node_ids[idx] - chunk_start_node;
-        idx_builder.UnsafeAppend(row_in_chunk);
-      }
-      std::shared_ptr<arrow::Array> take_indices;
-      st = idx_builder.Finish(&take_indices);
+      for (size_t i : miss_idxs)
+        idx_b.UnsafeAppend(static_cast<int64_t>(node_ids[i] - chunk_start));
+      std::shared_ptr<arrow::Array> take_idx;
+      st = idx_b.Finish(&take_idx);
       if (!st.ok()) return Status::ArrowError(st.ToString());
 
-      // Extract value for each property
-      for (const auto& prop : props) {
-        auto column = chunk_table->GetColumnByName(prop);
-        if (!column) {
-          return Status::Invalid("Column '", prop, "' not found in chunk");
-        }
-        auto take_result =
-            arrow::compute::Take(column->chunk(0), take_indices);
-        if (!take_result.ok()) {
-          return Status::ArrowError(take_result.status().ToString());
-        }
-        prop_taken[prop].push_back(take_result.ValueOrDie().make_array());
+      std::vector<std::shared_ptr<arrow::Array>> bulk_cols;
+      bulk_cols.reserve(chunk_tbl->num_columns());
+      for (int c = 0; c < chunk_tbl->num_columns(); c++) {
+        auto res = arrow::compute::Take(chunk_tbl->column(c)->chunk(0), take_idx);
+        if (!res.ok()) return Status::ArrowError(res.status().ToString());
+        bulk_cols.push_back(res.ValueOrDie().make_array());
       }
 
-      for (size_t idx : indices) {
-        concat_to_output.push_back(static_cast<int64_t>(idx));
+      // Split bulk result into per-node 1-row tables and cache each
+      auto row_schema = chunk_tbl->schema();
+      for (size_t li = 0; li < miss_idxs.size(); li++) {
+        arrow::Int64Builder rb;
+        st = rb.Append(static_cast<int64_t>(li));
+        if (!st.ok()) return Status::ArrowError(st.ToString());
+        std::shared_ptr<arrow::Array> row_take;
+        st = rb.Finish(&row_take);
+        if (!st.ok()) return Status::ArrowError(st.ToString());
+
+        std::vector<std::shared_ptr<arrow::Array>> row_arrs;
+        row_arrs.reserve(bulk_cols.size());
+        for (const auto& col : bulk_cols) {
+          auto res = arrow::compute::Take(col, row_take);
+          if (!res.ok()) return Status::ArrowError(res.status().ToString());
+          row_arrs.push_back(res.ValueOrDie().make_array());
+        }
+        auto row_tbl = arrow::Table::Make(row_schema, row_arrs, 1);
+
+        size_t orig = miss_idxs[li];
+        if (cache) cache->Put(graph_info.get(), pg.get(), node_ids[orig], row_tbl);
+        node_data[orig] = row_tbl;
       }
     }
 
-    // Build inverse permutation: result[j] = concat[inv[j]]
-    std::vector<int64_t> inv_perm(node_ids.size());
-    for (size_t i = 0; i < concat_to_output.size(); i++) {
-      inv_perm[concat_to_output[i]] = static_cast<int64_t>(i);
-    }
-    arrow::Int64Builder perm_builder;
-    auto pst = perm_builder.AppendValues(inv_perm);
-    if (!pst.ok()) return Status::ArrowError(pst.ToString());
-    std::shared_ptr<arrow::Array> perm_array;
-    pst = perm_builder.Finish(&perm_array);
-    if (!pst.ok()) return Status::ArrowError(pst.ToString());
-
+    // Step 3: assemble output columns from per-node rows in node_ids order
     for (const auto& prop : props) {
-      auto concat_result = arrow::Concatenate(prop_taken[prop]);
-      if (!concat_result.ok()) {
-        return Status::ArrowError(concat_result.status().ToString());
+      std::vector<std::shared_ptr<arrow::Array>> col_chunks;
+      col_chunks.reserve(node_ids.size());
+      for (const auto& row : node_data) {
+        auto col = row->GetColumnByName(prop);
+        if (!col) return Status::Invalid("Column '", prop, "' not found in row");
+        col_chunks.push_back(col->chunk(0));
       }
-      auto reorder_result =
-          arrow::compute::Take(concat_result.ValueOrDie(), perm_array);
-      if (!reorder_result.ok()) {
-        return Status::ArrowError(reorder_result.status().ToString());
-      }
+      auto concat = arrow::Concatenate(col_chunks);
+      if (!concat.ok()) return Status::ArrowError(concat.status().ToString());
 
       auto prop_type_result = vertex_info->GetPropertyType(prop);
       GAR_RETURN_NOT_OK(prop_type_result.status());
@@ -453,7 +444,7 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
           DataType::DataTypeToArrowDataType(prop_type_result.value());
 
       schema_fields.push_back(arrow::field(prop, arrow_type));
-      result_arrays.push_back(reorder_result.ValueOrDie().make_array());
+      result_arrays.push_back(concat.ValueOrDie());
     }
   }
 

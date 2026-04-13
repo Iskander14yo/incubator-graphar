@@ -127,7 +127,7 @@ def test_feature_cache_basic(ldbc_graph):
     assert cache.hits == 0
     assert cache.misses == 0
     assert cache.hit_rate == 0.0
-    assert cache.num_chunks == 0
+    assert cache.num_nodes == 0
     assert cache.size_mb == pytest.approx(0.0)
     assert cache.max_size_mb == pytest.approx(64.0)
 
@@ -135,7 +135,7 @@ def test_feature_cache_basic(ldbc_graph):
     gar_ml.get_node_features(ldbc_graph, "person", [0, 1, 2], ["id"], cache=cache)
     assert cache.misses > 0
     assert cache.hits == 0
-    assert cache.num_chunks > 0
+    assert cache.num_nodes > 0
 
     misses_after_first = cache.misses
 
@@ -170,7 +170,7 @@ def test_feature_cache_clear(ldbc_graph):
     hits = cache.hits
     cache.clear()
 
-    assert cache.num_chunks == 0
+    assert cache.num_nodes == 0
     assert cache.size_mb == pytest.approx(0.0)
     assert cache.misses == misses  # stats preserved
     assert cache.hits == hits

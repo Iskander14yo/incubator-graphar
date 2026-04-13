@@ -34,9 +34,11 @@ class Table;
 namespace graphar::ml {
 
 /**
- * Thread-safe LFU cache for Arrow Table chunks fetched by GetNodeFeatures.
+ * Thread-safe LFU cache for individual node feature rows fetched by
+ * GetNodeFeatures.
  *
- * Cache key: (graph_info*, property_group*, chunk_id).
+ * Cache key: (graph_info*, property_group*, node_id). Each entry is a 1-row
+ * Arrow Table holding all columns of the property group for that node.
  * Multiple threads sharing the same FeatureCache instance benefit from
  * shared hits — all synchronization is internal.
  *
@@ -53,20 +55,20 @@ class FeatureCache {
    * On hit, promotes the entry's frequency (O(1) LFU).
    */
   std::shared_ptr<arrow::Table> Get(const void* graph_info_ptr,
-                                    const void* pg_ptr, IdType chunk_id);
+                                    const void* pg_ptr, IdType node_id);
 
   /**
-   * Insert a chunk. Evicts LFU entries if needed to stay within budget.
-   * No-op if the chunk already exists or is larger than the total budget.
+   * Insert a node row. Evicts LFU entries if needed to stay within budget.
+   * No-op if the node already exists or its row is larger than the total budget.
    */
-  void Put(const void* graph_info_ptr, const void* pg_ptr, IdType chunk_id,
+  void Put(const void* graph_info_ptr, const void* pg_ptr, IdType node_id,
            std::shared_ptr<arrow::Table> table);
 
   /** Remove all cached entries. */
   void Clear();
 
   size_t size_bytes() const;
-  size_t num_chunks() const;
+  size_t num_nodes() const;
   size_t max_bytes() const { return max_bytes_; }
   size_t hits() const { return hits_.load(); }
   size_t misses() const { return misses_.load(); }
@@ -76,11 +78,11 @@ class FeatureCache {
   struct CacheKey {
     const void* graph_info_ptr;
     const void* pg_ptr;
-    IdType chunk_id;
+    IdType node_id;
 
     bool operator==(const CacheKey& o) const noexcept {
       return graph_info_ptr == o.graph_info_ptr && pg_ptr == o.pg_ptr &&
-             chunk_id == o.chunk_id;
+             node_id == o.node_id;
     }
   };
 
@@ -89,7 +91,7 @@ class FeatureCache {
       size_t h = std::hash<const void*>{}(k.graph_info_ptr);
       h ^= std::hash<const void*>{}(k.pg_ptr) + 0x9e3779b9u + (h << 6) +
            (h >> 2);
-      h ^= std::hash<IdType>{}(k.chunk_id) + 0x9e3779b9u + (h << 6) +
+      h ^= std::hash<IdType>{}(k.node_id) + 0x9e3779b9u + (h << 6) +
            (h >> 2);
       return h;
     }

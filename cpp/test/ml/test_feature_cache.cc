@@ -62,7 +62,7 @@ TEST_CASE("FeatureCache - miss on empty cache") {
   REQUIRE(cache.Get(kG, kPg, 0) == nullptr);
   REQUIRE(cache.misses() == 1);
   REQUIRE(cache.hits() == 0);
-  REQUIRE(cache.num_chunks() == 0);
+  REQUIRE(cache.num_nodes() == 0);
   REQUIRE(cache.size_bytes() == 0);
   REQUIRE(cache.hit_rate() == 0.0);
 }
@@ -72,7 +72,7 @@ TEST_CASE("FeatureCache - put then get returns same table") {
   FeatureCache cache(ArrowTableBytes(*table) * 4);
 
   cache.Put(kG, kPg, 0, table);
-  REQUIRE(cache.num_chunks() == 1);
+  REQUIRE(cache.num_nodes() == 1);
   REQUIRE(cache.size_bytes() > 0);
 
   auto got = cache.Get(kG, kPg, 0);
@@ -90,7 +90,7 @@ TEST_CASE("FeatureCache - duplicate put is no-op") {
   cache.Put(kG, kPg, 0, t1);
   cache.Put(kG, kPg, 0, t2);  // same key — should be ignored
 
-  REQUIRE(cache.num_chunks() == 1);
+  REQUIRE(cache.num_nodes() == 1);
   REQUIRE(cache.Get(kG, kPg, 0).get() == t1.get());  // t1 wins
 }
 
@@ -114,7 +114,7 @@ TEST_CASE("FeatureCache - LFU evicts least-frequent entry") {
   REQUIRE(cache.Get(kG, kPg, 1) == nullptr);  // B evicted
   REQUIRE(cache.Get(kG, kPg, 0) != nullptr);  // A kept
   REQUIRE(cache.Get(kG, kPg, 2) != nullptr);  // C present
-  REQUIRE(cache.num_chunks() == 2);
+  REQUIRE(cache.num_nodes() == 2);
 }
 
 TEST_CASE("FeatureCache - LRU tie-break within same frequency") {
@@ -146,7 +146,7 @@ TEST_CASE("FeatureCache - clear empties entries, preserves stats") {
 
   cache.Clear();
 
-  REQUIRE(cache.num_chunks() == 0);
+  REQUIRE(cache.num_nodes() == 0);
   REQUIRE(cache.size_bytes() == 0);
   REQUIRE(cache.Get(kG, kPg, 0) == nullptr);  // evicted by Clear
   // cumulative stats preserved
@@ -177,7 +177,7 @@ TEST_CASE("FeatureCache - entry too large for budget is silently dropped") {
 
   cache.Put(kG, kPg, 0, t);  // must be silently ignored
 
-  REQUIRE(cache.num_chunks() == 0);
+  REQUIRE(cache.num_nodes() == 0);
   REQUIRE(cache.Get(kG, kPg, 0) == nullptr);
 }
 
@@ -185,7 +185,7 @@ TEST_CASE("FeatureCache - entry too large for budget is silently dropped") {
 // Integration tests: FeatureCache + GetNodeFeatures
 // =============================================================================
 
-TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - cached result equals uncached") {
+TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - node-cached result equals uncached") {
   auto maybe_graph = GraphInfo::Load(test_data_dir + "/ldbc_sample/parquet/ldbc_sample.graph.yml");
   REQUIRE(maybe_graph.status().ok());
   auto graph = maybe_graph.value();
@@ -202,7 +202,7 @@ TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - cached result equals uncached
           Int64Values(r_cached.value()->GetColumnByName("id")));
 }
 
-TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - second call is a cache hit") {
+TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - second call hits per-node cache") {
   auto maybe_graph = GraphInfo::Load(test_data_dir + "/ldbc_sample/parquet/ldbc_sample.graph.yml");
   REQUIRE(maybe_graph.status().ok());
   auto graph = maybe_graph.value();
@@ -215,7 +215,7 @@ TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - second call is a cache hit") 
   REQUIRE(r1.status().ok());
   REQUIRE(cache.misses() > 0);
   REQUIRE(cache.hits() == 0);
-  size_t chunks_after_first = cache.num_chunks();
+  size_t nodes_after_first = cache.num_nodes();
   size_t misses_after_first = cache.misses();
 
   // Second call — same nodes, same props → all chunks already in cache
@@ -223,7 +223,7 @@ TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - second call is a cache hit") 
   REQUIRE(r2.status().ok());
   REQUIRE(cache.hits() > 0);
   REQUIRE(cache.misses() == misses_after_first);  // no new misses
-  REQUIRE(cache.num_chunks() == chunks_after_first);  // nothing new inserted
+  REQUIRE(cache.num_nodes() == nodes_after_first);  // same nodes, no new inserts
 
   REQUIRE(Int64Values(r1.value()->GetColumnByName("id")) ==
           Int64Values(r2.value()->GetColumnByName("id")));
