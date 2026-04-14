@@ -17,24 +17,12 @@ namespace {
 
 // ---- helpers ----------------------------------------------------------------
 
-std::shared_ptr<arrow::Table> MakeInt64Table(int64_t num_rows) {
-  arrow::Int64Builder builder;
-  (void)builder.Reserve(num_rows);
-  for (int64_t i = 0; i < num_rows; ++i) builder.UnsafeAppend(i);
-  std::shared_ptr<arrow::Array> arr;
-  (void)builder.Finish(&arr);
-  return arrow::Table::Make(
-      arrow::schema({arrow::field("v", arrow::int64())}),
-      {std::make_shared<arrow::ChunkedArray>(arr)}, num_rows);
-}
-
-size_t ArrowTableBytes(const arrow::Table& t) {
-  size_t total = 0;
-  for (int i = 0; i < t.num_columns(); ++i)
-    for (const auto& chunk : t.column(i)->chunks())
-      for (const auto& buf : chunk->data()->buffers)
-        if (buf) total += static_cast<size_t>(buf->size());
-  return total;
+std::shared_ptr<FeatureCache::CachedRow> MakeInt64Row(
+    int64_t value, size_t size_bytes = sizeof(int64_t)) {
+  auto row = std::make_shared<FeatureCache::CachedRow>();
+  row->values.push_back(std::make_shared<arrow::Int64Scalar>(value));
+  row->size_bytes = size_bytes;
+  return row;
 }
 
 std::vector<int64_t> Int64Values(const std::shared_ptr<arrow::ChunkedArray>& col) {
@@ -67,40 +55,44 @@ TEST_CASE("FeatureCache - miss on empty cache") {
   REQUIRE(cache.hit_rate() == 0.0);
 }
 
-TEST_CASE("FeatureCache - put then get returns same table") {
-  auto table = MakeInt64Table(100);
-  FeatureCache cache(ArrowTableBytes(*table) * 4);
+TEST_CASE("FeatureCache - put then get returns same row") {
+  auto row = MakeInt64Row(100);
+  FeatureCache cache(row->size_bytes * 4);
 
-  cache.Put(kG, kPg, 0, table);
+  cache.Put(kG, kPg, 0, row);
   REQUIRE(cache.num_nodes() == 1);
   REQUIRE(cache.size_bytes() > 0);
 
   auto got = cache.Get(kG, kPg, 0);
   REQUIRE(got != nullptr);
-  REQUIRE(got.get() == table.get());  // same underlying object
+  REQUIRE(got.get() == row.get());
   REQUIRE(cache.hits() == 1);
   REQUIRE(cache.misses() == 0);
 }
 
 TEST_CASE("FeatureCache - duplicate put is no-op") {
-  auto t1 = MakeInt64Table(100);
-  auto t2 = MakeInt64Table(100);
-  FeatureCache cache(ArrowTableBytes(*t1) * 4);
+  auto t1 = MakeInt64Row(1);
+  auto t2 = MakeInt64Row(2);
+  FeatureCache cache(t1->size_bytes * 4);
 
   cache.Put(kG, kPg, 0, t1);
   cache.Put(kG, kPg, 0, t2);  // same key — should be ignored
 
   REQUIRE(cache.num_nodes() == 1);
-  REQUIRE(cache.Get(kG, kPg, 0).get() == t1.get());  // t1 wins
+  auto got = cache.Get(kG, kPg, 0);
+  REQUIRE(got.get() == t1.get());
+  REQUIRE(
+      std::static_pointer_cast<const arrow::Int64Scalar>(got->values[0])->value ==
+      1);
 }
 
 TEST_CASE("FeatureCache - LFU evicts least-frequent entry") {
   // Put A and B (both freq=1), promote A twice, then insert C.
   // B has lower frequency so B is evicted, A and C survive.
-  auto ta = MakeInt64Table(100);
-  auto tb = MakeInt64Table(100);
-  auto tc = MakeInt64Table(100);
-  size_t sz = ArrowTableBytes(*ta);
+  auto ta = MakeInt64Row(1);
+  auto tb = MakeInt64Row(2);
+  auto tc = MakeInt64Row(3);
+  size_t sz = ta->size_bytes;
   FeatureCache cache(2 * sz);  // fits exactly 2 entries
 
   cache.Put(kG, kPg, 0, ta);  // A: freq=1
@@ -120,10 +112,10 @@ TEST_CASE("FeatureCache - LFU evicts least-frequent entry") {
 TEST_CASE("FeatureCache - LRU tie-break within same frequency") {
   // Put A first, then B — both freq=1. A is the LRU (oldest at back of list).
   // Inserting C must evict A, leaving B and C.
-  auto ta = MakeInt64Table(100);
-  auto tb = MakeInt64Table(100);
-  auto tc = MakeInt64Table(100);
-  size_t sz = ArrowTableBytes(*ta);
+  auto ta = MakeInt64Row(1);
+  auto tb = MakeInt64Row(2);
+  auto tc = MakeInt64Row(3);
+  size_t sz = ta->size_bytes;
   FeatureCache cache(2 * sz);
 
   cache.Put(kG, kPg, 0, ta);  // A: inserted first → LRU end of freq=1
@@ -137,8 +129,8 @@ TEST_CASE("FeatureCache - LRU tie-break within same frequency") {
 }
 
 TEST_CASE("FeatureCache - clear empties entries, preserves stats") {
-  auto t = MakeInt64Table(100);
-  FeatureCache cache(ArrowTableBytes(*t) * 4);
+  auto t = MakeInt64Row(1);
+  FeatureCache cache(t->size_bytes * 4);
 
   cache.Put(kG, kPg, 0, t);
   cache.Get(kG, kPg, 0);  // hit
@@ -155,8 +147,8 @@ TEST_CASE("FeatureCache - clear empties entries, preserves stats") {
 }
 
 TEST_CASE("FeatureCache - hit_rate") {
-  auto t = MakeInt64Table(100);
-  FeatureCache cache(ArrowTableBytes(*t) * 4);
+  auto t = MakeInt64Row(1);
+  FeatureCache cache(t->size_bytes * 4);
 
   REQUIRE(cache.hit_rate() == 0.0);  // no lookups yet
 
@@ -171,8 +163,8 @@ TEST_CASE("FeatureCache - hit_rate") {
 }
 
 TEST_CASE("FeatureCache - entry too large for budget is silently dropped") {
-  auto t = MakeInt64Table(1000);
-  size_t sz = ArrowTableBytes(*t);
+  auto t = MakeInt64Row(1, 1024);
+  size_t sz = t->size_bytes;
   FeatureCache cache(sz / 2);  // budget too small for one entry
 
   cache.Put(kG, kPg, 0, t);  // must be silently ignored

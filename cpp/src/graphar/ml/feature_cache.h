@@ -28,6 +28,7 @@
 #include "graphar/types.h"
 
 namespace arrow {
+class Scalar;
 class Table;
 }
 
@@ -37,8 +38,8 @@ namespace graphar::ml {
  * Thread-safe LFU cache for individual node feature rows fetched by
  * GetNodeFeatures.
  *
- * Cache key: (graph_info*, property_group*, node_id). Each entry is a 1-row
- * Arrow Table holding all columns of the property group for that node.
+ * Cache key: (graph_info*, property_group*, node_id). Each entry stores one
+ * property-group row for that node.
  * Multiple threads sharing the same FeatureCache instance benefit from
  * shared hits — all synchronization is internal.
  *
@@ -48,21 +49,26 @@ namespace graphar::ml {
  */
 class FeatureCache {
  public:
+  struct CachedRow {
+    std::vector<std::shared_ptr<arrow::Scalar>> values;
+    size_t size_bytes{0};
+  };
+
   explicit FeatureCache(size_t max_bytes);
 
   /**
-   * Look up a chunk. Returns nullptr on miss.
+   * Look up a cached row. Returns nullptr on miss.
    * On hit, promotes the entry's frequency (O(1) LFU).
    */
-  std::shared_ptr<arrow::Table> Get(const void* graph_info_ptr,
-                                    const void* pg_ptr, IdType node_id);
+  std::shared_ptr<const CachedRow> Get(const void* graph_info_ptr,
+                                       const void* pg_ptr, IdType node_id);
 
   /**
-   * Insert a node row. Evicts LFU entries if needed to stay within budget.
+   * Insert a cached row. Evicts LFU entries if needed to stay within budget.
    * No-op if the node already exists or its row is larger than the total budget.
    */
   void Put(const void* graph_info_ptr, const void* pg_ptr, IdType node_id,
-           std::shared_ptr<arrow::Table> table);
+           std::shared_ptr<CachedRow> row);
 
   /** Remove all cached entries. */
   void Clear();
@@ -106,7 +112,7 @@ class FeatureCache {
   };
 
   struct Entry {
-    std::shared_ptr<arrow::Table> table;
+    std::shared_ptr<CachedRow> row;
     size_t freq;
     size_t size_bytes;
     std::list<CacheKey>::iterator list_it;  // position in freq_to_keys_[freq]

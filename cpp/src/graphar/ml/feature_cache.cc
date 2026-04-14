@@ -22,31 +22,12 @@
 #include <algorithm>
 #include <cstdio>
 
-#include "arrow/api.h"
-
 namespace graphar::ml {
-
-namespace {
-
-int64_t TableBufferSize(const arrow::Table& table) {
-  int64_t total = 0;
-  for (int i = 0; i < table.num_columns(); ++i) {
-    for (const auto& chunk : table.column(i)->chunks()) {
-      for (const auto& buf : chunk->data()->buffers) {
-        if (buf) total += buf->size();
-      }
-    }
-  }
-  return total;
-}
-
-}  // namespace
 
 FeatureCache::FeatureCache(size_t max_bytes) : max_bytes_(max_bytes) {}
 
-std::shared_ptr<arrow::Table> FeatureCache::Get(const void* graph_info_ptr,
-                                                 const void* pg_ptr,
-                                                 IdType node_id) {
+std::shared_ptr<const FeatureCache::CachedRow> FeatureCache::Get(
+    const void* graph_info_ptr, const void* pg_ptr, IdType node_id) {
   CacheKey key{graph_info_ptr, pg_ptr, node_id};
   std::lock_guard<std::mutex> lock(mutex_);
 
@@ -73,12 +54,13 @@ std::shared_ptr<arrow::Table> FeatureCache::Get(const void* graph_info_ptr,
   new_list.push_front(key);
   entry.list_it = new_list.begin();
 
-  return entry.table;
+  return entry.row;
 }
 
 void FeatureCache::Put(const void* graph_info_ptr, const void* pg_ptr,
-                       IdType node_id, std::shared_ptr<arrow::Table> table) {
-  size_t size = static_cast<size_t>(TableBufferSize(*table));
+                       IdType node_id, std::shared_ptr<CachedRow> row) {
+  if (row == nullptr) return;
+  size_t size = row->size_bytes;
   if (size > max_bytes_) return;  // will never fit; skip silently
 
   CacheKey key{graph_info_ptr, pg_ptr, node_id};
@@ -105,7 +87,7 @@ void FeatureCache::Put(const void* graph_info_ptr, const void* pg_ptr,
   // Insert with frequency 1 at the front (most-recently-used position)
   auto& list = freq_to_keys_[1];
   list.push_front(key);
-  key_to_entry_[key] = Entry{std::move(table), 1, size, list.begin()};
+  key_to_entry_[key] = Entry{std::move(row), 1, size, list.begin()};
   current_bytes_ += size;
   min_freq_ = 1;
 }
