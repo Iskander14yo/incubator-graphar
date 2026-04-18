@@ -602,6 +602,7 @@ if (BUILD_TESTS)
     add_test(test_neighbor_sampling SRCS test/ml/test_neighbor_sampling.cc)
     add_test(test_feature_cache SRCS test/ml/test_feature_cache.cc)
     add_test(test_hot_node_selector SRCS test/ml/test_hot_node_selector.cc)
+    add_test(test_static_feature_cache SRCS test/ml/test_static_feature_cache.cc)
 
     # enable_testing()
 endif()
