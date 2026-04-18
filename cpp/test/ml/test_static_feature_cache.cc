@@ -94,4 +94,45 @@ TEST_CASE_METHOD(GlobalFixture, "StaticFeatureCache - Pin idempotent") {
   REQUIRE(cache.size_bytes() == s1);
 }
 
+TEST_CASE_METHOD(GlobalFixture,
+                 "GetNodeFeatures static_cache matches uncached (interleaved)") {
+  auto maybe_graph = GraphInfo::Load(test_data_dir + "/ldbc_sample/parquet/ldbc_sample.graph.yml");
+  REQUIRE(maybe_graph.status().ok());
+  auto graph = maybe_graph.value();
+
+  StaticFeatureCache cache(graph);
+  REQUIRE(cache.Pin("person", std::vector<IdType>({0, 2, 4, 10}), {"id"}).ok());
+
+  // 7 is valid but unpinned → miss; all IDs stay within the graph (e.g. ldbc ~903 persons).
+  std::vector<IdType> q = {10, 5, 0, 7, 4, 2};
+  auto ref = GetNodeFeatures(graph, "person", q, {"id"});
+  auto got = GetNodeFeatures(graph, "person", q, {"id"}, &cache);
+  REQUIRE(ref.status().ok());
+  REQUIRE(got.status().ok());
+  REQUIRE(ref.value()->Equals(*got.value()));
+}
+
+TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures static_cache all hit or all miss") {
+  auto maybe_graph = GraphInfo::Load(test_data_dir + "/ldbc_sample/parquet/ldbc_sample.graph.yml");
+  REQUIRE(maybe_graph.status().ok());
+  auto graph = maybe_graph.value();
+
+  StaticFeatureCache warm(graph);
+  REQUIRE(warm.Pin("person", std::vector<IdType>({1, 2, 3}), {"id"}).ok());
+  std::vector<IdType> inner = {3, 1, 2};
+  auto r1 = GetNodeFeatures(graph, "person", inner, {"id"});
+  auto g1 = GetNodeFeatures(graph, "person", inner, {"id"}, &warm);
+  REQUIRE(r1.status().ok());
+  REQUIRE(g1.status().ok());
+  REQUIRE(r1.value()->Equals(*g1.value()));
+
+  StaticFeatureCache cold(graph);
+  std::vector<IdType> any = {7, 8};
+  auto r2 = GetNodeFeatures(graph, "person", any, {"id"});
+  auto g2 = GetNodeFeatures(graph, "person", any, {"id"}, &cold);
+  REQUIRE(r2.status().ok());
+  REQUIRE(g2.status().ok());
+  REQUIRE(r2.value()->Equals(*g2.value()));
+}
+
 }  // namespace graphar::ml

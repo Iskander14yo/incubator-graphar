@@ -5,6 +5,7 @@
 #include "graphar/ml/arrow_size_util.h"
 #include "graphar/ml/get_node_features_uncached.h"
 #include "graphar/ml/feature_cache.h"
+#include "graphar/ml/static_feature_cache.h"
 #include <map>
 #include <random>
 #include <unordered_map>
@@ -580,6 +581,147 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
 
   return arrow::Table::Make(arrow::schema(schema_fields), result_arrays,
                             node_ids.size());
+}
+
+namespace {
+
+Result<std::shared_ptr<arrow::ChunkedArray>> ConcatChunkedMaybeEmpty(
+    const std::shared_ptr<arrow::ChunkedArray>& a,
+    const std::shared_ptr<arrow::ChunkedArray>& b) {
+  const int64_t la = a ? a->length() : 0;
+  const int64_t lb = b ? b->length() : 0;
+  if (la == 0) return b;
+  if (lb == 0) return a;
+  std::vector<std::shared_ptr<arrow::Array>> v;
+  v.reserve(static_cast<size_t>(a->num_chunks() + b->num_chunks()));
+  for (int i = 0; i < a->num_chunks(); ++i) v.push_back(a->chunk(i));
+  for (int i = 0; i < b->num_chunks(); ++i) v.push_back(b->chunk(i));
+  auto concat = arrow::Concatenate(v);
+  if (!concat.ok()) {
+    return Status::ArrowError(concat.status().ToString());
+  }
+  return std::make_shared<arrow::ChunkedArray>(concat.ValueOrDie());
+}
+
+Result<std::shared_ptr<arrow::Array>> ChunksToOneArray(
+    const std::shared_ptr<arrow::ChunkedArray>& ca) {
+  if (!ca) {
+    return Status::Invalid("null chunked column after Take");
+  }
+  if (ca->num_chunks() == 1) return ca->chunk(0);
+  std::vector<std::shared_ptr<arrow::Array>> chs;
+  chs.reserve(static_cast<size_t>(ca->num_chunks()));
+  for (int i = 0; i < ca->num_chunks(); ++i) chs.push_back(ca->chunk(i));
+  auto r = arrow::Concatenate(chs);
+  if (!r.ok()) return Status::ArrowError(r.status().ToString());
+  return r.ValueOrDie();
+}
+
+}  // namespace
+
+Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
+    const std::shared_ptr<GraphInfo>& graph_info,
+    const std::string& vertex_type, const std::vector<IdType>& node_ids,
+    const std::vector<std::string>& properties,
+    StaticFeatureCache* static_cache) {
+  if (static_cache == nullptr) {
+    return GetNodeFeatures(graph_info, vertex_type, node_ids, properties,
+                           static_cast<FeatureCache*>(nullptr));
+  }
+
+  if (node_ids.empty()) {
+    std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
+    return arrow::Table::Make(arrow::schema({}), empty_arrays, 0);
+  }
+  if (properties.empty()) {
+    return Status::Invalid("Properties list cannot be empty");
+  }
+
+  auto vertex_info = graph_info->GetVertexInfo(vertex_type);
+  if (!vertex_info) {
+    return Status::Invalid("Vertex type '", vertex_type, "' not found");
+  }
+
+  for (const auto& prop : properties) {
+    if (!vertex_info->HasProperty(prop)) {
+      return Status::Invalid("Property '", prop, "' not found in vertex type '",
+                             vertex_type, "'");
+    }
+  }
+
+  PropertyGroupMap pg_to_props;
+  for (const auto& prop : properties) {
+    auto pg = vertex_info->GetPropertyGroup(prop);
+    if (!pg) {
+      return Status::Invalid("Property group not found for property '", prop,
+                             "'");
+    }
+    pg_to_props[pg].push_back(prop);
+  }
+
+  GAR_ASSIGN_OR_RAISE(auto lr,
+                      static_cache->Lookup(vertex_type, node_ids, properties));
+
+  const size_t n = node_ids.size();
+  const size_t hit_count = lr.hit_positions.size();
+  const size_t miss_count = lr.miss_positions.size();
+
+  std::shared_ptr<arrow::Table> miss_tbl;
+  if (miss_count > 0) {
+    GAR_ASSIGN_OR_RAISE(
+        miss_tbl,
+        GetNodeFeaturesUncached(graph_info, vertex_info, vertex_type,
+                                lr.miss_node_ids, pg_to_props));
+  }
+
+  std::vector<std::shared_ptr<arrow::Field>> schema_fields;
+  std::vector<std::shared_ptr<arrow::Array>> out_arrays;
+  schema_fields.reserve(properties.size());
+  out_arrays.reserve(properties.size());
+
+  for (const auto& prop : properties) {
+    auto prop_type_result = vertex_info->GetPropertyType(prop);
+    GAR_RETURN_NOT_OK(prop_type_result.status());
+    schema_fields.push_back(arrow::field(
+        prop, DataType::DataTypeToArrowDataType(prop_type_result.value())));
+
+    std::shared_ptr<arrow::ChunkedArray> hc = lr.hits->GetColumnByName(prop);
+    std::shared_ptr<arrow::ChunkedArray> mc;
+    if (miss_count > 0 && miss_tbl) {
+      mc = miss_tbl->GetColumnByName(prop);
+    }
+    GAR_ASSIGN_OR_RAISE(auto combined, ConcatChunkedMaybeEmpty(hc, mc));
+
+    arrow::Int64Builder idx_b;
+    auto st = idx_b.Reserve(static_cast<int64_t>(n));
+    if (!st.ok()) return Status::ArrowError(st.ToString());
+    size_t hk = 0;
+    size_t mk = 0;
+    for (size_t r = 0; r < n; ++r) {
+      if (hk < hit_count && lr.hit_positions[hk] == r) {
+        idx_b.UnsafeAppend(static_cast<int64_t>(hk));
+        ++hk;
+      } else {
+        idx_b.UnsafeAppend(static_cast<int64_t>(hit_count + mk));
+        ++mk;
+      }
+    }
+    std::shared_ptr<arrow::Array> idx_arr;
+    st = idx_b.Finish(&idx_arr);
+    if (!st.ok()) return Status::ArrowError(st.ToString());
+
+    auto take_res =
+        arrow::compute::Take(arrow::Datum(combined), arrow::Datum(idx_arr));
+    if (!take_res.ok()) {
+      return Status::ArrowError(take_res.status().ToString());
+    }
+    auto out_ch = take_res.ValueOrDie().chunked_array();
+    GAR_ASSIGN_OR_RAISE(auto out_a, ChunksToOneArray(out_ch));
+    out_arrays.push_back(std::move(out_a));
+  }
+
+  return arrow::Table::Make(arrow::schema(schema_fields), out_arrays,
+                            static_cast<int64_t>(n));
 }
 
 }  // namespace graphar::ml
