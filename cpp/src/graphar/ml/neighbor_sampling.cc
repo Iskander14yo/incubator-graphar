@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "graphar/ml/arrow_size_util.h"
+#include "graphar/ml/get_node_features_uncached.h"
 #include "graphar/ml/feature_cache.h"
 #include <map>
 #include <random>
@@ -127,9 +128,7 @@ Result<std::shared_ptr<arrow::ChunkedArray>> LoadOffsetColumn(
   return table->column(0);
 }
 
-using PropertyGroupMap =
-    std::unordered_map<std::shared_ptr<PropertyGroup>,
-                       std::vector<std::string>>;
+}  // namespace
 
 Result<std::shared_ptr<arrow::Table>> GetNodeFeaturesUncached(
     const std::shared_ptr<GraphInfo>& graph_info,
@@ -224,8 +223,6 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeaturesUncached(
   return arrow::Table::Make(arrow::schema(schema_fields), result_arrays,
                             node_ids.size());
 }
-
-}  // namespace
 
 Result<SamplingResult> SampleNeighbors(
     const std::shared_ptr<GraphInfo>& graph_info,
