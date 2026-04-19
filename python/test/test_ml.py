@@ -166,7 +166,8 @@ def test_static_cache_matches_uncached_and_records_hits(ldbc_graph):
     cache = gar_ml.StaticFeatureCache(ldbc_graph)
     cache.pin("person", top, ["id"])
 
-    node_ids = [0, 7, 2, 10, 1]
+    # Include ids from `top` so lookups are not all misses (low-degree fixtures may not overlap [0,7,...]).
+    node_ids = [top[0], top[1], 0, 7, 2]
     plain = gar_ml.get_node_features(ldbc_graph, "person", node_ids, ["id"])
     got = gar_ml.get_node_features(
         ldbc_graph, "person", node_ids, ["id"], static_cache=cache
