@@ -8,6 +8,7 @@ import torch
 from torch_geometric.data import Data
 
 import graphar as gar
+import graphar.ml as gar_ml
 from graphar.ml.torch import BatchProfile, GARNeighborLoader
 
 
@@ -368,3 +369,54 @@ def test_bounded_prefetch_limits_concurrency(ldbc_graph):
         list(loader)
 
     assert peak <= num_workers
+
+
+def test_neighbor_loader_static_cache_matches_uncached(ldbc_graph):
+    sel = gar_ml.DegreeHotNodeSelector(ldbc_graph, "person", "knows")
+    top = sel.select(48)
+    static_cache = gar_ml.StaticFeatureCache(ldbc_graph)
+    static_cache.pin("person", top, ["id"])
+
+    torch.manual_seed(2026)
+    loader_a = GARNeighborLoader(
+        ldbc_graph,
+        "person",
+        "knows",
+        [3],
+        input_nodes=[0, 1, 2, 3],
+        batch_size=2,
+        shuffle=False,
+        features=["id"],
+        static_cache=None,
+    )
+    torch.manual_seed(2026)
+    loader_b = GARNeighborLoader(
+        ldbc_graph,
+        "person",
+        "knows",
+        [3],
+        input_nodes=[0, 1, 2, 3],
+        batch_size=2,
+        shuffle=False,
+        features=["id"],
+        static_cache=static_cache,
+    )
+    ba, _ = next(iter(loader_a.profile()))
+    bb, _ = next(iter(loader_b.profile()))
+    assert torch.equal(ba.x, bb.x)
+    assert torch.equal(ba.n_id, bb.n_id)
+    assert static_cache.hits > 0
+
+
+def test_neighbor_loader_cache_mutex(ldbc_graph):
+    fc = gar_ml.FeatureCache(1024 * 1024)
+    sc = gar_ml.StaticFeatureCache(ldbc_graph)
+    with pytest.raises(ValueError, match="only one"):
+        GARNeighborLoader(
+            ldbc_graph,
+            "person",
+            "knows",
+            [2],
+            feature_cache=fc,
+            static_cache=sc,
+        )

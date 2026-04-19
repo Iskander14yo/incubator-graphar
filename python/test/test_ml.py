@@ -160,6 +160,30 @@ def test_feature_cache_returns_same_results(ldbc_graph):
     assert no_cache.to_pydict() == second_cached.to_pydict()
 
 
+def test_static_cache_matches_uncached_and_records_hits(ldbc_graph):
+    sel = gar_ml.DegreeHotNodeSelector(ldbc_graph, "person", "knows")
+    top = sel.select(32)
+    cache = gar_ml.StaticFeatureCache(ldbc_graph)
+    cache.pin("person", top, ["id"])
+
+    node_ids = [0, 7, 2, 10, 1]
+    plain = gar_ml.get_node_features(ldbc_graph, "person", node_ids, ["id"])
+    got = gar_ml.get_node_features(
+        ldbc_graph, "person", node_ids, ["id"], static_cache=cache
+    )
+    assert plain.to_pydict() == got.to_pydict()
+    assert cache.hits > 0
+
+
+def test_get_node_features_cache_arguments_mutex(ldbc_graph):
+    fc = gar_ml.FeatureCache(1024 * 1024)
+    sc = gar_ml.StaticFeatureCache(ldbc_graph)
+    with pytest.raises(RuntimeError, match="only one"):
+        gar_ml.get_node_features(
+            ldbc_graph, "person", [0], ["id"], cache=fc, static_cache=sc
+        )
+
+
 def test_feature_cache_clear(ldbc_graph):
     """Clear empties entries but preserves cumulative hit/miss stats."""
     cache = gar_ml.FeatureCache(64 * 1024 * 1024)

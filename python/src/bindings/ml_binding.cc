@@ -24,7 +24,9 @@
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "graphar/ml/feature_cache.h"
+#include "graphar/ml/hot_node_selector.h"
 #include "graphar/ml/neighbor_sampling.h"
+#include "graphar/ml/static_feature_cache.h"
 #include "graphar/graph_info.h"
 
 namespace py = pybind11;
@@ -131,25 +133,87 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       py::arg("seed"),
       "Sample multi-hop neighbors for given seed nodes");
 
-  // Bind get_node_features function
-  m.def("get_node_features",
+  py::class_<graphar::ml::StaticFeatureCache>(
+      m, "StaticFeatureCache",
+      "Immutable columnar feature tier: Pin once, then lock-free Lookup.")
+      .def(py::init<std::shared_ptr<graphar::GraphInfo>>(), py::arg("graph_info"))
+      .def(
+          "pin",
+          [](graphar::ml::StaticFeatureCache& self, const std::string& vertex_type,
+             const std::vector<graphar::IdType>& node_ids,
+             const std::vector<std::string>& properties) {
+            CheckStatus(self.Pin(vertex_type, node_ids, properties));
+          },
+          py::arg("vertex_type"), py::arg("node_ids"), py::arg("properties"))
+      .def_property_readonly("num_nodes", &graphar::ml::StaticFeatureCache::num_nodes)
+      .def_property_readonly("size_bytes", &graphar::ml::StaticFeatureCache::size_bytes)
+      .def_property_readonly("hits", &graphar::ml::StaticFeatureCache::hits)
+      .def_property_readonly("misses", &graphar::ml::StaticFeatureCache::misses)
+      .def_property_readonly("hit_rate", &graphar::ml::StaticFeatureCache::hit_rate);
+
+  py::class_<graphar::ml::DegreeHotNodeSelector>(m, "DegreeHotNodeSelector")
+      .def(py::init<std::shared_ptr<graphar::GraphInfo>, std::string, std::string>(),
+           py::arg("graph_info"), py::arg("vertex_type"), py::arg("edge_type"))
+      .def(
+          "select",
+          [](graphar::ml::DegreeHotNodeSelector& self, size_t top_k) {
+            return ThrowOrReturn(self.Select(top_k));
+          },
+          py::arg("top_k"))
+      .def(
+          "curve",
+          [](graphar::ml::DegreeHotNodeSelector& self) {
+            auto cv = ThrowOrReturn(self.Curve());
+            py::list out;
+            for (const auto& p : cv) {
+              out.append(py::make_tuple(p.k, p.cumulative_hit_rate));
+            }
+            return out;
+          });
+
+  m.def(
+      "estimate_hit_rate",
+      [](graphar::ml::DegreeHotNodeSelector& sel, size_t top_k) {
+        return ThrowOrReturn(graphar::ml::EstimateHitRate(
+            static_cast<graphar::ml::HotNodeSelector&>(sel), top_k));
+      },
+      py::arg("selector"), py::arg("top_k"));
+
+  m.def(
+      "get_node_features",
       [](const std::shared_ptr<graphar::GraphInfo>& graph_info,
          const std::string& vertex_type,
          const std::vector<graphar::IdType>& node_ids,
-         const std::vector<std::string>& properties,
-         graphar::ml::FeatureCache* cache) {
-        auto result = [&]() {
-          py::gil_scoped_release release; // release GIL
-          return graphar::ml::GetNodeFeatures(
-              graph_info, vertex_type, node_ids, properties, cache);
-        }();
-        auto table = ThrowOrReturn(result);
+         const std::vector<std::string>& properties, py::object cache_arg,
+         py::object static_cache_arg) {
+        if (!cache_arg.is_none() && !static_cache_arg.is_none()) {
+          throw std::runtime_error("pass only one of cache and static_cache");
+        }
+        std::shared_ptr<arrow::Table> table;
+        if (!static_cache_arg.is_none()) {
+          auto* sc = static_cache_arg.cast<graphar::ml::StaticFeatureCache*>();
+          auto result = [&]() {
+            py::gil_scoped_release release;
+            return graphar::ml::GetNodeFeatures(graph_info, vertex_type, node_ids,
+                                                properties, sc);
+          }();
+          table = ThrowOrReturn(result);
+        } else {
+          graphar::ml::FeatureCache* fc = nullptr;
+          if (!cache_arg.is_none()) {
+            fc = cache_arg.cast<graphar::ml::FeatureCache*>();
+          }
+          auto result = [&]() {
+            py::gil_scoped_release release;
+            return graphar::ml::GetNodeFeatures(graph_info, vertex_type, node_ids,
+                                                properties, fc);
+          }();
+          table = ThrowOrReturn(result);
+        }
         return table_to_pyarrow(table);
       },
-      py::arg("graph_info"),
-      py::arg("vertex_type"),
-      py::arg("node_ids"),
-      py::arg("properties"),
-      py::arg("cache").none(true) = static_cast<graphar::ml::FeatureCache*>(nullptr),
+      py::arg("graph_info"), py::arg("vertex_type"), py::arg("node_ids"),
+      py::arg("properties"), py::arg("cache").none(true) = py::none(),
+      py::arg("static_cache").none(true) = py::none(),
       "Fetch node properties for given internal IDs");
 }
