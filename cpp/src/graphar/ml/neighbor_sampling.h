@@ -53,12 +53,7 @@ Result<SamplingResult> SampleNeighbors(
 Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
     const std::shared_ptr<GraphInfo>& graph_info,
     const std::string& vertex_type, const std::vector<IdType>& node_ids,
-    const std::vector<std::string>& properties);
-
-Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
-    const std::shared_ptr<GraphInfo>& graph_info,
-    const std::string& vertex_type, const std::vector<IdType>& node_ids,
     const std::vector<std::string>& properties,
-    ChunkReadManager* chunk_manager);
+    ChunkReadManager* chunk_manager = nullptr);
 
 }  // namespace graphar::ml

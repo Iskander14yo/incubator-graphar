@@ -469,11 +469,4 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
   return arrow::Table::Make(schema, result_arrays, node_ids.size());
 }
 
-Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
-    const std::shared_ptr<GraphInfo>& graph_info,
-    const std::string& vertex_type, const std::vector<IdType>& node_ids,
-    const std::vector<std::string>& properties) {
-  return GetNodeFeatures(graph_info, vertex_type, node_ids, properties, nullptr);
-}
-
 }  // namespace graphar::ml
