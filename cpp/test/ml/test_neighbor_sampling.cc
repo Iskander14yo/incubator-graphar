@@ -6,6 +6,7 @@
 
 #include "arrow/api.h"
 #include "graphar/graph_info.h"
+#include "graphar/ml/chunk_read_manager.h"
 #include "graphar/ml/neighbor_sampling.h"
 
 #include <catch2/catch_test_macros.hpp>
@@ -261,6 +262,26 @@ TEST_CASE_METHOD(GlobalFixture,
   REQUIRE(first_name_column != nullptr);
   REQUIRE(StringValues(first_name_column) ==
           std::vector<std::string>{"Mahinda", "Eli"});
+}
+
+TEST_CASE_METHOD(GlobalFixture,
+                 "GetNodeFeatures - chunk manager matches uncached output") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  ChunkReadManager manager;
+
+  auto uncached =
+      GetNodeFeatures(graph_info, kVertexType, {5, 1, 3, 0}, {"id", "firstName"});
+  auto managed = GetNodeFeatures(graph_info, kVertexType, {5, 1, 3, 0},
+                                 {"id", "firstName"}, &manager);
+  REQUIRE(uncached.status().ok());
+  REQUIRE(managed.status().ok());
+
+  REQUIRE(managed.value()->Equals(*uncached.value()));
+  const auto stats = manager.stats();
+  REQUIRE(stats.requests > 0);
+  REQUIRE(stats.leaders == stats.requests);
+  REQUIRE(stats.completed == stats.requests);
+  REQUIRE(stats.failed == 0);
 }
 
 TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - empty node list") {
