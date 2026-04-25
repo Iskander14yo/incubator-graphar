@@ -32,6 +32,20 @@ std::shared_ptr<arrow::Table> MakeTable(int64_t value) {
       arrow::schema({arrow::field("value", arrow::int64())}), {array});
 }
 
+size_t TableBytes(const std::shared_ptr<arrow::Table>& table) {
+  size_t bytes = 0;
+  for (int col = 0; col < table->num_columns(); ++col) {
+    for (const auto& chunk : table->column(col)->chunks()) {
+      for (const auto& buffer : chunk->data()->buffers) {
+        if (buffer != nullptr) {
+          bytes += static_cast<size_t>(buffer->size());
+        }
+      }
+    }
+  }
+  return bytes;
+}
+
 }  // namespace
 
 TEST_CASE("ChunkReadManager singleflight shares one load") {
@@ -104,6 +118,131 @@ TEST_CASE("ChunkReadManager does not merge distinct keys") {
   REQUIRE(stats.waiters == 0);
   REQUIRE(stats.completed == 2);
   REQUIRE(stats.failed == 0);
+}
+
+TEST_CASE("ChunkReadManager serves later requests from RAM cache") {
+  ChunkReadManagerOptions options;
+  options.ram_budget_bytes = 1024;
+  ChunkReadManager manager(options);
+  auto table = MakeTable(11);
+  std::atomic<int> loader_calls{0};
+
+  auto first = manager.GetOrLoad(TestKey(), [&]() {
+    loader_calls.fetch_add(1, std::memory_order_relaxed);
+    return table;
+  });
+  auto second = manager.GetOrLoad(TestKey(), [&]() {
+    loader_calls.fetch_add(1, std::memory_order_relaxed);
+    return MakeTable(12);
+  });
+
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+  REQUIRE(first.value() == table);
+  REQUIRE(second.value() == table);
+  REQUIRE(loader_calls.load() == 1);
+
+  const auto stats = manager.stats();
+  REQUIRE(stats.requests == 2);
+  REQUIRE(stats.leaders == 1);
+  REQUIRE(stats.ram_cache_hits == 1);
+  REQUIRE(stats.ram_cache_misses == 1);
+  REQUIRE(stats.ram_cache_evictions == 0);
+  REQUIRE(stats.ram_cache_bytes >= TableBytes(table));
+}
+
+TEST_CASE("ChunkReadManager zero RAM budget disables cache") {
+  ChunkReadManager manager;
+  std::atomic<int> loader_calls{0};
+
+  auto first = manager.GetOrLoad(TestKey(), [&]() {
+    loader_calls.fetch_add(1, std::memory_order_relaxed);
+    return MakeTable(1);
+  });
+  auto second = manager.GetOrLoad(TestKey(), [&]() {
+    loader_calls.fetch_add(1, std::memory_order_relaxed);
+    return MakeTable(2);
+  });
+
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+  REQUIRE(loader_calls.load() == 2);
+
+  const auto stats = manager.stats();
+  REQUIRE(stats.ram_cache_hits == 0);
+  REQUIRE(stats.ram_cache_misses == 0);
+  REQUIRE(stats.ram_cache_bytes == 0);
+}
+
+TEST_CASE("ChunkReadManager evicts least recently used chunks") {
+  auto table = MakeTable(1);
+  ChunkReadManagerOptions options;
+  options.ram_budget_bytes = TableBytes(table) * 2;
+  ChunkReadManager manager(options);
+  std::atomic<int> loader_calls{0};
+
+  REQUIRE(manager.GetOrLoad(TestKey(1), [&]() {
+                   loader_calls.fetch_add(1, std::memory_order_relaxed);
+                   return MakeTable(1);
+                 })
+              .status()
+              .ok());
+  REQUIRE(manager.GetOrLoad(TestKey(2), [&]() {
+                   loader_calls.fetch_add(1, std::memory_order_relaxed);
+                   return MakeTable(2);
+                 })
+              .status()
+              .ok());
+  REQUIRE(manager.GetOrLoad(TestKey(1), [&]() {
+                   loader_calls.fetch_add(1, std::memory_order_relaxed);
+                   return MakeTable(10);
+                 })
+              .status()
+              .ok());
+  REQUIRE(manager.GetOrLoad(TestKey(3), [&]() {
+                   loader_calls.fetch_add(1, std::memory_order_relaxed);
+                   return MakeTable(3);
+                 })
+              .status()
+              .ok());
+  REQUIRE(manager.GetOrLoad(TestKey(2), [&]() {
+                   loader_calls.fetch_add(1, std::memory_order_relaxed);
+                   return MakeTable(20);
+                 })
+              .status()
+              .ok());
+
+  REQUIRE(loader_calls.load() == 4);
+  const auto stats = manager.stats();
+  REQUIRE(stats.ram_cache_hits == 1);
+  REQUIRE(stats.ram_cache_evictions >= 1);
+  REQUIRE(stats.ram_cache_bytes <= options.ram_budget_bytes);
+}
+
+TEST_CASE("ChunkReadManager does not cache chunks larger than RAM budget") {
+  auto table = MakeTable(1);
+  ChunkReadManagerOptions options;
+  options.ram_budget_bytes = TableBytes(table) - 1;
+  ChunkReadManager manager(options);
+  std::atomic<int> loader_calls{0};
+
+  auto first = manager.GetOrLoad(TestKey(), [&]() {
+    loader_calls.fetch_add(1, std::memory_order_relaxed);
+    return table;
+  });
+  auto second = manager.GetOrLoad(TestKey(), [&]() {
+    loader_calls.fetch_add(1, std::memory_order_relaxed);
+    return table;
+  });
+
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+  REQUIRE(loader_calls.load() == 2);
+
+  const auto stats = manager.stats();
+  REQUIRE(stats.ram_cache_hits == 0);
+  REQUIRE(stats.ram_cache_misses == 2);
+  REQUIRE(stats.ram_cache_bytes == 0);
 }
 
 TEST_CASE("ChunkReadManager propagates failures and allows retry") {

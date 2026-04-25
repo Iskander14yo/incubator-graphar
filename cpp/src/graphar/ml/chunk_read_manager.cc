@@ -20,8 +20,11 @@
 #include "graphar/ml/chunk_read_manager.h"
 
 #include <exception>
+#include <iterator>
+#include <unordered_set>
 #include <utility>
 
+#include "arrow/api.h"
 #include "graphar/arrow/chunk_reader.h"
 #include "graphar/graph_info.h"
 #include "graphar/status.h"
@@ -33,6 +36,37 @@ template <typename T>
 void HashCombine(size_t* seed, const T& value) {
   std::hash<T> hasher;
   *seed ^= hasher(value) + 0x9e3779b97f4a7c15ULL + (*seed << 6) + (*seed >> 2);
+}
+
+size_t ArrayDataBytes(const std::shared_ptr<arrow::ArrayData>& data,
+                      std::unordered_set<const arrow::Buffer*>* seen) {
+  if (data == nullptr) {
+    return 0;
+  }
+  size_t bytes = 0;
+  for (const auto& buffer : data->buffers) {
+    if (buffer != nullptr && seen->insert(buffer.get()).second) {
+      bytes += static_cast<size_t>(buffer->size());
+    }
+  }
+  for (const auto& child : data->child_data) {
+    bytes += ArrayDataBytes(child, seen);
+  }
+  return bytes;
+}
+
+size_t TableBytes(const std::shared_ptr<arrow::Table>& table) {
+  if (table == nullptr) {
+    return 0;
+  }
+  std::unordered_set<const arrow::Buffer*> seen;
+  size_t bytes = 0;
+  for (int col = 0; col < table->num_columns(); ++col) {
+    for (const auto& chunk : table->column(col)->chunks()) {
+      bytes += ArrayDataBytes(chunk->data(), &seen);
+    }
+  }
+  return bytes;
 }
 
 }  // namespace
@@ -62,9 +96,27 @@ ChunkReadManager::TableResult ChunkReadManager::GetOrLoad(
     const ChunkReadKey& key, const TableLoader& loader) {
   requests_.fetch_add(1, std::memory_order_relaxed);
 
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto cached = LookupRamCacheLocked(key);
+    if (cached != nullptr) {
+      ram_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+      TableResult result = cached;
+      RecordResult(result);
+      return result;
+    }
+    if (options_.ram_budget_bytes > 0) {
+      ram_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   if (!options_.enable_singleflight) {
     leaders_.fetch_add(1, std::memory_order_relaxed);
     TableResult result = loader();
+    if (!result.has_error()) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      InsertRamCacheLocked(key, result.value());
+    }
     RecordResult(result);
     return result;
   }
@@ -103,6 +155,11 @@ ChunkReadManager::TableResult ChunkReadManager::GetOrLoad(
       return Status::UnknownError("Chunk loader threw unknown exception");
     }
   }();
+
+  if (!result.has_error()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    InsertRamCacheLocked(key, result.value());
+  }
 
   promise->set_value(result);
   {
@@ -161,6 +218,14 @@ ChunkReadStats ChunkReadManager::stats() const {
   stats.waiters = waiters_.load(std::memory_order_relaxed);
   stats.completed = completed_.load(std::memory_order_relaxed);
   stats.failed = failed_.load(std::memory_order_relaxed);
+  stats.ram_cache_hits = ram_cache_hits_.load(std::memory_order_relaxed);
+  stats.ram_cache_misses = ram_cache_misses_.load(std::memory_order_relaxed);
+  stats.ram_cache_evictions =
+      ram_cache_evictions_.load(std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats.ram_cache_bytes = ram_cache_bytes_;
+  }
   return stats;
 }
 
@@ -169,6 +234,56 @@ void ChunkReadManager::RecordResult(const TableResult& result) {
     failed_.fetch_add(1, std::memory_order_relaxed);
   } else {
     completed_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+ChunkReadManager::TablePtr ChunkReadManager::LookupRamCacheLocked(
+    const ChunkReadKey& key) {
+  auto it = ram_cache_.find(key);
+  if (it == ram_cache_.end()) {
+    return nullptr;
+  }
+  ram_cache_lru_.splice(ram_cache_lru_.end(), ram_cache_lru_,
+                        it->second.lru_it);
+  return it->second.table;
+}
+
+void ChunkReadManager::InsertRamCacheLocked(const ChunkReadKey& key,
+                                            const TablePtr& table) {
+  if (options_.ram_budget_bytes == 0 || table == nullptr) {
+    return;
+  }
+
+  const size_t bytes = TableBytes(table);
+  if (bytes > options_.ram_budget_bytes) {
+    return;
+  }
+
+  auto existing = ram_cache_.find(key);
+  if (existing != ram_cache_.end()) {
+    ram_cache_bytes_ -= existing->second.bytes;
+    ram_cache_lru_.erase(existing->second.lru_it);
+    ram_cache_.erase(existing);
+  }
+
+  EvictRamCacheLocked(bytes);
+  ram_cache_lru_.push_back(key);
+  auto lru_it = std::prev(ram_cache_lru_.end());
+  ram_cache_.emplace(key, CacheEntry{table, bytes, lru_it});
+  ram_cache_bytes_ += bytes;
+}
+
+void ChunkReadManager::EvictRamCacheLocked(size_t bytes_needed) {
+  while (ram_cache_bytes_ + bytes_needed > options_.ram_budget_bytes &&
+         !ram_cache_lru_.empty()) {
+    const auto& victim_key = ram_cache_lru_.front();
+    auto victim = ram_cache_.find(victim_key);
+    if (victim != ram_cache_.end()) {
+      ram_cache_bytes_ -= victim->second.bytes;
+      ram_cache_.erase(victim);
+      ram_cache_evictions_.fetch_add(1, std::memory_order_relaxed);
+    }
+    ram_cache_lru_.pop_front();
   }
 }
 

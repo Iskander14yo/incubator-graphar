@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <functional>
 #include <future>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -58,6 +59,7 @@ struct ChunkReadKeyHash {
 
 struct ChunkReadManagerOptions {
   bool enable_singleflight = true;
+  size_t ram_budget_bytes = 0;
 };
 
 struct ChunkReadStats {
@@ -66,6 +68,10 @@ struct ChunkReadStats {
   uint64_t waiters = 0;
   uint64_t completed = 0;
   uint64_t failed = 0;
+  uint64_t ram_cache_hits = 0;
+  uint64_t ram_cache_misses = 0;
+  uint64_t ram_cache_evictions = 0;
+  uint64_t ram_cache_bytes = 0;
 };
 
 class ChunkReadManager {
@@ -86,10 +92,22 @@ class ChunkReadManager {
   ChunkReadStats stats() const;
 
  private:
+  struct CacheEntry {
+    TablePtr table;
+    size_t bytes = 0;
+    std::list<ChunkReadKey>::iterator lru_it;
+  };
+
   void RecordResult(const TableResult& result);
+  TablePtr LookupRamCacheLocked(const ChunkReadKey& key);
+  void InsertRamCacheLocked(const ChunkReadKey& key, const TablePtr& table);
+  void EvictRamCacheLocked(size_t bytes_needed);
 
   ChunkReadManagerOptions options_;
   mutable std::mutex mutex_;
+  std::list<ChunkReadKey> ram_cache_lru_;
+  std::unordered_map<ChunkReadKey, CacheEntry, ChunkReadKeyHash> ram_cache_;
+  size_t ram_cache_bytes_ = 0;
   std::unordered_map<ChunkReadKey, std::shared_future<TableResult>,
                      ChunkReadKeyHash>
       in_flight_;
@@ -99,6 +117,9 @@ class ChunkReadManager {
   std::atomic<uint64_t> waiters_{0};
   std::atomic<uint64_t> completed_{0};
   std::atomic<uint64_t> failed_{0};
+  std::atomic<uint64_t> ram_cache_hits_{0};
+  std::atomic<uint64_t> ram_cache_misses_{0};
+  std::atomic<uint64_t> ram_cache_evictions_{0};
 };
 
 }  // namespace graphar::ml
