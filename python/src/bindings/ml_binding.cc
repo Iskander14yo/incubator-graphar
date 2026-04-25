@@ -81,14 +81,24 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       m, "_ChunkReadManagerOptions")
       .def(py::init<>())
       .def_readwrite("enable_singleflight",
-                     &graphar::ml::ChunkReadManagerOptions::enable_singleflight);
+                     &graphar::ml::ChunkReadManagerOptions::enable_singleflight)
+      .def_readwrite("ram_budget_bytes",
+                     &graphar::ml::ChunkReadManagerOptions::ram_budget_bytes);
 
   py::class_<graphar::ml::ChunkReadStats>(m, "_ChunkReadStats")
       .def_readonly("requests", &graphar::ml::ChunkReadStats::requests)
       .def_readonly("leaders", &graphar::ml::ChunkReadStats::leaders)
       .def_readonly("waiters", &graphar::ml::ChunkReadStats::waiters)
       .def_readonly("completed", &graphar::ml::ChunkReadStats::completed)
-      .def_readonly("failed", &graphar::ml::ChunkReadStats::failed);
+      .def_readonly("failed", &graphar::ml::ChunkReadStats::failed)
+      .def_readonly("ram_cache_hits",
+                    &graphar::ml::ChunkReadStats::ram_cache_hits)
+      .def_readonly("ram_cache_misses",
+                    &graphar::ml::ChunkReadStats::ram_cache_misses)
+      .def_readonly("ram_cache_evictions",
+                    &graphar::ml::ChunkReadStats::ram_cache_evictions)
+      .def_readonly("ram_cache_bytes",
+                    &graphar::ml::ChunkReadStats::ram_cache_bytes);
 
   py::class_<graphar::ml::ChunkReadManager,
              std::shared_ptr<graphar::ml::ChunkReadManager>>(

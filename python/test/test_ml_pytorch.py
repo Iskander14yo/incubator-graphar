@@ -26,6 +26,7 @@ def _make_loader(
     shuffle=False,
     features=None,
     num_workers=0,
+    ram_for_loader_mb=0,
 ):
     if num_neighbors is None:
         num_neighbors = [5]
@@ -39,6 +40,7 @@ def _make_loader(
         shuffle=shuffle,
         features=features,
         num_workers=num_workers,
+        ram_for_loader_mb=ram_for_loader_mb,
     )
     return GARNeighborLoader(**kwargs)
 
@@ -195,6 +197,32 @@ def test_chunk_manager_is_owned_by_loader(ldbc_graph):
     assert stats["leaders"] == stats["requests"]
     assert stats["completed"] == stats["requests"]
     assert stats["failed"] == 0
+    assert stats["ram_cache_hits"] == 0
+    assert stats["ram_cache_misses"] == 0
+    assert stats["ram_cache_evictions"] == 0
+    assert stats["ram_cache_bytes"] == 0
+
+
+def test_chunk_manager_uses_ram_budget(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        ram_for_loader_mb=1,
+    )
+    list(loader)
+
+    stats = loader.chunk_manager_stats()
+    assert stats["requests"] > 0
+    assert stats["ram_cache_misses"] > 0
+    assert stats["ram_cache_bytes"] > 0
+
+
+def test_negative_ram_for_loader_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="ram_for_loader_mb"):
+        _make_loader(ldbc_graph, ram_for_loader_mb=-1)
 
 
 def test_valid_batch_with_zero_fanout(ldbc_graph):

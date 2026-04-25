@@ -95,6 +95,7 @@ class GARNeighborLoader(IterableDataset):
         shuffle: bool = True,
         features: list[str] | None = None,
         num_workers: int = 0,
+        ram_for_loader_mb: int = 0,
     ) -> None:
         if batch_size <= 0:
             msg = "batch_size must be > 0"
@@ -105,6 +106,9 @@ class GARNeighborLoader(IterableDataset):
         if num_workers < 0:
             msg = "num_workers must be >= 0"
             raise ValueError(msg)
+        if ram_for_loader_mb < 0:
+            msg = "ram_for_loader_mb must be >= 0"
+            raise ValueError(msg)
         self.graph_info = graph_info
         self.vertex_type = vertex_type
         self.edge_type = edge_type
@@ -112,7 +116,9 @@ class GARNeighborLoader(IterableDataset):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
-        self._chunk_manager = gar_ml._ChunkReadManager()
+        chunk_manager_options = gar_ml._ChunkReadManagerOptions()
+        chunk_manager_options.ram_budget_bytes = int(ram_for_loader_mb) * 1024 * 1024
+        self._chunk_manager = gar_ml._ChunkReadManager(chunk_manager_options)
         self._input_nodes = list(dict.fromkeys(  #  dict.fromkeys preserves insertion order
             _normalize_input_nodes(graph_info, vertex_type, input_nodes)
         ))
@@ -150,6 +156,10 @@ class GARNeighborLoader(IterableDataset):
             "waiters": int(stats.waiters),
             "completed": int(stats.completed),
             "failed": int(stats.failed),
+            "ram_cache_hits": int(stats.ram_cache_hits),
+            "ram_cache_misses": int(stats.ram_cache_misses),
+            "ram_cache_evictions": int(stats.ram_cache_evictions),
+            "ram_cache_bytes": int(stats.ram_cache_bytes),
         }
 
     def _build_batch(self, seed_nodes: list[int], seed: int) -> tuple[Data, BatchProfile]:
