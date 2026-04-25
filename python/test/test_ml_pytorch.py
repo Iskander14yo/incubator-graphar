@@ -184,6 +184,18 @@ def test_feature_selection_sanity(ldbc_graph, features, expected_dim):
     assert x.size(1) == expected_dim
 
 
+def test_chunk_manager_is_owned_by_loader(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph, input_nodes=[0, 1, 2, 3], features=["id"], batch_size=2, shuffle=False
+    )
+    list(loader)
+
+    stats = loader.chunk_manager_stats()
+    assert stats["requests"] > 0
+    assert stats["leaders"] == stats["requests"]
+    assert stats["completed"] == stats["requests"]
+    assert stats["failed"] == 0
+
 
 def test_valid_batch_with_zero_fanout(ldbc_graph):
     loader = _make_loader(
