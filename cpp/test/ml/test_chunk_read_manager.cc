@@ -1,0 +1,133 @@
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include "arrow/api.h"
+#include "graphar/ml/chunk_read_manager.h"
+
+#include <catch2/catch_test_macros.hpp>
+
+namespace graphar::ml {
+namespace {
+
+ChunkReadKey TestKey(IdType chunk_id = 0) {
+  ChunkReadKey key;
+  key.graph_prefix = "graph";
+  key.vertex_type = "node";
+  key.property_group_prefix = "features";
+  key.chunk_id = chunk_id;
+  return key;
+}
+
+std::shared_ptr<arrow::Table> MakeTable(int64_t value) {
+  arrow::Int64Builder builder;
+  REQUIRE(builder.Append(value).ok());
+  std::shared_ptr<arrow::Array> array;
+  REQUIRE(builder.Finish(&array).ok());
+  return arrow::Table::Make(
+      arrow::schema({arrow::field("value", arrow::int64())}), {array});
+}
+
+}  // namespace
+
+TEST_CASE("ChunkReadManager singleflight shares one load") {
+  ChunkReadManager manager;
+  auto table = MakeTable(42);
+  std::atomic<int> loader_calls{0};
+
+  constexpr int kThreads = 8;
+  std::promise<void> start_promise;
+  auto start = start_promise.get_future().share();
+  std::vector<ChunkReadManager::TableResult> results(kThreads);
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+
+  for (int i = 0; i < kThreads; ++i) {
+    threads.emplace_back([&, i]() {
+      start.wait();
+      results[i] = manager.GetOrLoad(TestKey(), [&]() {
+        loader_calls.fetch_add(1, std::memory_order_relaxed);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (manager.stats().waiters < kThreads - 1 &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return table;
+      });
+    });
+  }
+
+  start_promise.set_value();
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  REQUIRE(loader_calls.load() == 1);
+  for (const auto& result : results) {
+    REQUIRE(result.status().ok());
+    REQUIRE(result.value() == table);
+  }
+
+  const auto stats = manager.stats();
+  REQUIRE(stats.requests == kThreads);
+  REQUIRE(stats.leaders == 1);
+  REQUIRE(stats.waiters == kThreads - 1);
+  REQUIRE(stats.completed == kThreads);
+  REQUIRE(stats.failed == 0);
+}
+
+TEST_CASE("ChunkReadManager does not merge distinct keys") {
+  ChunkReadManager manager;
+  std::atomic<int> loader_calls{0};
+
+  auto first = manager.GetOrLoad(TestKey(1), [&]() {
+    loader_calls.fetch_add(1, std::memory_order_relaxed);
+    return MakeTable(1);
+  });
+  auto second = manager.GetOrLoad(TestKey(2), [&]() {
+    loader_calls.fetch_add(1, std::memory_order_relaxed);
+    return MakeTable(2);
+  });
+
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+  REQUIRE(loader_calls.load() == 2);
+
+  const auto stats = manager.stats();
+  REQUIRE(stats.requests == 2);
+  REQUIRE(stats.leaders == 2);
+  REQUIRE(stats.waiters == 0);
+  REQUIRE(stats.completed == 2);
+  REQUIRE(stats.failed == 0);
+}
+
+TEST_CASE("ChunkReadManager propagates failures and allows retry") {
+  ChunkReadManager manager;
+  std::atomic<int> loader_calls{0};
+
+  auto failed = manager.GetOrLoad(TestKey(), [&]() {
+    loader_calls.fetch_add(1, std::memory_order_relaxed);
+    return Status::Invalid("synthetic failure");
+  });
+  REQUIRE(failed.has_error());
+
+  auto retried = manager.GetOrLoad(TestKey(), [&]() {
+    loader_calls.fetch_add(1, std::memory_order_relaxed);
+    return MakeTable(7);
+  });
+  REQUIRE(retried.status().ok());
+
+  REQUIRE(loader_calls.load() == 2);
+  const auto stats = manager.stats();
+  REQUIRE(stats.requests == 2);
+  REQUIRE(stats.leaders == 2);
+  REQUIRE(stats.completed == 1);
+  REQUIRE(stats.failed == 1);
+}
+
+}  // namespace graphar::ml

@@ -599,6 +599,7 @@ if (BUILD_TESTS)
     add_test(test_graph SRCS test/test_graph.cc)
     add_test(test_multi_label SRCS test/test_multi_label.cc)
     add_test(test_multi_property SRCS test/test_multi_property.cc)
+    add_test(test_chunk_read_manager SRCS test/ml/test_chunk_read_manager.cc)
     add_test(test_neighbor_sampling SRCS test/ml/test_neighbor_sampling.cc)
 
     # enable_testing()
