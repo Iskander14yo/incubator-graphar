@@ -220,6 +220,22 @@ def test_chunk_manager_uses_ram_budget(ldbc_graph):
     assert stats["ram_cache_bytes"] > 0
 
 
+def test_chunk_manager_is_used_for_sampling_without_features(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=[],
+        batch_size=2,
+        shuffle=False,
+    )
+    list(loader)
+
+    stats = loader.chunk_manager_stats()
+    assert stats["requests"] > 0
+    assert stats["completed"] == stats["requests"]
+    assert stats["failed"] == 0
+
+
 def test_negative_ram_for_loader_is_rejected(ldbc_graph):
     with pytest.raises(ValueError, match="ram_for_loader_mb"):
         _make_loader(ldbc_graph, ram_for_loader_mb=-1)

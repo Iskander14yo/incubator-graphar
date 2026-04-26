@@ -173,6 +173,7 @@ class GARNeighborLoader(IterableDataset):
             seed_nodes,
             self.num_neighbors,
             seed=seed,
+            chunk_manager=self._chunk_manager,
         )
         sampling_ms = (time.perf_counter() - t_s) * 1000
 
