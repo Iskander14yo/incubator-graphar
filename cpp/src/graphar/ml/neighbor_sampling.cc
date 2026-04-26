@@ -110,8 +110,23 @@ class Int64ChunkedArrayCursor {
 
 Result<std::shared_ptr<arrow::ChunkedArray>> LoadOffsetColumn(
     const std::shared_ptr<FileSystem>& fs, const std::string& prefix,
+    const std::shared_ptr<GraphInfo>& graph_info,
+    const std::string& vertex_type,
     const std::shared_ptr<EdgeInfo>& edge_info, AdjListType adj_list_type,
-    IdType vertex_chunk_idx) {
+    IdType vertex_chunk_idx, ChunkReadManager* chunk_manager) {
+  if (chunk_manager != nullptr) {
+    GAR_ASSIGN_OR_RAISE(
+        auto table,
+        chunk_manager->GetEdgeOffsetChunk(graph_info, vertex_type,
+                                          edge_info->GetEdgeType(), vertex_type,
+                                          adj_list_type, vertex_chunk_idx));
+    if (table->num_columns() == 0) {
+      return Status::Invalid("Offset file for edge type '",
+                             edge_info->GetEdgeType(), "' has no columns");
+    }
+    return table->column(0);
+  }
+
   GAR_ASSIGN_OR_RAISE(
       auto chunk_file_path,
       edge_info->GetAdjListOffsetFilePath(vertex_chunk_idx, adj_list_type));
@@ -131,7 +146,7 @@ Result<SamplingResult> SampleNeighbors(
     const std::shared_ptr<GraphInfo>& graph_info,
     const std::string& vertex_type, const std::string& edge_type,
     const std::vector<IdType>& seed_nodes, const std::vector<int>& fanout,
-    uint64_t seed) {
+    uint64_t seed, ChunkReadManager* chunk_manager) {
   if (seed_nodes.empty()) {
     SamplingResult result;
     result.num_sampled_nodes_per_hop.assign(fanout.size() + 1, 0);
@@ -204,8 +219,10 @@ Result<SamplingResult> SampleNeighbors(
       }
 
       GAR_ASSIGN_OR_RAISE(
-          auto offset_column, LoadOffsetColumn(fs, normalized_prefix, edge_info,
-                                               adj_type, vertex_chunk_idx));
+          auto offset_column,
+          LoadOffsetColumn(fs, normalized_prefix, graph_info, vertex_type,
+                           edge_info, adj_type, vertex_chunk_idx,
+                           chunk_manager));
       Int64ChunkedArrayCursor offset_cursor(offset_column);
       IdType offset_len = offset_column->length();
 
@@ -237,8 +254,17 @@ Result<SamplingResult> SampleNeighbors(
               std::min(end_off, edge_chunk_start + edge_chunk_size);
 
           if (edge_chunk_idx != cached_edge_chunk_idx) {
-            GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
-            GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
+            std::shared_ptr<arrow::Table> chunk_table;
+            if (chunk_manager != nullptr) {
+              GAR_ASSIGN_OR_RAISE(
+                  chunk_table,
+                  chunk_manager->GetEdgeAdjListChunk(
+                      graph_info, vertex_type, edge_type, vertex_type, adj_type,
+                      vertex_chunk_idx, edge_chunk_idx));
+            } else {
+              GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
+              GAR_ASSIGN_OR_RAISE(chunk_table, adj_reader.GetChunk());
+            }
             if (!chunk_table) break;
 
             cached_dst_column = chunk_table->column(1);
