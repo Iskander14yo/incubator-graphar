@@ -7,12 +7,20 @@
 #include <vector>
 
 #include "arrow/api.h"
+#include "graphar/graph_info.h"
 #include "graphar/ml/chunk_read_manager.h"
+#include "graphar/types.h"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "../util.h"
+
 namespace graphar::ml {
 namespace {
+
+constexpr const char* kGraphPath = "/ldbc_sample/parquet/ldbc_sample.graph.yml";
+constexpr const char* kVertexType = "person";
+constexpr const char* kEdgeType = "knows";
 
 ChunkReadKey TestKey(IdType chunk_id = 0) {
   ChunkReadKey key;
@@ -44,6 +52,12 @@ size_t TableBytes(const std::shared_ptr<arrow::Table>& table) {
     }
   }
   return bytes;
+}
+
+std::shared_ptr<GraphInfo> LoadLdbcSampleGraph(const std::string& test_data_dir) {
+  auto maybe_graph_info = GraphInfo::Load(test_data_dir + kGraphPath);
+  REQUIRE(maybe_graph_info.status().ok());
+  return maybe_graph_info.value();
 }
 
 }  // namespace
@@ -243,6 +257,57 @@ TEST_CASE("ChunkReadManager does not cache chunks larger than RAM budget") {
   REQUIRE(stats.ram_cache_hits == 0);
   REQUIRE(stats.ram_cache_misses == 2);
   REQUIRE(stats.ram_cache_bytes == 0);
+}
+
+TEST_CASE_METHOD(GlobalFixture, "ChunkReadManager caches edge offset chunks") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  ChunkReadManagerOptions options;
+  options.ram_budget_bytes = 1024 * 1024;
+  ChunkReadManager manager(options);
+
+  auto first = manager.GetEdgeOffsetChunk(
+      graph_info, kVertexType, kEdgeType, kVertexType,
+      AdjListType::ordered_by_source, /*vertex_chunk_id=*/0);
+  auto second = manager.GetEdgeOffsetChunk(
+      graph_info, kVertexType, kEdgeType, kVertexType,
+      AdjListType::ordered_by_source, /*vertex_chunk_id=*/0);
+
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+  REQUIRE(first.value()->Equals(*second.value()));
+
+  const auto stats = manager.stats();
+  REQUIRE(stats.requests == 2);
+  REQUIRE(stats.leaders == 1);
+  REQUIRE(stats.ram_cache_hits == 1);
+  REQUIRE(stats.ram_cache_misses == 1);
+  REQUIRE(stats.failed == 0);
+}
+
+TEST_CASE_METHOD(GlobalFixture, "ChunkReadManager caches edge adjacency chunks") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  ChunkReadManagerOptions options;
+  options.ram_budget_bytes = 1024 * 1024;
+  ChunkReadManager manager(options);
+
+  auto first = manager.GetEdgeAdjListChunk(
+      graph_info, kVertexType, kEdgeType, kVertexType,
+      AdjListType::ordered_by_source, /*vertex_chunk_id=*/0, /*chunk_id=*/0);
+  auto second = manager.GetEdgeAdjListChunk(
+      graph_info, kVertexType, kEdgeType, kVertexType,
+      AdjListType::ordered_by_source, /*vertex_chunk_id=*/0, /*chunk_id=*/0);
+
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+  REQUIRE(first.value() != nullptr);
+  REQUIRE(first.value()->Equals(*second.value()));
+
+  const auto stats = manager.stats();
+  REQUIRE(stats.requests == 2);
+  REQUIRE(stats.leaders == 1);
+  REQUIRE(stats.ram_cache_hits == 1);
+  REQUIRE(stats.ram_cache_misses == 1);
+  REQUIRE(stats.failed == 0);
 }
 
 TEST_CASE("ChunkReadManager propagates failures and allows retry") {

@@ -26,6 +26,7 @@
 
 #include "arrow/api.h"
 #include "graphar/arrow/chunk_reader.h"
+#include "graphar/filesystem.h"
 #include "graphar/graph_info.h"
 #include "graphar/status.h"
 
@@ -74,8 +75,10 @@ size_t TableBytes(const std::shared_ptr<arrow::Table>& table) {
 bool ChunkReadKey::operator==(const ChunkReadKey& other) const {
   return kind == other.kind && graph_prefix == other.graph_prefix &&
          vertex_type == other.vertex_type &&
+         edge_type == other.edge_type &&
          property_group_prefix == other.property_group_prefix &&
-         file_type == other.file_type && chunk_id == other.chunk_id;
+         adj_list_type == other.adj_list_type && file_type == other.file_type &&
+         vertex_chunk_id == other.vertex_chunk_id && chunk_id == other.chunk_id;
 }
 
 size_t ChunkReadKeyHash::operator()(const ChunkReadKey& key) const {
@@ -83,8 +86,11 @@ size_t ChunkReadKeyHash::operator()(const ChunkReadKey& key) const {
   HashCombine(&seed, static_cast<int>(key.kind));
   HashCombine(&seed, key.graph_prefix);
   HashCombine(&seed, key.vertex_type);
+  HashCombine(&seed, key.edge_type);
   HashCombine(&seed, key.property_group_prefix);
+  HashCombine(&seed, static_cast<int>(key.adj_list_type));
   HashCombine(&seed, static_cast<int>(key.file_type));
+  HashCombine(&seed, key.vertex_chunk_id);
   HashCombine(&seed, key.chunk_id);
   return seed;
 }
@@ -206,6 +212,89 @@ ChunkReadManager::TableResult ChunkReadManager::GetVertexPropertyChunk(
     GAR_RETURN_NOT_OK(reader->seek(chunk_start_node));
 
     auto chunk_result = reader->GetChunk();
+    GAR_RETURN_NOT_OK(chunk_result.status());
+    return chunk_result.value();
+  });
+}
+
+ChunkReadManager::TableResult ChunkReadManager::GetEdgeOffsetChunk(
+    const std::shared_ptr<GraphInfo>& graph_info, const std::string& src_type,
+    const std::string& edge_type, const std::string& dst_type,
+    AdjListType adj_list_type, IdType vertex_chunk_id) {
+  if (graph_info == nullptr) {
+    return Status::Invalid("GraphInfo cannot be null");
+  }
+  auto edge_info = graph_info->GetEdgeInfo(src_type, edge_type, dst_type);
+  if (!edge_info) {
+    return Status::Invalid("Edge type '", edge_type, "' not found");
+  }
+  if (!edge_info->HasAdjacentListType(adj_list_type)) {
+    return Status::Invalid("Adjacent list type not available for edge type '",
+                           edge_type, "'");
+  }
+
+  ChunkReadKey key;
+  key.kind = ChunkReadKind::kEdgeOffset;
+  key.graph_prefix = graph_info->GetPrefix();
+  key.vertex_type = src_type;
+  key.edge_type = edge_type;
+  key.adj_list_type = adj_list_type;
+  key.file_type = edge_info->GetAdjacentList(adj_list_type)->GetFileType();
+  key.vertex_chunk_id = vertex_chunk_id;
+
+  return GetOrLoad(key, [graph_info, edge_info, adj_list_type,
+                         vertex_chunk_id]() -> TableResult {
+    const std::string& prefix = graph_info->GetPrefix();
+    std::string normalized_prefix;
+    GAR_ASSIGN_OR_RAISE(auto fs,
+                        FileSystemFromUriOrPath(prefix, &normalized_prefix));
+    GAR_ASSIGN_OR_RAISE(
+        auto chunk_file_path,
+        edge_info->GetAdjListOffsetFilePath(vertex_chunk_id, adj_list_type));
+    auto file_type = edge_info->GetAdjacentList(adj_list_type)->GetFileType();
+    GAR_ASSIGN_OR_RAISE(auto table,
+                        fs->ReadFileToTable(normalized_prefix + chunk_file_path,
+                                            file_type));
+    if (table->num_columns() == 0) {
+      return Status::Invalid("Offset file for edge type '",
+                             edge_info->GetEdgeType(), "' has no columns");
+    }
+    return table;
+  });
+}
+
+ChunkReadManager::TableResult ChunkReadManager::GetEdgeAdjListChunk(
+    const std::shared_ptr<GraphInfo>& graph_info, const std::string& src_type,
+    const std::string& edge_type, const std::string& dst_type,
+    AdjListType adj_list_type, IdType vertex_chunk_id, IdType chunk_id) {
+  if (graph_info == nullptr) {
+    return Status::Invalid("GraphInfo cannot be null");
+  }
+  auto edge_info = graph_info->GetEdgeInfo(src_type, edge_type, dst_type);
+  if (!edge_info) {
+    return Status::Invalid("Edge type '", edge_type, "' not found");
+  }
+  if (!edge_info->HasAdjacentListType(adj_list_type)) {
+    return Status::Invalid("Adjacent list type not available for edge type '",
+                           edge_type, "'");
+  }
+
+  ChunkReadKey key;
+  key.kind = ChunkReadKind::kEdgeAdjList;
+  key.graph_prefix = graph_info->GetPrefix();
+  key.vertex_type = src_type;
+  key.edge_type = edge_type;
+  key.adj_list_type = adj_list_type;
+  key.file_type = edge_info->GetAdjacentList(adj_list_type)->GetFileType();
+  key.vertex_chunk_id = vertex_chunk_id;
+  key.chunk_id = chunk_id;
+
+  return GetOrLoad(key, [edge_info, adj_list_type, graph_info, vertex_chunk_id,
+                         chunk_id]() -> TableResult {
+    AdjListArrowChunkReader reader(edge_info, adj_list_type,
+                                   graph_info->GetPrefix());
+    GAR_RETURN_NOT_OK(reader.seek_chunk_index(vertex_chunk_id, chunk_id));
+    auto chunk_result = reader.GetChunk();
     GAR_RETURN_NOT_OK(chunk_result.status());
     return chunk_result.value();
   });

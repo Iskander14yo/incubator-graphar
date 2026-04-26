@@ -40,14 +40,19 @@ namespace graphar::ml {
 
 enum class ChunkReadKind {
   kVertexProperty,
+  kEdgeOffset,
+  kEdgeAdjList,
 };
 
 struct ChunkReadKey {
   ChunkReadKind kind = ChunkReadKind::kVertexProperty;
   std::string graph_prefix;
   std::string vertex_type;
+  std::string edge_type;
   std::string property_group_prefix;
+  AdjListType adj_list_type = static_cast<AdjListType>(0);
   FileType file_type = FileType::PARQUET;
+  IdType vertex_chunk_id = 0;
   IdType chunk_id = 0;
 
   bool operator==(const ChunkReadKey& other) const;
@@ -88,6 +93,20 @@ class ChunkReadManager {
       const std::shared_ptr<GraphInfo>& graph_info,
       const std::string& vertex_type,
       const std::shared_ptr<PropertyGroup>& property_group, IdType chunk_id);
+
+  TableResult GetEdgeOffsetChunk(const std::shared_ptr<GraphInfo>& graph_info,
+                                 const std::string& src_type,
+                                 const std::string& edge_type,
+                                 const std::string& dst_type,
+                                 AdjListType adj_list_type,
+                                 IdType vertex_chunk_id);
+
+  TableResult GetEdgeAdjListChunk(const std::shared_ptr<GraphInfo>& graph_info,
+                                  const std::string& src_type,
+                                  const std::string& edge_type,
+                                  const std::string& dst_type,
+                                  AdjListType adj_list_type,
+                                  IdType vertex_chunk_id, IdType chunk_id);
 
   ChunkReadStats stats() const;
 
