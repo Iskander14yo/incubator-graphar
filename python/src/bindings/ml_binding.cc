@@ -23,6 +23,7 @@
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
+#include "graphar/ml/chunk_read_manager.h"
 #include "graphar/ml/neighbor_sampling.h"
 #include "graphar/graph_info.h"
 
@@ -76,17 +77,49 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def_readwrite("num_sampled_edges_per_hop",
                      &graphar::ml::SamplingResult::num_sampled_edges_per_hop);
 
+  py::class_<graphar::ml::ChunkReadManagerOptions>(
+      m, "_ChunkReadManagerOptions")
+      .def(py::init<>())
+      .def_readwrite("enable_singleflight",
+                     &graphar::ml::ChunkReadManagerOptions::enable_singleflight)
+      .def_readwrite("ram_budget_bytes",
+                     &graphar::ml::ChunkReadManagerOptions::ram_budget_bytes);
+
+  py::class_<graphar::ml::ChunkReadStats>(m, "_ChunkReadStats")
+      .def_readonly("requests", &graphar::ml::ChunkReadStats::requests)
+      .def_readonly("leaders", &graphar::ml::ChunkReadStats::leaders)
+      .def_readonly("waiters", &graphar::ml::ChunkReadStats::waiters)
+      .def_readonly("completed", &graphar::ml::ChunkReadStats::completed)
+      .def_readonly("failed", &graphar::ml::ChunkReadStats::failed)
+      .def_readonly("ram_cache_hits",
+                    &graphar::ml::ChunkReadStats::ram_cache_hits)
+      .def_readonly("ram_cache_misses",
+                    &graphar::ml::ChunkReadStats::ram_cache_misses)
+      .def_readonly("ram_cache_evictions",
+                    &graphar::ml::ChunkReadStats::ram_cache_evictions)
+      .def_readonly("ram_cache_bytes",
+                    &graphar::ml::ChunkReadStats::ram_cache_bytes);
+
+  py::class_<graphar::ml::ChunkReadManager,
+             std::shared_ptr<graphar::ml::ChunkReadManager>>(
+      m, "_ChunkReadManager")
+      .def(py::init<graphar::ml::ChunkReadManagerOptions>(),
+           py::arg("options") = graphar::ml::ChunkReadManagerOptions{})
+      .def("stats", &graphar::ml::ChunkReadManager::stats);
+
   // Bind sample_neighbors function
   m.def("sample_neighbors", 
       [](const std::shared_ptr<graphar::GraphInfo>& graph_info,
          const std::string& vertex_type,
          const std::string& edge_type,
          const std::vector<graphar::IdType>& seed_nodes,
-         const std::vector<int>& fanout, uint64_t seed) {
+         const std::vector<int>& fanout, uint64_t seed,
+         const std::shared_ptr<graphar::ml::ChunkReadManager>& chunk_manager) {
         auto result = [&]() {
           py::gil_scoped_release release; // release GIL
           return graphar::ml::SampleNeighbors(
-              graph_info, vertex_type, edge_type, seed_nodes, fanout, seed);
+              graph_info, vertex_type, edge_type, seed_nodes, fanout, seed,
+              chunk_manager.get());
         }();
         return ThrowOrReturn(result);
       },
@@ -96,6 +129,7 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       py::arg("seed_nodes"),
       py::arg("fanout"),
       py::arg("seed"),
+      py::arg("chunk_manager") = nullptr,
       "Sample multi-hop neighbors for given seed nodes");
 
   // Bind get_node_features function
@@ -103,11 +137,13 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       [](const std::shared_ptr<graphar::GraphInfo>& graph_info,
          const std::string& vertex_type,
          const std::vector<graphar::IdType>& node_ids,
-         const std::vector<std::string>& properties) {
+         const std::vector<std::string>& properties,
+         const std::shared_ptr<graphar::ml::ChunkReadManager>& chunk_manager) {
         auto result = [&]() {
           py::gil_scoped_release release; // release GIL
           return graphar::ml::GetNodeFeatures(
-              graph_info, vertex_type, node_ids, properties);
+              graph_info, vertex_type, node_ids, properties,
+              chunk_manager.get());
         }();
         auto table = ThrowOrReturn(result);
         return table_to_pyarrow(table);
@@ -116,5 +152,6 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       py::arg("vertex_type"),
       py::arg("node_ids"),
       py::arg("properties"),
+      py::arg("chunk_manager") = nullptr,
       "Fetch node properties for given internal IDs");
 }

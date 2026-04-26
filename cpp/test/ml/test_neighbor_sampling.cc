@@ -6,6 +6,7 @@
 
 #include "arrow/api.h"
 #include "graphar/graph_info.h"
+#include "graphar/ml/chunk_read_manager.h"
 #include "graphar/ml/neighbor_sampling.h"
 
 #include <catch2/catch_test_macros.hpp>
@@ -223,6 +224,33 @@ TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - negative fanout") {
   REQUIRE(result.status().IsInvalid());
 }
 
+TEST_CASE_METHOD(GlobalFixture,
+                 "SampleNeighbors - chunk manager matches uncached output") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  ChunkReadManager manager;
+
+  auto uncached =
+      SampleNeighbors(graph_info, kVertexType, kEdgeType, {0, 1}, {3, 2}, 42);
+  auto managed = SampleNeighbors(graph_info, kVertexType, kEdgeType, {0, 1},
+                                 {3, 2}, 42, &manager);
+  REQUIRE(uncached.status().ok());
+  REQUIRE(managed.status().ok());
+
+  REQUIRE(managed.value().sampled_nodes == uncached.value().sampled_nodes);
+  REQUIRE(managed.value().src_indices == uncached.value().src_indices);
+  REQUIRE(managed.value().dst_indices == uncached.value().dst_indices);
+  REQUIRE(managed.value().num_sampled_nodes_per_hop ==
+          uncached.value().num_sampled_nodes_per_hop);
+  REQUIRE(managed.value().num_sampled_edges_per_hop ==
+          uncached.value().num_sampled_edges_per_hop);
+
+  const auto stats = manager.stats();
+  REQUIRE(stats.requests > 0);
+  REQUIRE(stats.leaders == stats.requests);
+  REQUIRE(stats.completed == stats.requests);
+  REQUIRE(stats.failed == 0);
+}
+
 //////////////////////////// GetNodeFeatures /////////////////////////////////////
 
 TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - single property on ldbc_sample") {
@@ -261,6 +289,26 @@ TEST_CASE_METHOD(GlobalFixture,
   REQUIRE(first_name_column != nullptr);
   REQUIRE(StringValues(first_name_column) ==
           std::vector<std::string>{"Mahinda", "Eli"});
+}
+
+TEST_CASE_METHOD(GlobalFixture,
+                 "GetNodeFeatures - chunk manager matches uncached output") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  ChunkReadManager manager;
+
+  auto uncached =
+      GetNodeFeatures(graph_info, kVertexType, {5, 1, 3, 0}, {"id", "firstName"});
+  auto managed = GetNodeFeatures(graph_info, kVertexType, {5, 1, 3, 0},
+                                 {"id", "firstName"}, &manager);
+  REQUIRE(uncached.status().ok());
+  REQUIRE(managed.status().ok());
+
+  REQUIRE(managed.value()->Equals(*uncached.value()));
+  const auto stats = manager.stats();
+  REQUIRE(stats.requests > 0);
+  REQUIRE(stats.leaders == stats.requests);
+  REQUIRE(stats.completed == stats.requests);
+  REQUIRE(stats.failed == 0);
 }
 
 TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - empty node list") {

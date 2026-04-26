@@ -12,6 +12,8 @@ class Table;
 
 namespace graphar::ml {
 
+class ChunkReadManager;
+
 /**
  * Result of neighbor sampling operation.
  */
@@ -37,7 +39,7 @@ Result<SamplingResult> SampleNeighbors(
     const std::shared_ptr<GraphInfo>& graph_info,
     const std::string& vertex_type, const std::string& edge_type,
     const std::vector<IdType>& seed_nodes, const std::vector<int>& fanout,
-    uint64_t seed);
+    uint64_t seed, ChunkReadManager* chunk_manager = nullptr);
 
 /**
  * Fetch node properties for given internal IDs.
@@ -51,6 +53,7 @@ Result<SamplingResult> SampleNeighbors(
 Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
     const std::shared_ptr<GraphInfo>& graph_info,
     const std::string& vertex_type, const std::vector<IdType>& node_ids,
-    const std::vector<std::string>& properties);
+    const std::vector<std::string>& properties,
+    ChunkReadManager* chunk_manager = nullptr);
 
 }  // namespace graphar::ml

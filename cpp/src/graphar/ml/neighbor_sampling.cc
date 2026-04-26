@@ -11,6 +11,7 @@
 #include "graphar/arrow/chunk_reader.h"
 #include "graphar/filesystem.h"
 #include "graphar/graph_info.h"
+#include "graphar/ml/chunk_read_manager.h"
 #include "graphar/result.h"
 #include "graphar/types.h"
 
@@ -109,8 +110,23 @@ class Int64ChunkedArrayCursor {
 
 Result<std::shared_ptr<arrow::ChunkedArray>> LoadOffsetColumn(
     const std::shared_ptr<FileSystem>& fs, const std::string& prefix,
+    const std::shared_ptr<GraphInfo>& graph_info,
+    const std::string& vertex_type,
     const std::shared_ptr<EdgeInfo>& edge_info, AdjListType adj_list_type,
-    IdType vertex_chunk_idx) {
+    IdType vertex_chunk_idx, ChunkReadManager* chunk_manager) {
+  if (chunk_manager != nullptr) {
+    GAR_ASSIGN_OR_RAISE(
+        auto table,
+        chunk_manager->GetEdgeOffsetChunk(graph_info, vertex_type,
+                                          edge_info->GetEdgeType(), vertex_type,
+                                          adj_list_type, vertex_chunk_idx));
+    if (table->num_columns() == 0) {
+      return Status::Invalid("Offset file for edge type '",
+                             edge_info->GetEdgeType(), "' has no columns");
+    }
+    return table->column(0);
+  }
+
   GAR_ASSIGN_OR_RAISE(
       auto chunk_file_path,
       edge_info->GetAdjListOffsetFilePath(vertex_chunk_idx, adj_list_type));
@@ -130,7 +146,7 @@ Result<SamplingResult> SampleNeighbors(
     const std::shared_ptr<GraphInfo>& graph_info,
     const std::string& vertex_type, const std::string& edge_type,
     const std::vector<IdType>& seed_nodes, const std::vector<int>& fanout,
-    uint64_t seed) {
+    uint64_t seed, ChunkReadManager* chunk_manager) {
   if (seed_nodes.empty()) {
     SamplingResult result;
     result.num_sampled_nodes_per_hop.assign(fanout.size() + 1, 0);
@@ -203,8 +219,10 @@ Result<SamplingResult> SampleNeighbors(
       }
 
       GAR_ASSIGN_OR_RAISE(
-          auto offset_column, LoadOffsetColumn(fs, normalized_prefix, edge_info,
-                                               adj_type, vertex_chunk_idx));
+          auto offset_column,
+          LoadOffsetColumn(fs, normalized_prefix, graph_info, vertex_type,
+                           edge_info, adj_type, vertex_chunk_idx,
+                           chunk_manager));
       Int64ChunkedArrayCursor offset_cursor(offset_column);
       IdType offset_len = offset_column->length();
 
@@ -236,8 +254,17 @@ Result<SamplingResult> SampleNeighbors(
               std::min(end_off, edge_chunk_start + edge_chunk_size);
 
           if (edge_chunk_idx != cached_edge_chunk_idx) {
-            GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
-            GAR_ASSIGN_OR_RAISE(auto chunk_table, adj_reader.GetChunk());
+            std::shared_ptr<arrow::Table> chunk_table;
+            if (chunk_manager != nullptr) {
+              GAR_ASSIGN_OR_RAISE(
+                  chunk_table,
+                  chunk_manager->GetEdgeAdjListChunk(
+                      graph_info, vertex_type, edge_type, vertex_type, adj_type,
+                      vertex_chunk_idx, edge_chunk_idx));
+            } else {
+              GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
+              GAR_ASSIGN_OR_RAISE(chunk_table, adj_reader.GetChunk());
+            }
             if (!chunk_table) break;
 
             cached_dst_column = chunk_table->column(1);
@@ -312,7 +339,8 @@ Result<SamplingResult> SampleNeighbors(
 Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
     const std::shared_ptr<GraphInfo>& graph_info,
     const std::string& vertex_type, const std::vector<IdType>& node_ids,
-    const std::vector<std::string>& properties) {
+    const std::vector<std::string>& properties,
+    ChunkReadManager* chunk_manager) {
   // Return empty table for empty input
   if (node_ids.empty()) {
     std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
@@ -355,11 +383,14 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
 
   // For each property group, read the data
   for (const auto& [pg, props] : pg_to_props) {
-    // Create reader for this property group
-    auto reader_result =
-        VertexPropertyArrowChunkReader::Make(graph_info, vertex_type, pg);
-    GAR_RETURN_NOT_OK(reader_result.status());
-    auto reader = reader_result.value();
+    std::shared_ptr<VertexPropertyArrowChunkReader> reader;
+    if (chunk_manager == nullptr) {
+      // Create reader for this property group
+      auto reader_result =
+          VertexPropertyArrowChunkReader::Make(graph_info, vertex_type, pg);
+      GAR_RETURN_NOT_OK(reader_result.status());
+      reader = reader_result.value();
+    }
 
     // Group node_ids by chunk to minimize chunk reads
     IdType chunk_size = vertex_info->GetChunkSize();
@@ -380,12 +411,20 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
     for (const auto& [chunk_id, indices] : chunk_to_indices) {
       // Seek to the beginning of this chunk
       IdType chunk_start_node = chunk_id * chunk_size;
-      GAR_RETURN_NOT_OK(reader->seek(chunk_start_node));
+      std::shared_ptr<arrow::Table> chunk_table;
+      if (chunk_manager != nullptr) {
+        GAR_ASSIGN_OR_RAISE(
+            chunk_table,
+            chunk_manager->GetVertexPropertyChunk(graph_info, vertex_type, pg,
+                                                  chunk_id));
+      } else {
+        GAR_RETURN_NOT_OK(reader->seek(chunk_start_node));
 
-      // Read the chunk
-      auto chunk_result = reader->GetChunk();
-      GAR_RETURN_NOT_OK(chunk_result.status());
-      auto chunk_table = chunk_result.value();
+        // Read the chunk
+        auto chunk_result = reader->GetChunk();
+        GAR_RETURN_NOT_OK(chunk_result.status());
+        chunk_table = chunk_result.value();
+      }
 
       // Build Take indices (row offsets within this chunk)
       arrow::Int64Builder idx_builder;
