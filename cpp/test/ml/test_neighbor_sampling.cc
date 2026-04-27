@@ -111,6 +111,52 @@ class MultiRowGroupGraphCopy {
   std::shared_ptr<GraphInfo> graph_info_;
 };
 
+class InflatedVertexCountGraphCopy {
+ public:
+  InflatedVertexCountGraphCopy(const std::string& test_data_dir,
+                               IdType vertex_count) {
+    root_ = std::filesystem::temp_directory_path() /
+            "graphar_ml_shutdown_pending";
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+
+    const auto source_root =
+        std::filesystem::path(test_data_dir) / "ldbc_sample" / "parquet";
+    CopyDirectoryTree(source_root, root_);
+
+    auto maybe_graph_info =
+        GraphInfo::Load((root_ / "ldbc_sample.graph.yml").string());
+    REQUIRE(maybe_graph_info.status().ok());
+    graph_info_ = maybe_graph_info.value();
+
+    auto vertex_info = graph_info_->GetVertexInfo(kVertexType);
+    REQUIRE(vertex_info != nullptr);
+    auto maybe_vertex_count_path = vertex_info->GetVerticesNumFilePath();
+    REQUIRE(maybe_vertex_count_path.status().ok());
+
+    std::string normalized_prefix;
+    auto maybe_fs = FileSystemFromUriOrPath(graph_info_->GetPrefix(),
+                                            &normalized_prefix);
+    REQUIRE(maybe_fs.status().ok());
+    REQUIRE(
+        maybe_fs.value()
+            ->WriteValueToFile(vertex_count,
+                               normalized_prefix + maybe_vertex_count_path.value())
+            .ok());
+  }
+
+  ~InflatedVertexCountGraphCopy() {
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+  }
+
+  const std::shared_ptr<GraphInfo>& graph_info() const { return graph_info_; }
+
+ private:
+  std::filesystem::path root_;
+  std::shared_ptr<GraphInfo> graph_info_;
+};
+
 std::vector<std::pair<IdType, IdType>> ToNodeEdges(
     const SamplingResult& sampling) {
   std::vector<std::pair<IdType, IdType>> edges;
@@ -469,6 +515,28 @@ TEST_CASE_METHOD(GlobalFixture,
   auto coordinated = handle.value()->Wait();
   REQUIRE(coordinated.status().ok());
   REQUIRE(coordinated.value()->Equals(*expected.value()));
+}
+
+TEST_CASE_METHOD(GlobalFixture,
+                 "FeatureScanCoordinator shutdown fails pending requests") {
+  constexpr IdType kInflatedVertexCount = 1000000000;
+  InflatedVertexCountGraphCopy graph_copy(test_data_dir, kInflatedVertexCount);
+
+  auto chunk_manager = std::make_shared<ChunkReadManager>();
+  FeatureCursorOptions options;
+  options.cursor_count = 1;
+  FeatureScanCoordinator coordinator(graph_copy.graph_info(), chunk_manager,
+                                     options);
+
+  auto handle = coordinator.Submit(kVertexType, {kInflatedVertexCount - 1},
+                                   {"id"});
+  REQUIRE(handle.status().ok());
+
+  coordinator.Shutdown();
+
+  auto result = handle.value()->Wait();
+  REQUIRE(result.has_error());
+  REQUIRE(result.status().message().find("shutdown") != std::string::npos);
 }
 
 }  // namespace graphar::ml

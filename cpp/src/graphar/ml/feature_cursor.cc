@@ -239,8 +239,22 @@ struct FeatureScanCoordinator::Impl {
     auto future = request->promise.get_future().share();
     auto handle = std::make_shared<FeatureRequestHandle>(future);
 
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (shutdown_) {
+        return Status::Invalid("FeatureScanCoordinator is shut down");
+      }
+    }
+
     if (node_ids.empty()) {
-      RegisterRequest(request);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (shutdown_) {
+          return Status::Invalid("FeatureScanCoordinator is shut down");
+        }
+        RegisterRequestLocked();
+        request->request_id = next_request_id_.fetch_add(1);
+      }
       CompleteRequest(
           request,
           arrow::Table::Make(arrow::schema({}),
@@ -333,6 +347,9 @@ struct FeatureScanCoordinator::Impl {
     std::vector<std::pair<FeatureChunkKey, TablePtr>> trail_hits;
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      if (shutdown_) {
+        return Status::Invalid("FeatureScanCoordinator is shut down");
+      }
       GAR_RETURN_NOT_OK(EnsureStartedLocked(vertex_type, chunk_count));
       RegisterRequestLocked();
       for (const auto& [key, rows] : request->rows_by_key) {
@@ -385,14 +402,22 @@ struct FeatureScanCoordinator::Impl {
   }
 
   void Shutdown() {
+    std::vector<RequestPtr> pending_requests;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (shutdown_) {
         return;
       }
       shutdown_ = true;
+      pending_requests = DrainActiveRequestsLocked();
     }
     cv_.notify_all();
+    for (const auto& request : pending_requests) {
+      FailRequest(
+          request,
+          Status::UnknownError(
+              "FeatureScanCoordinator shutdown before request completion"));
+    }
     for (auto& cursor : cursors_) {
       if (cursor.joinable()) {
         cursor.join();
@@ -401,17 +426,25 @@ struct FeatureScanCoordinator::Impl {
   }
 
  private:
-  void RegisterRequest(const RequestPtr& request) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    RegisterRequestLocked();
-    request->request_id = next_request_id_.fetch_add(1);
-  }
-
   void RegisterRequestLocked() {
     requests_.fetch_add(1, std::memory_order_relaxed);
     const uint64_t active =
         active_requests_current_.fetch_add(1, std::memory_order_relaxed) + 1;
     AtomicMax(&active_requests_peak_, active);
+  }
+
+  std::vector<RequestPtr> DrainActiveRequestsLocked() {
+    std::vector<RequestPtr> requests;
+    std::unordered_set<FeatureRequestState*> seen;
+    for (auto& [key, chunk_requests] : active_) {
+      for (auto& request : chunk_requests) {
+        if (request != nullptr && seen.insert(request.get()).second) {
+          requests.push_back(request);
+        }
+      }
+    }
+    active_.clear();
+    return requests;
   }
 
   Status EnsureStartedLocked(const std::string& vertex_type,
