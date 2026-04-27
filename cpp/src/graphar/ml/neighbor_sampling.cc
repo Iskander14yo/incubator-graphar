@@ -444,8 +444,15 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
         if (!column) {
           return Status::Invalid("Column '", prop, "' not found in chunk");
         }
+        auto combined_result = arrow::Table::Make(
+            arrow::schema({arrow::field(prop, column->type())}), {column})
+                                   ->CombineChunks();
+        if (!combined_result.ok()) {
+          return Status::ArrowError(combined_result.status().ToString());
+        }
+        auto combined_column = combined_result.ValueOrDie()->column(0);
         auto take_result =
-            arrow::compute::Take(column->chunk(0), take_indices);
+            arrow::compute::Take(combined_column->chunk(0), take_indices);
         if (!take_result.ok()) {
           return Status::ArrowError(take_result.status().ToString());
         }

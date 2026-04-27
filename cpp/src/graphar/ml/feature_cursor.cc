@@ -601,10 +601,18 @@ struct FeatureScanCoordinator::Impl {
       if (!column) {
         return Status::Invalid("Column '", prop, "' not found in chunk");
       }
-      if (column->num_chunks() == 0) {
+      auto combined_result = arrow::Table::Make(
+          arrow::schema({arrow::field(prop, column->type())}), {column})
+                                 ->CombineChunks();
+      if (!combined_result.ok()) {
+        return Status::ArrowError(combined_result.status().ToString());
+      }
+      auto combined_column = combined_result.ValueOrDie()->column(0);
+      if (combined_column->num_chunks() == 0) {
         return Status::Invalid("Column '", prop, "' has no chunks");
       }
-      auto take_result = arrow::compute::Take(column->chunk(0), take_indices);
+      auto take_result =
+          arrow::compute::Take(combined_column->chunk(0), take_indices);
       if (!take_result.ok()) {
         return Status::ArrowError(take_result.status().ToString());
       }

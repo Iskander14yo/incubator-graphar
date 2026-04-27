@@ -1,13 +1,18 @@
 #include <algorithm>
+#include <filesystem>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "arrow/api.h"
+#include "graphar/filesystem.h"
 #include "graphar/graph_info.h"
 #include "graphar/ml/chunk_read_manager.h"
+#include "graphar/ml/feature_cursor.h"
 #include "graphar/ml/neighbor_sampling.h"
+#include "graphar/writer_util.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -25,6 +30,86 @@ std::shared_ptr<GraphInfo> LoadLdbcSampleGraph(const std::string& test_data_dir)
   REQUIRE(maybe_graph_info.status().ok());
   return maybe_graph_info.value();
 }
+
+void CopyDirectoryTree(const std::filesystem::path& source,
+                       const std::filesystem::path& destination) {
+  std::filesystem::create_directories(destination);
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(
+           source)) {
+    const auto relative = std::filesystem::relative(entry.path(), source);
+    const auto target = destination / relative;
+    if (entry.is_directory()) {
+      std::filesystem::create_directories(target);
+    } else if (entry.is_regular_file()) {
+      std::filesystem::create_directories(target.parent_path());
+      std::filesystem::copy_file(
+          entry.path(), target,
+          std::filesystem::copy_options::overwrite_existing);
+    }
+  }
+}
+
+class MultiRowGroupGraphCopy {
+ public:
+  explicit MultiRowGroupGraphCopy(const std::string& test_data_dir) {
+    root_ = std::filesystem::temp_directory_path() /
+            "graphar_ml_multi_row_group";
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+
+    const auto source_root =
+        std::filesystem::path(test_data_dir) / "ldbc_sample" / "parquet";
+    CopyDirectoryTree(source_root, root_);
+
+    auto maybe_graph_info =
+        GraphInfo::Load((root_ / "ldbc_sample.graph.yml").string());
+    REQUIRE(maybe_graph_info.status().ok());
+    graph_info_ = maybe_graph_info.value();
+
+    auto vertex_info = graph_info_->GetVertexInfo(kVertexType);
+    REQUIRE(vertex_info != nullptr);
+    auto property_group = vertex_info->GetPropertyGroup("id");
+    REQUIRE(property_group != nullptr);
+
+    auto maybe_chunk_path = vertex_info->GetFilePath(property_group, 0);
+    REQUIRE(maybe_chunk_path.status().ok());
+
+    std::string normalized_prefix;
+    auto maybe_fs = FileSystemFromUriOrPath(graph_info_->GetPrefix(),
+                                            &normalized_prefix);
+    REQUIRE(maybe_fs.status().ok());
+    auto fs = maybe_fs.value();
+    const auto chunk_path = normalized_prefix + maybe_chunk_path.value();
+
+    auto maybe_table =
+        fs->ReadFileToTable(chunk_path, property_group->GetFileType());
+    REQUIRE(maybe_table.status().ok());
+
+    auto writer_options =
+        WriterOptions::ParquetOptionBuilder().max_row_group_length(10).build();
+    REQUIRE(fs->WriteTableToFile(maybe_table.value(), FileType::PARQUET,
+                                 chunk_path, writer_options)
+                .ok());
+
+    auto maybe_rewritten =
+        fs->ReadFileToTable(chunk_path, property_group->GetFileType());
+    REQUIRE(maybe_rewritten.status().ok());
+    auto column = maybe_rewritten.value()->GetColumnByName("id");
+    REQUIRE(column != nullptr);
+    REQUIRE(column->num_chunks() > 1);
+  }
+
+  ~MultiRowGroupGraphCopy() {
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+  }
+
+  const std::shared_ptr<GraphInfo>& graph_info() const { return graph_info_; }
+
+ private:
+  std::filesystem::path root_;
+  std::shared_ptr<GraphInfo> graph_info_;
+};
 
 std::vector<std::pair<IdType, IdType>> ToNodeEdges(
     const SamplingResult& sampling) {
@@ -358,6 +443,32 @@ TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - unordered node ids") {
   REQUIRE(Int64Values(id_column) == std::vector<IdType>{
                                        28587302322727, 6597069767117,
                                        21990232556027, 933});
+}
+
+TEST_CASE_METHOD(GlobalFixture,
+                 "Feature reads handle multi-row-group parquet chunks") {
+  auto baseline_graph_info = LoadLdbcSampleGraph(test_data_dir);
+  MultiRowGroupGraphCopy graph_copy(test_data_dir);
+  const std::vector<IdType> node_ids = {0, 15, 27, 99};
+  const std::vector<std::string> properties = {"id"};
+
+  auto expected =
+      GetNodeFeatures(baseline_graph_info, kVertexType, node_ids, properties);
+  REQUIRE(expected.status().ok());
+
+  auto direct = GetNodeFeatures(graph_copy.graph_info(), kVertexType, node_ids,
+                                properties);
+  REQUIRE(direct.status().ok());
+  REQUIRE(direct.value()->Equals(*expected.value()));
+
+  auto chunk_manager = std::make_shared<ChunkReadManager>();
+  FeatureScanCoordinator coordinator(graph_copy.graph_info(), chunk_manager);
+  auto handle = coordinator.Submit(kVertexType, node_ids, properties);
+  REQUIRE(handle.status().ok());
+
+  auto coordinated = handle.value()->Wait();
+  REQUIRE(coordinated.status().ok());
+  REQUIRE(coordinated.value()->Equals(*expected.value()));
 }
 
 }  // namespace graphar::ml
