@@ -135,21 +135,31 @@ class GARNeighborLoader(IterableDataset):
             self._chunk_manager,
             feature_cursor_options,
         )
-        self._input_nodes = list(dict.fromkeys(  #  dict.fromkeys preserves insertion order
-            _normalize_input_nodes(graph_info, vertex_type, input_nodes)
-        ))
+        if input_nodes is None and not shuffle:
+            self._input_nodes = None
+            self._input_node_count = graph_info.get_vertex_count(vertex_type)
+        else:
+            self._input_nodes = list(dict.fromkeys(  # dict.fromkeys preserves insertion order
+                _normalize_input_nodes(graph_info, vertex_type, input_nodes)
+            ))
+            self._input_node_count = len(self._input_nodes)
         self.features = _properties_for_vertex(graph_info, vertex_type) if features is None else features
         self._rng = torch.Generator()  # used for both dataset shuffling and sampling seeds
         self._rng.manual_seed(int(torch.initial_seed()))
 
     def __len__(self) -> int:
-        if not self._input_nodes:
+        if self._input_node_count == 0:
             return 0
-        return (len(self._input_nodes) + self.batch_size - 1) // self.batch_size
+        return (self._input_node_count + self.batch_size - 1) // self.batch_size
 
     def _iter_input_batches(self) -> Iterator[list[int]]:
-        total = len(self._input_nodes)
+        total = self._input_node_count
         if total == 0:
+            return
+        if self._input_nodes is None:
+            for start in range(0, total, self.batch_size):
+                end = min(start + self.batch_size, total)
+                yield list(range(start, end))
             return
         if self.shuffle:
             order = torch.randperm(total, generator=self._rng).tolist()

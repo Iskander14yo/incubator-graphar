@@ -8,6 +8,7 @@ import torch
 from torch_geometric.data import Data
 
 import graphar as gar
+import graphar.ml.torch as gar_torch
 from graphar.ml.torch import BatchProfile, GARNeighborLoader
 
 
@@ -163,6 +164,24 @@ def test_input_nodes_none_uses_all_nodes(ldbc_graph):
 
     assert batch.batch_size == 4
     assert batch.input_id.tolist() == [0, 1, 2, 3]
+
+
+def test_input_nodes_none_shuffle_false_is_lazy(ldbc_graph):
+    with mock.patch.object(
+        gar_torch,
+        "_normalize_input_nodes",
+        side_effect=AssertionError("lazy all-node path should bypass normalization"),
+    ):
+        loader = _make_loader(
+            ldbc_graph,
+            input_nodes=None,
+            features=["id"],
+            batch_size=4,
+            shuffle=False,
+        )
+
+    assert loader._input_nodes is None
+    assert loader._input_node_count == ldbc_graph.get_vertex_count("person")
 
 
 def test_empty_input_nodes_yields_no_batches(ldbc_graph):
