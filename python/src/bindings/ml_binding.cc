@@ -23,9 +23,10 @@
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
-#include "graphar/ml/chunk_read_manager.h"
-#include "graphar/ml/neighbor_sampling.h"
 #include "graphar/graph_info.h"
+#include "graphar/ml/chunk_read_manager.h"
+#include "graphar/ml/feature_cursor.h"
+#include "graphar/ml/neighbor_sampling.h"
 
 namespace py = pybind11;
 
@@ -36,7 +37,7 @@ py::object table_to_pyarrow(const std::shared_ptr<arrow::Table>& table) {
   // Combine into single batch for simpler export
   auto batch_result = table->CombineChunksToBatch();
   if (!batch_result.ok()) {
-    throw std::runtime_error("Failed to combine table chunks: " + 
+    throw std::runtime_error("Failed to combine table chunks: " +
                              batch_result.status().ToString());
   }
   auto batch = batch_result.ValueOrDie();
@@ -58,7 +59,7 @@ py::object table_to_pyarrow(const std::shared_ptr<arrow::Table>& table) {
   intptr_t c_schema_ptr = reinterpret_cast<intptr_t>(&c_schema);
 
   py::object pa_batch = import_fn(c_array_ptr, c_schema_ptr);
-  
+
   // Convert RecordBatch to Table
   return pyarrow.attr("Table").attr("from_batches")(py::make_tuple(pa_batch));
 }
@@ -69,7 +70,8 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
   // Bind SamplingResult struct
   py::class_<graphar::ml::SamplingResult>(m, "SamplingResult")
       .def(py::init<>())
-      .def_readwrite("sampled_nodes", &graphar::ml::SamplingResult::sampled_nodes)
+      .def_readwrite("sampled_nodes",
+                     &graphar::ml::SamplingResult::sampled_nodes)
       .def_readwrite("src_indices", &graphar::ml::SamplingResult::src_indices)
       .def_readwrite("dst_indices", &graphar::ml::SamplingResult::dst_indices)
       .def_readwrite("num_sampled_nodes_per_hop",
@@ -77,8 +79,8 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def_readwrite("num_sampled_edges_per_hop",
                      &graphar::ml::SamplingResult::num_sampled_edges_per_hop);
 
-  py::class_<graphar::ml::ChunkReadManagerOptions>(
-      m, "_ChunkReadManagerOptions")
+  py::class_<graphar::ml::ChunkReadManagerOptions>(m,
+                                                   "_ChunkReadManagerOptions")
       .def(py::init<>())
       .def_readwrite("enable_singleflight",
                      &graphar::ml::ChunkReadManagerOptions::enable_singleflight)
@@ -107,51 +109,121 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
            py::arg("options") = graphar::ml::ChunkReadManagerOptions{})
       .def("stats", &graphar::ml::ChunkReadManager::stats);
 
+  py::class_<graphar::ml::FeatureCursorOptions>(m, "_FeatureCursorOptions")
+      .def(py::init<>())
+      .def_readwrite("cursor_count",
+                     &graphar::ml::FeatureCursorOptions::cursor_count)
+      .def_readwrite("trail_capacity_chunks",
+                     &graphar::ml::FeatureCursorOptions::trail_capacity_chunks);
+
+  py::class_<graphar::ml::FeatureCursorStats>(m, "_FeatureCursorStats")
+      .def_readonly("cursor_count",
+                    &graphar::ml::FeatureCursorStats::cursor_count)
+      .def_readonly("trail_capacity_chunks",
+                    &graphar::ml::FeatureCursorStats::trail_capacity_chunks)
+      .def_readonly("requests", &graphar::ml::FeatureCursorStats::requests)
+      .def_readonly("requests_completed",
+                    &graphar::ml::FeatureCursorStats::requests_completed)
+      .def_readonly("requests_failed",
+                    &graphar::ml::FeatureCursorStats::requests_failed)
+      .def_readonly("active_requests_peak",
+                    &graphar::ml::FeatureCursorStats::active_requests_peak)
+      .def_readonly("chunks_read",
+                    &graphar::ml::FeatureCursorStats::chunks_read)
+      .def_readonly("chunks_served",
+                    &graphar::ml::FeatureCursorStats::chunks_served)
+      .def_readonly("rows_served",
+                    &graphar::ml::FeatureCursorStats::rows_served)
+      .def_readonly("batches_served",
+                    &graphar::ml::FeatureCursorStats::batches_served)
+      .def_readonly("trail_hits", &graphar::ml::FeatureCursorStats::trail_hits)
+      .def_readonly("trail_misses",
+                    &graphar::ml::FeatureCursorStats::trail_misses)
+      .def_readonly("trail_evictions",
+                    &graphar::ml::FeatureCursorStats::trail_evictions)
+      .def_readonly("wait_ms_sum",
+                    &graphar::ml::FeatureCursorStats::wait_ms_sum)
+      .def_readonly("wait_ms_max",
+                    &graphar::ml::FeatureCursorStats::wait_ms_max)
+      .def_readonly("service_ms_sum",
+                    &graphar::ml::FeatureCursorStats::service_ms_sum)
+      .def_readonly("service_ms_max",
+                    &graphar::ml::FeatureCursorStats::service_ms_max);
+
+  py::class_<graphar::ml::FeatureRequestHandle,
+             std::shared_ptr<graphar::ml::FeatureRequestHandle>>(
+      m, "_FeatureRequestHandle")
+      .def("wait", [](const graphar::ml::FeatureRequestHandle& handle) {
+        auto result = [&]() {
+          py::gil_scoped_release release;
+          return handle.Wait();
+        }();
+        auto table = ThrowOrReturn(result);
+        return table_to_pyarrow(table);
+      });
+
+  py::class_<graphar::ml::FeatureScanCoordinator,
+             std::shared_ptr<graphar::ml::FeatureScanCoordinator>>(
+      m, "_FeatureScanCoordinator")
+      .def(py::init<std::shared_ptr<graphar::GraphInfo>,
+                    std::shared_ptr<graphar::ml::ChunkReadManager>,
+                    graphar::ml::FeatureCursorOptions>(),
+           py::arg("graph_info"), py::arg("chunk_manager"),
+           py::arg("options") = graphar::ml::FeatureCursorOptions{})
+      .def(
+          "submit",
+          [](graphar::ml::FeatureScanCoordinator& coordinator,
+             const std::string& vertex_type,
+             const std::vector<graphar::IdType>& node_ids,
+             const std::vector<std::string>& properties) {
+            auto result = [&]() {
+              py::gil_scoped_release release;
+              return coordinator.Submit(vertex_type, node_ids, properties);
+            }();
+            return ThrowOrReturn(result);
+          },
+          py::arg("vertex_type"), py::arg("node_ids"), py::arg("properties"))
+      .def("stats", &graphar::ml::FeatureScanCoordinator::stats)
+      .def("shutdown", &graphar::ml::FeatureScanCoordinator::Shutdown);
+
   // Bind sample_neighbors function
-  m.def("sample_neighbors", 
+  m.def(
+      "sample_neighbors",
       [](const std::shared_ptr<graphar::GraphInfo>& graph_info,
-         const std::string& vertex_type,
-         const std::string& edge_type,
+         const std::string& vertex_type, const std::string& edge_type,
          const std::vector<graphar::IdType>& seed_nodes,
          const std::vector<int>& fanout, uint64_t seed,
          const std::shared_ptr<graphar::ml::ChunkReadManager>& chunk_manager) {
         auto result = [&]() {
-          py::gil_scoped_release release; // release GIL
-          return graphar::ml::SampleNeighbors(
-              graph_info, vertex_type, edge_type, seed_nodes, fanout, seed,
-              chunk_manager.get());
+          py::gil_scoped_release release;  // release GIL
+          return graphar::ml::SampleNeighbors(graph_info, vertex_type,
+                                              edge_type, seed_nodes, fanout,
+                                              seed, chunk_manager.get());
         }();
         return ThrowOrReturn(result);
       },
-      py::arg("graph_info"),
-      py::arg("vertex_type"),
-      py::arg("edge_type"),
-      py::arg("seed_nodes"),
-      py::arg("fanout"),
-      py::arg("seed"),
+      py::arg("graph_info"), py::arg("vertex_type"), py::arg("edge_type"),
+      py::arg("seed_nodes"), py::arg("fanout"), py::arg("seed"),
       py::arg("chunk_manager") = nullptr,
       "Sample multi-hop neighbors for given seed nodes");
 
   // Bind get_node_features function
-  m.def("get_node_features",
+  m.def(
+      "get_node_features",
       [](const std::shared_ptr<graphar::GraphInfo>& graph_info,
          const std::string& vertex_type,
          const std::vector<graphar::IdType>& node_ids,
          const std::vector<std::string>& properties,
          const std::shared_ptr<graphar::ml::ChunkReadManager>& chunk_manager) {
         auto result = [&]() {
-          py::gil_scoped_release release; // release GIL
-          return graphar::ml::GetNodeFeatures(
-              graph_info, vertex_type, node_ids, properties,
-              chunk_manager.get());
+          py::gil_scoped_release release;  // release GIL
+          return graphar::ml::GetNodeFeatures(graph_info, vertex_type, node_ids,
+                                              properties, chunk_manager.get());
         }();
         auto table = ThrowOrReturn(result);
         return table_to_pyarrow(table);
       },
-      py::arg("graph_info"),
-      py::arg("vertex_type"),
-      py::arg("node_ids"),
-      py::arg("properties"),
-      py::arg("chunk_manager") = nullptr,
+      py::arg("graph_info"), py::arg("vertex_type"), py::arg("node_ids"),
+      py::arg("properties"), py::arg("chunk_manager") = nullptr,
       "Fetch node properties for given internal IDs");
 }
