@@ -96,6 +96,8 @@ class GARNeighborLoader(IterableDataset):
         features: list[str] | None = None,
         num_workers: int = 0,
         ram_for_loader_mb: int = 0,
+        feature_cursor_count: int = 1,
+        feature_cursor_trail_chunks: int = 10,
     ) -> None:
         if batch_size <= 0:
             msg = "batch_size must be > 0"
@@ -109,6 +111,12 @@ class GARNeighborLoader(IterableDataset):
         if ram_for_loader_mb < 0:
             msg = "ram_for_loader_mb must be >= 0"
             raise ValueError(msg)
+        if feature_cursor_count <= 0:
+            msg = "feature_cursor_count must be > 0"
+            raise ValueError(msg)
+        if feature_cursor_trail_chunks < 0:
+            msg = "feature_cursor_trail_chunks must be >= 0"
+            raise ValueError(msg)
         self.graph_info = graph_info
         self.vertex_type = vertex_type
         self.edge_type = edge_type
@@ -119,6 +127,14 @@ class GARNeighborLoader(IterableDataset):
         chunk_manager_options = gar_ml._ChunkReadManagerOptions()
         chunk_manager_options.ram_budget_bytes = int(ram_for_loader_mb) * 1024 * 1024
         self._chunk_manager = gar_ml._ChunkReadManager(chunk_manager_options)
+        feature_cursor_options = gar_ml._FeatureCursorOptions()
+        feature_cursor_options.cursor_count = int(feature_cursor_count)
+        feature_cursor_options.trail_capacity_chunks = int(feature_cursor_trail_chunks)
+        self._feature_coordinator = gar_ml._FeatureScanCoordinator(
+            graph_info,
+            self._chunk_manager,
+            feature_cursor_options,
+        )
         self._input_nodes = list(dict.fromkeys(  #  dict.fromkeys preserves insertion order
             _normalize_input_nodes(graph_info, vertex_type, input_nodes)
         ))
@@ -162,6 +178,31 @@ class GARNeighborLoader(IterableDataset):
             "ram_cache_bytes": int(stats.ram_cache_bytes),
         }
 
+    def feature_cursor_stats(self) -> dict[str, int]:
+        stats = self._feature_coordinator.stats()
+        return {
+            "cursor_count": int(stats.cursor_count),
+            "trail_capacity_chunks": int(stats.trail_capacity_chunks),
+            "requests": int(stats.requests),
+            "requests_completed": int(stats.requests_completed),
+            "requests_failed": int(stats.requests_failed),
+            "active_requests_peak": int(stats.active_requests_peak),
+            "chunks_read": int(stats.chunks_read),
+            "chunks_served": int(stats.chunks_served),
+            "rows_served": int(stats.rows_served),
+            "batches_served": int(stats.batches_served),
+            "trail_hits": int(stats.trail_hits),
+            "trail_misses": int(stats.trail_misses),
+            "trail_evictions": int(stats.trail_evictions),
+            "wait_ms_sum": int(stats.wait_ms_sum),
+            "wait_ms_max": int(stats.wait_ms_max),
+            "service_ms_sum": int(stats.service_ms_sum),
+            "service_ms_max": int(stats.service_ms_max),
+        }
+
+    def close(self) -> None:
+        self._feature_coordinator.shutdown()
+
     def _build_batch(self, seed_nodes: list[int], seed: int) -> tuple[Data, BatchProfile]:
         t_total = time.perf_counter()
 
@@ -190,13 +231,11 @@ class GARNeighborLoader(IterableDataset):
         conversion_ms = 0.0
         if self.features:
             t_s = time.perf_counter()
-            feature_table = gar_ml.get_node_features(
-                self.graph_info,
+            feature_table = self._feature_coordinator.submit(
                 self.vertex_type,
                 n_id_list,
                 self.features,
-                chunk_manager=self._chunk_manager,
-            )
+            ).wait()
             feature_fetch_ms = (time.perf_counter() - t_s) * 1000
 
             t_s = time.perf_counter()
