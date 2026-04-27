@@ -422,6 +422,24 @@ TEST_CASE_METHOD(GlobalFixture,
           std::vector<std::string>{"Mahinda", "Eli"});
 }
 
+TEST_CASE_METHOD(
+    GlobalFixture,
+    "GetNodeFeatures preserves requested property order across groups") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  ChunkReadManager manager;
+  const std::vector<std::string> properties = {"firstName", "id"};
+
+  auto result = GetNodeFeatures(graph_info, kVertexType, {0, 1}, properties);
+  auto managed =
+      GetNodeFeatures(graph_info, kVertexType, {0, 1}, properties, &manager);
+  REQUIRE(result.status().ok());
+  REQUIRE(managed.status().ok());
+
+  REQUIRE(result.value()->ColumnNames() == properties);
+  REQUIRE(managed.value()->ColumnNames() == properties);
+  REQUIRE(managed.value()->Equals(*result.value()));
+}
+
 TEST_CASE_METHOD(GlobalFixture,
                  "GetNodeFeatures - chunk manager matches uncached output") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);

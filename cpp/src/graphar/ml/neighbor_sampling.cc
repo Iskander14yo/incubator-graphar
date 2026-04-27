@@ -377,9 +377,8 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
     pg_to_props[pg].push_back(prop);
   }
 
-  // Build Arrow schema and arrays for result
-  std::vector<std::shared_ptr<arrow::Field>> schema_fields;
-  std::vector<std::shared_ptr<arrow::Array>> result_arrays;
+  std::unordered_map<std::string, std::shared_ptr<arrow::Array>>
+      result_array_by_property;
 
   // For each property group, read the data
   for (const auto& [pg, props] : pg_to_props) {
@@ -489,12 +488,28 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
 
       auto prop_type_result = vertex_info->GetPropertyType(prop);
       GAR_RETURN_NOT_OK(prop_type_result.status());
-      auto arrow_type =
-          DataType::DataTypeToArrowDataType(prop_type_result.value());
-
-      schema_fields.push_back(arrow::field(prop, arrow_type));
-      result_arrays.push_back(reorder_result.ValueOrDie().make_array());
+      result_array_by_property[prop] = reorder_result.ValueOrDie().make_array();
     }
+  }
+
+  // Rebuild columns in the exact order requested by the caller.
+  std::vector<std::shared_ptr<arrow::Field>> schema_fields;
+  std::vector<std::shared_ptr<arrow::Array>> result_arrays;
+  schema_fields.reserve(properties.size());
+  result_arrays.reserve(properties.size());
+  for (const auto& prop : properties) {
+    auto array_it = result_array_by_property.find(prop);
+    if (array_it == result_array_by_property.end()) {
+      return Status::Invalid("No feature data collected for property '", prop,
+                             "'");
+    }
+    auto prop_type_result = vertex_info->GetPropertyType(prop);
+    GAR_RETURN_NOT_OK(prop_type_result.status());
+    auto arrow_type =
+        DataType::DataTypeToArrowDataType(prop_type_result.value());
+
+    schema_fields.push_back(arrow::field(prop, arrow_type));
+    result_arrays.push_back(array_it->second);
   }
 
   // Create final table
