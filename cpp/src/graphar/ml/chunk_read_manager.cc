@@ -75,7 +75,7 @@ size_t TableBytes(const std::shared_ptr<arrow::Table>& table) {
 bool ChunkReadKey::operator==(const ChunkReadKey& other) const {
   return kind == other.kind && graph_prefix == other.graph_prefix &&
          vertex_type == other.vertex_type &&
-         edge_type == other.edge_type &&
+         edge_type == other.edge_type && dst_type == other.dst_type &&
          property_group_prefix == other.property_group_prefix &&
          adj_list_type == other.adj_list_type && file_type == other.file_type &&
          vertex_chunk_id == other.vertex_chunk_id && chunk_id == other.chunk_id;
@@ -87,6 +87,7 @@ size_t ChunkReadKeyHash::operator()(const ChunkReadKey& key) const {
   HashCombine(&seed, key.graph_prefix);
   HashCombine(&seed, key.vertex_type);
   HashCombine(&seed, key.edge_type);
+  HashCombine(&seed, key.dst_type);
   HashCombine(&seed, key.property_group_prefix);
   HashCombine(&seed, static_cast<int>(key.adj_list_type));
   HashCombine(&seed, static_cast<int>(key.file_type));
@@ -238,6 +239,7 @@ ChunkReadManager::TableResult ChunkReadManager::GetEdgeOffsetChunk(
   key.graph_prefix = graph_info->GetPrefix();
   key.vertex_type = src_type;
   key.edge_type = edge_type;
+  key.dst_type = dst_type;
   key.adj_list_type = adj_list_type;
   key.file_type = edge_info->GetAdjacentList(adj_list_type)->GetFileType();
   key.vertex_chunk_id = vertex_chunk_id;
@@ -284,6 +286,7 @@ ChunkReadManager::TableResult ChunkReadManager::GetEdgeAdjListChunk(
   key.graph_prefix = graph_info->GetPrefix();
   key.vertex_type = src_type;
   key.edge_type = edge_type;
+  key.dst_type = dst_type;
   key.adj_list_type = adj_list_type;
   key.file_type = edge_info->GetAdjacentList(adj_list_type)->GetFileType();
   key.vertex_chunk_id = vertex_chunk_id;

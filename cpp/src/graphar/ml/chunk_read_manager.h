@@ -49,6 +49,7 @@ struct ChunkReadKey {
   std::string graph_prefix;
   std::string vertex_type;
   std::string edge_type;
+  std::string dst_type;
   std::string property_group_prefix;
   AdjListType adj_list_type = static_cast<AdjListType>(0);
   FileType file_type = FileType::PARQUET;
