@@ -27,7 +27,8 @@ def _make_loader(
     shuffle=False,
     features=None,
     num_workers=0,
-    ram_for_loader_mb=0,
+    edge_ram_for_loader_mb=0,
+    feature_ram_for_loader_mb=0,
 ):
     if num_neighbors is None:
         num_neighbors = [5]
@@ -41,7 +42,8 @@ def _make_loader(
         shuffle=shuffle,
         features=features,
         num_workers=num_workers,
-        ram_for_loader_mb=ram_for_loader_mb,
+        edge_ram_for_loader_mb=edge_ram_for_loader_mb,
+        feature_ram_for_loader_mb=feature_ram_for_loader_mb,
     )
     return GARNeighborLoader(**kwargs)
 
@@ -229,7 +231,7 @@ def test_chunk_manager_uses_ram_budget(ldbc_graph):
         features=["id"],
         batch_size=2,
         shuffle=False,
-        ram_for_loader_mb=1,
+        edge_ram_for_loader_mb=1,
     )
     list(loader)
 
@@ -237,6 +239,47 @@ def test_chunk_manager_uses_ram_budget(ldbc_graph):
     assert stats["requests"] > 0
     assert stats["ram_cache_misses"] > 0
     assert stats["ram_cache_bytes"] > 0
+
+
+def test_feature_chunk_manager_uses_separate_ram_budget(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        edge_ram_for_loader_mb=0,
+        feature_ram_for_loader_mb=1,
+    )
+    list(loader)
+
+    sampling_stats = loader.chunk_manager_stats()
+    feature_stats = loader.feature_chunk_manager_stats()
+    assert sampling_stats["ram_cache_bytes"] == 0
+    assert feature_stats["requests"] > 0
+    assert feature_stats["ram_cache_misses"] > 0
+    assert feature_stats["ram_cache_bytes"] > 0
+
+
+def test_feature_chunk_manager_cache_can_be_disabled(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        edge_ram_for_loader_mb=1,
+        feature_ram_for_loader_mb=0,
+    )
+    list(loader)
+
+    sampling_stats = loader.chunk_manager_stats()
+    feature_stats = loader.feature_chunk_manager_stats()
+    assert sampling_stats["ram_cache_bytes"] > 0
+    assert feature_stats["requests"] > 0
+    assert feature_stats["ram_cache_hits"] == 0
+    assert feature_stats["ram_cache_misses"] == 0
+    assert feature_stats["ram_cache_bytes"] == 0
 
 
 def test_chunk_manager_is_used_for_sampling_without_features(ldbc_graph):
@@ -255,9 +298,14 @@ def test_chunk_manager_is_used_for_sampling_without_features(ldbc_graph):
     assert stats["failed"] == 0
 
 
-def test_negative_ram_for_loader_is_rejected(ldbc_graph):
-    with pytest.raises(ValueError, match="ram_for_loader_mb"):
-        _make_loader(ldbc_graph, ram_for_loader_mb=-1)
+def test_negative_edge_ram_for_loader_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="edge_ram_for_loader_mb"):
+        _make_loader(ldbc_graph, edge_ram_for_loader_mb=-1)
+
+
+def test_negative_feature_ram_for_loader_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="feature_ram_for_loader_mb"):
+        _make_loader(ldbc_graph, feature_ram_for_loader_mb=-1)
 
 
 def test_valid_batch_with_zero_fanout(ldbc_graph):

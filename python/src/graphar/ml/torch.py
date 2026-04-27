@@ -80,6 +80,20 @@ def _normalize_input_nodes(
     return [int(node) for node in input_nodes]
 
 
+def _chunk_read_stats_to_dict(stats) -> dict[str, int]:
+    return {
+        "requests": int(stats.requests),
+        "leaders": int(stats.leaders),
+        "waiters": int(stats.waiters),
+        "completed": int(stats.completed),
+        "failed": int(stats.failed),
+        "ram_cache_hits": int(stats.ram_cache_hits),
+        "ram_cache_misses": int(stats.ram_cache_misses),
+        "ram_cache_evictions": int(stats.ram_cache_evictions),
+        "ram_cache_bytes": int(stats.ram_cache_bytes),
+    }
+
+
 
 class GARNeighborLoader(IterableDataset):
     """Minimal PyG-compatible neighbor loader over GraphAr APIs."""
@@ -95,7 +109,8 @@ class GARNeighborLoader(IterableDataset):
         shuffle: bool = True,
         features: list[str] | None = None,
         num_workers: int = 0,
-        ram_for_loader_mb: int = 0,
+        edge_ram_for_loader_mb: int = 0,
+        feature_ram_for_loader_mb: int = 0,
         feature_cursor_count: int = 1,
         feature_cursor_trail_chunks: int = 10,
     ) -> None:
@@ -108,8 +123,11 @@ class GARNeighborLoader(IterableDataset):
         if num_workers < 0:
             msg = "num_workers must be >= 0"
             raise ValueError(msg)
-        if ram_for_loader_mb < 0:
-            msg = "ram_for_loader_mb must be >= 0"
+        if edge_ram_for_loader_mb < 0:
+            msg = "edge_ram_for_loader_mb must be >= 0"
+            raise ValueError(msg)
+        if feature_ram_for_loader_mb < 0:
+            msg = "feature_ram_for_loader_mb must be >= 0"
             raise ValueError(msg)
         if feature_cursor_count <= 0:
             msg = "feature_cursor_count must be > 0"
@@ -124,15 +142,18 @@ class GARNeighborLoader(IterableDataset):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
-        chunk_manager_options = gar_ml._ChunkReadManagerOptions()
-        chunk_manager_options.ram_budget_bytes = int(ram_for_loader_mb) * 1024 * 1024
-        self._chunk_manager = gar_ml._ChunkReadManager(chunk_manager_options)
+        edge_chunk_manager_options = gar_ml._ChunkReadManagerOptions()
+        edge_chunk_manager_options.ram_budget_bytes = int(edge_ram_for_loader_mb) * 1024 * 1024
+        self._sampling_chunk_manager = gar_ml._ChunkReadManager(edge_chunk_manager_options)
+        feature_chunk_manager_options = gar_ml._ChunkReadManagerOptions()
+        feature_chunk_manager_options.ram_budget_bytes = int(feature_ram_for_loader_mb) * 1024 * 1024
+        self._feature_chunk_manager = gar_ml._ChunkReadManager(feature_chunk_manager_options)
         feature_cursor_options = gar_ml._FeatureCursorOptions()
         feature_cursor_options.cursor_count = int(feature_cursor_count)
         feature_cursor_options.trail_capacity_chunks = int(feature_cursor_trail_chunks)
         self._feature_coordinator = gar_ml._FeatureScanCoordinator(
             graph_info,
-            self._chunk_manager,
+            self._feature_chunk_manager,
             feature_cursor_options,
         )
         if input_nodes is None and not shuffle:
@@ -175,18 +196,13 @@ class GARNeighborLoader(IterableDataset):
         )
 
     def chunk_manager_stats(self) -> dict[str, int]:
-        stats = self._chunk_manager.stats()
-        return {
-            "requests": int(stats.requests),
-            "leaders": int(stats.leaders),
-            "waiters": int(stats.waiters),
-            "completed": int(stats.completed),
-            "failed": int(stats.failed),
-            "ram_cache_hits": int(stats.ram_cache_hits),
-            "ram_cache_misses": int(stats.ram_cache_misses),
-            "ram_cache_evictions": int(stats.ram_cache_evictions),
-            "ram_cache_bytes": int(stats.ram_cache_bytes),
-        }
+        return self.sampling_chunk_manager_stats()
+
+    def sampling_chunk_manager_stats(self) -> dict[str, int]:
+        return _chunk_read_stats_to_dict(self._sampling_chunk_manager.stats())
+
+    def feature_chunk_manager_stats(self) -> dict[str, int]:
+        return _chunk_read_stats_to_dict(self._feature_chunk_manager.stats())
 
     def feature_cursor_stats(self) -> dict[str, int]:
         stats = self._feature_coordinator.stats()
@@ -224,7 +240,7 @@ class GARNeighborLoader(IterableDataset):
             seed_nodes,
             self.num_neighbors,
             seed=seed,
-            chunk_manager=self._chunk_manager,
+            chunk_manager=self._sampling_chunk_manager,
         )
         sampling_ms = (time.perf_counter() - t_s) * 1000
 
