@@ -151,15 +151,9 @@ class GARNeighborLoader(IterableDataset):
         self._sampling_chunk_manager = gar_ml._ChunkReadManager(edge_chunk_manager_options)
         feature_chunk_manager_options = gar_ml._ChunkReadManagerOptions()
         feature_chunk_manager_options.ram_budget_bytes = int(feature_ram_for_loader_mb) * 1024 * 1024
+        feature_chunk_manager_options.feature_cursor_count = int(feature_cursor_count)
+        feature_chunk_manager_options.feature_cursor_trail_capacity_chunks = int(feature_cursor_trail_chunks)
         self._feature_chunk_manager = gar_ml._ChunkReadManager(feature_chunk_manager_options)
-        feature_cursor_options = gar_ml._FeatureCursorOptions()
-        feature_cursor_options.cursor_count = int(feature_cursor_count)
-        feature_cursor_options.trail_capacity_chunks = int(feature_cursor_trail_chunks)
-        self._feature_coordinator = gar_ml._FeatureScanCoordinator(
-            graph_info,
-            self._feature_chunk_manager,
-            feature_cursor_options,
-        )
         if input_nodes is None and not shuffle:
             self._input_nodes = None
             self._input_node_count = graph_info.get_vertex_count(vertex_type)
@@ -209,7 +203,7 @@ class GARNeighborLoader(IterableDataset):
         return _chunk_read_stats_to_dict(self._feature_chunk_manager.stats())
 
     def feature_cursor_stats(self) -> dict[str, int]:
-        stats = self._feature_coordinator.stats()
+        stats = self._feature_chunk_manager.feature_cursor_stats()
         return {
             "cursor_count": int(stats.cursor_count),
             "trail_capacity_chunks": int(stats.trail_capacity_chunks),
@@ -231,7 +225,7 @@ class GARNeighborLoader(IterableDataset):
         }
 
     def close(self) -> None:
-        self._feature_coordinator.shutdown()
+        self._feature_chunk_manager.shutdown()
 
     def _build_batch(self, seed_nodes: list[int], seed: int) -> tuple[Data, BatchProfile]:
         t_total = time.perf_counter()
@@ -261,11 +255,13 @@ class GARNeighborLoader(IterableDataset):
         conversion_ms = 0.0
         if self.features:
             t_s = time.perf_counter()
-            feature_table = self._feature_coordinator.submit(
+            feature_table = gar_ml.get_node_features(
+                self.graph_info,
                 self.vertex_type,
                 n_id_list,
                 self.features,
-            ).wait()
+                chunk_manager=self._feature_chunk_manager,
+            )
             feature_fetch_ms = (time.perf_counter() - t_s) * 1000
 
             t_s = time.perf_counter()

@@ -25,7 +25,6 @@
 #include "arrow/c/bridge.h"
 #include "graphar/graph_info.h"
 #include "graphar/ml/chunk_read_manager.h"
-#include "graphar/ml/feature_cursor.h"
 #include "graphar/ml/neighbor_sampling.h"
 
 namespace py = pybind11;
@@ -85,7 +84,13 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def_readwrite("enable_singleflight",
                      &graphar::ml::ChunkReadManagerOptions::enable_singleflight)
       .def_readwrite("ram_budget_bytes",
-                     &graphar::ml::ChunkReadManagerOptions::ram_budget_bytes);
+                     &graphar::ml::ChunkReadManagerOptions::ram_budget_bytes)
+      .def_readwrite("feature_cursor_count",
+                     &graphar::ml::ChunkReadManagerOptions::feature_cursor_count)
+      .def_readwrite(
+          "feature_cursor_trail_capacity_chunks",
+          &graphar::ml::ChunkReadManagerOptions::
+              feature_cursor_trail_capacity_chunks);
 
   py::class_<graphar::ml::ChunkReadStats>(m, "_ChunkReadStats")
       .def_readonly("requests", &graphar::ml::ChunkReadStats::requests)
@@ -107,14 +112,10 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       m, "_ChunkReadManager")
       .def(py::init<graphar::ml::ChunkReadManagerOptions>(),
            py::arg("options") = graphar::ml::ChunkReadManagerOptions{})
-      .def("stats", &graphar::ml::ChunkReadManager::stats);
-
-  py::class_<graphar::ml::FeatureCursorOptions>(m, "_FeatureCursorOptions")
-      .def(py::init<>())
-      .def_readwrite("cursor_count",
-                     &graphar::ml::FeatureCursorOptions::cursor_count)
-      .def_readwrite("trail_capacity_chunks",
-                     &graphar::ml::FeatureCursorOptions::trail_capacity_chunks);
+      .def("stats", &graphar::ml::ChunkReadManager::stats)
+      .def("feature_cursor_stats",
+           &graphar::ml::ChunkReadManager::feature_cursor_stats)
+      .def("shutdown", &graphar::ml::ChunkReadManager::Shutdown);
 
   py::class_<graphar::ml::FeatureCursorStats>(m, "_FeatureCursorStats")
       .def_readonly("cursor_count",
@@ -149,42 +150,6 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
                     &graphar::ml::FeatureCursorStats::service_ms_sum)
       .def_readonly("service_ms_max",
                     &graphar::ml::FeatureCursorStats::service_ms_max);
-
-  py::class_<graphar::ml::FeatureRequestHandle,
-             std::shared_ptr<graphar::ml::FeatureRequestHandle>>(
-      m, "_FeatureRequestHandle")
-      .def("wait", [](const graphar::ml::FeatureRequestHandle& handle) {
-        auto result = [&]() {
-          py::gil_scoped_release release;
-          return handle.Wait();
-        }();
-        auto table = ThrowOrReturn(result);
-        return table_to_pyarrow(table);
-      });
-
-  py::class_<graphar::ml::FeatureScanCoordinator,
-             std::shared_ptr<graphar::ml::FeatureScanCoordinator>>(
-      m, "_FeatureScanCoordinator")
-      .def(py::init<std::shared_ptr<graphar::GraphInfo>,
-                    std::shared_ptr<graphar::ml::ChunkReadManager>,
-                    graphar::ml::FeatureCursorOptions>(),
-           py::arg("graph_info"), py::arg("chunk_manager"),
-           py::arg("options") = graphar::ml::FeatureCursorOptions{})
-      .def(
-          "submit",
-          [](graphar::ml::FeatureScanCoordinator& coordinator,
-             const std::string& vertex_type,
-             const std::vector<graphar::IdType>& node_ids,
-             const std::vector<std::string>& properties) {
-            auto result = [&]() {
-              py::gil_scoped_release release;
-              return coordinator.Submit(vertex_type, node_ids, properties);
-            }();
-            return ThrowOrReturn(result);
-          },
-          py::arg("vertex_type"), py::arg("node_ids"), py::arg("properties"))
-      .def("stats", &graphar::ml::FeatureScanCoordinator::stats)
-      .def("shutdown", &graphar::ml::FeatureScanCoordinator::Shutdown);
 
   // Bind sample_neighbors function
   m.def(

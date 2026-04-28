@@ -1,6 +1,7 @@
 #include "graphar/ml/neighbor_sampling.h"
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <random>
 #include <unordered_map>
@@ -364,6 +365,25 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
     }
   }
 
+  struct FeatureRequestTracker {
+    ChunkReadManager* manager = nullptr;
+    std::chrono::steady_clock::time_point start;
+    bool ok = false;
+
+    ~FeatureRequestTracker() {
+      if (manager != nullptr) {
+        manager->CompleteFeatureRequest(start, ok);
+      }
+    }
+  };
+
+  FeatureRequestTracker tracker;
+  if (chunk_manager != nullptr && chunk_manager->HasFeatureCursor()) {
+    chunk_manager->RegisterFeatureRequest();
+    tracker.manager = chunk_manager;
+    tracker.start = std::chrono::steady_clock::now();
+  }
+
   // Group properties by their property group
   std::unordered_map<std::shared_ptr<PropertyGroup>,
                      std::vector<std::string>>
@@ -457,6 +477,9 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
         }
         prop_taken[prop].push_back(take_result.ValueOrDie().make_array());
       }
+      if (tracker.manager != nullptr) {
+        tracker.manager->RecordFeatureBatchServed(indices.size());
+      }
 
       for (size_t idx : indices) {
         concat_to_output.push_back(static_cast<int64_t>(idx));
@@ -514,6 +537,7 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
 
   // Create final table
   auto schema = arrow::schema(schema_fields);
+  tracker.ok = true;
   return arrow::Table::Make(schema, result_arrays, node_ids.size());
 }
 

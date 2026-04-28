@@ -19,10 +19,14 @@
 
 #include "graphar/ml/chunk_read_manager.h"
 
+#include <condition_variable>
+#include <deque>
 #include <exception>
 #include <iterator>
+#include <thread>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "arrow/api.h"
 #include "graphar/arrow/chunk_reader.h"
@@ -37,6 +41,22 @@ template <typename T>
 void HashCombine(size_t* seed, const T& value) {
   std::hash<T> hasher;
   *seed ^= hasher(value) + 0x9e3779b97f4a7c15ULL + (*seed << 6) + (*seed >> 2);
+}
+
+template <typename T>
+void AtomicMax(std::atomic<T>* target, T value) {
+  T current = target->load(std::memory_order_relaxed);
+  while (current < value &&
+         !target->compare_exchange_weak(current, value,
+                                        std::memory_order_relaxed)) {
+  }
+}
+
+uint64_t MillisecondsSince(std::chrono::steady_clock::time_point start) {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count());
 }
 
 size_t ArrayDataBytes(const std::shared_ptr<arrow::ArrayData>& data,
@@ -70,6 +90,24 @@ size_t TableBytes(const std::shared_ptr<arrow::Table>& table) {
   return bytes;
 }
 
+Result<std::shared_ptr<arrow::Table>> LoadVertexPropertyChunkDirect(
+    const std::shared_ptr<GraphInfo>& graph_info, const std::string& vertex_type,
+    const std::shared_ptr<PropertyGroup>& property_group,
+    const std::shared_ptr<VertexInfo>& vertex_info, IdType chunk_id) {
+  auto reader_result =
+      VertexPropertyArrowChunkReader::Make(graph_info, vertex_type,
+                                           property_group);
+  GAR_RETURN_NOT_OK(reader_result.status());
+  auto reader = reader_result.value();
+
+  const IdType chunk_start_node = chunk_id * vertex_info->GetChunkSize();
+  GAR_RETURN_NOT_OK(reader->seek(chunk_start_node));
+
+  auto chunk_result = reader->GetChunk();
+  GAR_RETURN_NOT_OK(chunk_result.status());
+  return chunk_result.value();
+}
+
 }  // namespace
 
 bool ChunkReadKey::operator==(const ChunkReadKey& other) const {
@@ -96,8 +134,319 @@ size_t ChunkReadKeyHash::operator()(const ChunkReadKey& key) const {
   return seed;
 }
 
+struct ChunkReadManager::FeatureCursorState {
+  struct TrailEntry {
+    ChunkReadKey key;
+    TablePtr table;
+  };
+
+  struct Task {
+    ChunkReadKey key;
+    std::shared_ptr<GraphInfo> graph_info;
+    std::string vertex_type;
+    std::shared_ptr<PropertyGroup> property_group;
+    std::shared_ptr<VertexInfo> vertex_info;
+    IdType chunk_id = 0;
+    std::promise<TableResult> promise;
+  };
+
+  explicit FeatureCursorState(const ChunkReadManagerOptions& options)
+      : cursor_count_(options.feature_cursor_count),
+        trail_capacity_chunks_(options.feature_cursor_trail_capacity_chunks),
+        queues_(cursor_count_) {
+    workers_.reserve(cursor_count_);
+    for (size_t i = 0; i < cursor_count_; ++i) {
+      workers_.emplace_back([this, i]() { WorkerLoop(i); });
+    }
+  }
+
+  ~FeatureCursorState() { Shutdown(); }
+
+  TableResult LoadChunk(const std::shared_ptr<GraphInfo>& graph_info,
+                        const std::string& vertex_type,
+                        const std::shared_ptr<PropertyGroup>& property_group,
+                        const std::shared_ptr<VertexInfo>& vertex_info,
+                        const ChunkReadKey& key, IdType chunk_id) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (shutdown_) {
+        return Status::Invalid("Feature cursor is shut down");
+      }
+      auto trail_table = LookupTrailLocked(key);
+      if (trail_table != nullptr) {
+        trail_hits_.fetch_add(1, std::memory_order_relaxed);
+        return trail_table;
+      }
+      trail_misses_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    auto task = std::make_shared<Task>();
+    task->key = key;
+    task->graph_info = graph_info;
+    task->vertex_type = vertex_type;
+    task->property_group = property_group;
+    task->vertex_info = vertex_info;
+    task->chunk_id = chunk_id;
+    auto future = task->promise.get_future();
+
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (shutdown_) {
+        return Status::Invalid("Feature cursor is shut down");
+      }
+      queues_[CursorIndexFor(key)].push_back(task);
+    }
+    cv_.notify_all();
+    return future.get();
+  }
+
+  FeatureCursorStats stats() const {
+    FeatureCursorStats stats;
+    stats.cursor_count = cursor_count_;
+    stats.trail_capacity_chunks = trail_capacity_chunks_;
+    stats.requests = requests_.load(std::memory_order_relaxed);
+    stats.requests_completed =
+        requests_completed_.load(std::memory_order_relaxed);
+    stats.requests_failed = requests_failed_.load(std::memory_order_relaxed);
+    stats.active_requests_peak =
+        active_requests_peak_.load(std::memory_order_relaxed);
+    stats.chunks_read = chunks_read_.load(std::memory_order_relaxed);
+    stats.chunks_served = chunks_served_.load(std::memory_order_relaxed);
+    stats.rows_served = rows_served_.load(std::memory_order_relaxed);
+    stats.batches_served = batches_served_.load(std::memory_order_relaxed);
+    stats.trail_hits = trail_hits_.load(std::memory_order_relaxed);
+    stats.trail_misses = trail_misses_.load(std::memory_order_relaxed);
+    stats.trail_evictions = trail_evictions_.load(std::memory_order_relaxed);
+    stats.wait_ms_sum = wait_ms_sum_.load(std::memory_order_relaxed);
+    stats.wait_ms_max = wait_ms_max_.load(std::memory_order_relaxed);
+    stats.service_ms_sum = service_ms_sum_.load(std::memory_order_relaxed);
+    stats.service_ms_max = service_ms_max_.load(std::memory_order_relaxed);
+    return stats;
+  }
+
+  void Shutdown() {
+    std::vector<std::shared_ptr<Task>> pending;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (shutdown_) {
+        return;
+      }
+      shutdown_ = true;
+      for (auto& queue : queues_) {
+        while (!queue.empty()) {
+          pending.push_back(std::move(queue.front()));
+          queue.pop_front();
+        }
+      }
+    }
+
+    cv_.notify_all();
+    for (const auto& task : pending) {
+      task->promise.set_value(Status::Invalid("Feature cursor is shut down"));
+    }
+    for (auto& worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+  }
+
+  void RegisterRequest() {
+    requests_.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t active =
+        active_requests_current_.fetch_add(1, std::memory_order_relaxed) + 1;
+    AtomicMax(&active_requests_peak_, active);
+  }
+
+  void CompleteRequest(Clock::time_point start, bool ok) {
+    const uint64_t wait_ms = MillisecondsSince(start);
+    wait_ms_sum_.fetch_add(wait_ms, std::memory_order_relaxed);
+    AtomicMax(&wait_ms_max_, wait_ms);
+    active_requests_current_.fetch_sub(1, std::memory_order_relaxed);
+    if (ok) {
+      requests_completed_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      requests_failed_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  void RecordBatchServed(size_t rows) {
+    rows_served_.fetch_add(rows, std::memory_order_relaxed);
+    batches_served_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+ private:
+  size_t CursorIndexFor(const ChunkReadKey& key) const {
+    return ChunkReadKeyHash{}(key) % cursor_count_;
+  }
+
+  void WorkerLoop(size_t index) {
+    while (true) {
+      std::shared_ptr<Task> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&]() { return shutdown_ || !queues_[index].empty(); });
+        if (shutdown_ && queues_[index].empty()) {
+          return;
+        }
+        task = std::move(queues_[index].front());
+        queues_[index].pop_front();
+      }
+
+      if (IsShutdown()) {
+        task->promise.set_value(Status::Invalid("Feature cursor is shut down"));
+        continue;
+      }
+
+      const auto service_start = Clock::now();
+      TableResult result = Status::Invalid("feature trail miss");
+      bool served_from_trail = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto trail_table = LookupTrailLocked(task->key);
+        if (trail_table != nullptr) {
+          trail_hits_.fetch_add(1, std::memory_order_relaxed);
+          result = trail_table;
+          served_from_trail = true;
+        }
+      }
+
+      if (served_from_trail) {
+        const uint64_t service_ms = MillisecondsSince(service_start);
+        service_ms_sum_.fetch_add(service_ms, std::memory_order_relaxed);
+        AtomicMax(&service_ms_max_, service_ms);
+        task->promise.set_value(result);
+        continue;
+      }
+
+      result = [&]() -> TableResult {
+        try {
+          auto chunk_result = LoadVertexPropertyChunkDirect(
+              task->graph_info, task->vertex_type, task->property_group,
+              task->vertex_info, task->chunk_id);
+          if (!chunk_result.has_error()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            InsertTrailLocked(task->key, chunk_result.value());
+          }
+          return chunk_result;
+        } catch (const std::exception& e) {
+          return Status::UnknownError("Feature cursor chunk read threw: ",
+                                      e.what());
+        } catch (...) {
+          return Status::UnknownError(
+              "Feature cursor chunk read threw unknown error");
+        }
+      }();
+
+      if (!result.has_error()) {
+        chunks_read_.fetch_add(1, std::memory_order_relaxed);
+        chunks_served_.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        chunks_read_.fetch_add(1, std::memory_order_relaxed);
+      }
+
+      const uint64_t service_ms = MillisecondsSince(service_start);
+      service_ms_sum_.fetch_add(service_ms, std::memory_order_relaxed);
+      AtomicMax(&service_ms_max_, service_ms);
+      task->promise.set_value(result);
+    }
+  }
+
+  bool IsShutdown() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return shutdown_;
+  }
+
+  TablePtr LookupTrailLocked(const ChunkReadKey& key) const {
+    auto it = trail_index_.find(key);
+    if (it == trail_index_.end()) {
+      return nullptr;
+    }
+    return it->second->table;
+  }
+
+  void InsertTrailLocked(const ChunkReadKey& key, const TablePtr& table) {
+    if (trail_capacity_chunks_ == 0 || table == nullptr) {
+      return;
+    }
+    auto existing = trail_index_.find(key);
+    if (existing != trail_index_.end()) {
+      existing->second->table = table;
+      trail_.splice(trail_.end(), trail_, existing->second);
+      return;
+    }
+
+    trail_.push_back(TrailEntry{key, table});
+    auto inserted = std::prev(trail_.end());
+    trail_index_.emplace(key, inserted);
+    while (trail_.size() > trail_capacity_chunks_) {
+      trail_index_.erase(trail_.front().key);
+      trail_.pop_front();
+      trail_evictions_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  const size_t cursor_count_;
+  const size_t trail_capacity_chunks_;
+
+  mutable std::mutex mutex_;
+  std::condition_variable cv_;
+  bool shutdown_ = false;
+  std::vector<std::thread> workers_;
+  std::vector<std::deque<std::shared_ptr<Task>>> queues_;
+  std::list<TrailEntry> trail_;
+  std::unordered_map<ChunkReadKey, std::list<TrailEntry>::iterator,
+                     ChunkReadKeyHash>
+      trail_index_;
+
+  std::atomic<uint64_t> requests_{0};
+  std::atomic<uint64_t> requests_completed_{0};
+  std::atomic<uint64_t> requests_failed_{0};
+  std::atomic<uint64_t> active_requests_current_{0};
+  std::atomic<uint64_t> active_requests_peak_{0};
+  std::atomic<uint64_t> chunks_read_{0};
+  std::atomic<uint64_t> chunks_served_{0};
+  std::atomic<uint64_t> rows_served_{0};
+  std::atomic<uint64_t> batches_served_{0};
+  std::atomic<uint64_t> trail_hits_{0};
+  std::atomic<uint64_t> trail_misses_{0};
+  std::atomic<uint64_t> trail_evictions_{0};
+  std::atomic<uint64_t> wait_ms_sum_{0};
+  std::atomic<uint64_t> wait_ms_max_{0};
+  std::atomic<uint64_t> service_ms_sum_{0};
+  std::atomic<uint64_t> service_ms_max_{0};
+};
+
 ChunkReadManager::ChunkReadManager(ChunkReadManagerOptions options)
-    : options_(std::move(options)) {}
+    : options_(std::move(options)) {
+  if (options_.feature_cursor_count > 0) {
+    feature_cursor_ = std::make_unique<FeatureCursorState>(options_);
+  }
+}
+
+ChunkReadManager::~ChunkReadManager() { Shutdown(); }
+
+bool ChunkReadManager::HasFeatureCursor() const {
+  return feature_cursor_ != nullptr;
+}
+
+void ChunkReadManager::RegisterFeatureRequest() {
+  if (feature_cursor_ != nullptr) {
+    feature_cursor_->RegisterRequest();
+  }
+}
+
+void ChunkReadManager::CompleteFeatureRequest(Clock::time_point start, bool ok) {
+  if (feature_cursor_ != nullptr) {
+    feature_cursor_->CompleteRequest(start, ok);
+  }
+}
+
+void ChunkReadManager::RecordFeatureBatchServed(size_t rows) {
+  if (feature_cursor_ != nullptr) {
+    feature_cursor_->RecordBatchServed(rows);
+  }
+}
 
 ChunkReadManager::TableResult ChunkReadManager::GetOrLoad(
     const ChunkReadKey& key, const TableLoader& loader) {
@@ -201,20 +550,18 @@ ChunkReadManager::TableResult ChunkReadManager::GetVertexPropertyChunk(
   key.file_type = property_group->GetFileType();
   key.chunk_id = chunk_id;
 
+  if (feature_cursor_ != nullptr) {
+    return GetOrLoad(key, [this, graph_info, vertex_type, property_group,
+                           vertex_info, key, chunk_id]() -> TableResult {
+      return feature_cursor_->LoadChunk(graph_info, vertex_type, property_group,
+                                        vertex_info, key, chunk_id);
+    });
+  }
+
   return GetOrLoad(key, [graph_info, vertex_type, property_group, vertex_info,
                          chunk_id]() -> TableResult {
-    auto reader_result =
-        VertexPropertyArrowChunkReader::Make(graph_info, vertex_type,
-                                             property_group);
-    GAR_RETURN_NOT_OK(reader_result.status());
-    auto reader = reader_result.value();
-
-    const IdType chunk_start_node = chunk_id * vertex_info->GetChunkSize();
-    GAR_RETURN_NOT_OK(reader->seek(chunk_start_node));
-
-    auto chunk_result = reader->GetChunk();
-    GAR_RETURN_NOT_OK(chunk_result.status());
-    return chunk_result.value();
+    return LoadVertexPropertyChunkDirect(graph_info, vertex_type, property_group,
+                                         vertex_info, chunk_id);
   });
 }
 
@@ -319,6 +666,19 @@ ChunkReadStats ChunkReadManager::stats() const {
     stats.ram_cache_bytes = ram_cache_bytes_;
   }
   return stats;
+}
+
+FeatureCursorStats ChunkReadManager::feature_cursor_stats() const {
+  if (feature_cursor_ == nullptr) {
+    return {};
+  }
+  return feature_cursor_->stats();
+}
+
+void ChunkReadManager::Shutdown() {
+  if (feature_cursor_ != nullptr) {
+    feature_cursor_->Shutdown();
+  }
 }
 
 void ChunkReadManager::RecordResult(const TableResult& result) {

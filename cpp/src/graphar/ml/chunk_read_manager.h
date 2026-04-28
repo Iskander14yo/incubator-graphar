@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <chrono>
 #include <functional>
 #include <future>
 #include <list>
@@ -28,6 +29,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "graphar/fwd.h"
 #include "graphar/result.h"
@@ -66,6 +68,8 @@ struct ChunkReadKeyHash {
 struct ChunkReadManagerOptions {
   bool enable_singleflight = true;
   size_t ram_budget_bytes = 0;
+  size_t feature_cursor_count = 0;
+  size_t feature_cursor_trail_capacity_chunks = 0;
 };
 
 struct ChunkReadStats {
@@ -80,6 +84,26 @@ struct ChunkReadStats {
   uint64_t ram_cache_bytes = 0;
 };
 
+struct FeatureCursorStats {
+  uint64_t cursor_count = 0;
+  uint64_t trail_capacity_chunks = 0;
+  uint64_t requests = 0;
+  uint64_t requests_completed = 0;
+  uint64_t requests_failed = 0;
+  uint64_t active_requests_peak = 0;
+  uint64_t chunks_read = 0;
+  uint64_t chunks_served = 0;
+  uint64_t rows_served = 0;
+  uint64_t batches_served = 0;
+  uint64_t trail_hits = 0;
+  uint64_t trail_misses = 0;
+  uint64_t trail_evictions = 0;
+  uint64_t wait_ms_sum = 0;
+  uint64_t wait_ms_max = 0;
+  uint64_t service_ms_sum = 0;
+  uint64_t service_ms_max = 0;
+};
+
 class ChunkReadManager {
  public:
   using TablePtr = std::shared_ptr<arrow::Table>;
@@ -87,6 +111,7 @@ class ChunkReadManager {
   using TableLoader = std::function<TableResult()>;
 
   explicit ChunkReadManager(ChunkReadManagerOptions options = {});
+  ~ChunkReadManager();
 
   TableResult GetOrLoad(const ChunkReadKey& key, const TableLoader& loader);
 
@@ -110,14 +135,29 @@ class ChunkReadManager {
                                   IdType vertex_chunk_id, IdType chunk_id);
 
   ChunkReadStats stats() const;
+  FeatureCursorStats feature_cursor_stats() const;
+  void Shutdown();
 
  private:
+  friend Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
+      const std::shared_ptr<GraphInfo>& graph_info,
+      const std::string& vertex_type, const std::vector<IdType>& node_ids,
+      const std::vector<std::string>& properties,
+      ChunkReadManager* chunk_manager);
+
+  using Clock = std::chrono::steady_clock;
+
+  struct FeatureCursorState;
   struct CacheEntry {
     TablePtr table;
     size_t bytes = 0;
     std::list<ChunkReadKey>::iterator lru_it;
   };
 
+  bool HasFeatureCursor() const;
+  void RegisterFeatureRequest();
+  void CompleteFeatureRequest(Clock::time_point start, bool ok);
+  void RecordFeatureBatchServed(size_t rows);
   void RecordResult(const TableResult& result);
   TablePtr LookupRamCacheLocked(const ChunkReadKey& key);
   void InsertRamCacheLocked(const ChunkReadKey& key, const TablePtr& table);
@@ -131,6 +171,7 @@ class ChunkReadManager {
   std::unordered_map<ChunkReadKey, std::shared_future<TableResult>,
                      ChunkReadKeyHash>
       in_flight_;
+  std::unique_ptr<FeatureCursorState> feature_cursor_;
 
   std::atomic<uint64_t> requests_{0};
   std::atomic<uint64_t> leaders_{0};

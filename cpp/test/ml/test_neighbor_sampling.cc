@@ -12,7 +12,6 @@
 #include "graphar/filesystem.h"
 #include "graphar/graph_info.h"
 #include "graphar/ml/chunk_read_manager.h"
-#include "graphar/ml/feature_cursor.h"
 #include "graphar/ml/neighbor_sampling.h"
 #include "graphar/reader_util.h"
 #include "graphar/writer_util.h"
@@ -25,18 +24,11 @@ namespace graphar::ml {
 namespace {
 
 constexpr const char* kGraphPath = "/ldbc_sample/parquet/ldbc_sample.graph.yml";
-constexpr const char* kMultiLabelGraphPath = "/ldbc/parquet/ldbc.graph.yml";
 constexpr const char* kVertexType = "person";
 constexpr const char* kEdgeType = "knows";
 
 std::shared_ptr<GraphInfo> LoadLdbcSampleGraph(const std::string& test_data_dir) {
   auto maybe_graph_info = GraphInfo::Load(test_data_dir + kGraphPath);
-  REQUIRE(maybe_graph_info.status().ok());
-  return maybe_graph_info.value();
-}
-
-std::shared_ptr<GraphInfo> LoadLdbcGraph(const std::string& test_data_dir) {
-  auto maybe_graph_info = GraphInfo::Load(test_data_dir + kMultiLabelGraphPath);
   REQUIRE(maybe_graph_info.status().ok());
   return maybe_graph_info.value();
 }
@@ -110,52 +102,6 @@ class MultiRowGroupGraphCopy {
   }
 
   ~MultiRowGroupGraphCopy() {
-    std::error_code ec;
-    std::filesystem::remove_all(root_, ec);
-  }
-
-  const std::shared_ptr<GraphInfo>& graph_info() const { return graph_info_; }
-
- private:
-  std::filesystem::path root_;
-  std::shared_ptr<GraphInfo> graph_info_;
-};
-
-class InflatedVertexCountGraphCopy {
- public:
-  InflatedVertexCountGraphCopy(const std::string& test_data_dir,
-                               IdType vertex_count) {
-    root_ = std::filesystem::temp_directory_path() /
-            "graphar_ml_shutdown_pending";
-    std::error_code ec;
-    std::filesystem::remove_all(root_, ec);
-
-    const auto source_root =
-        std::filesystem::path(test_data_dir) / "ldbc_sample" / "parquet";
-    CopyDirectoryTree(source_root, root_);
-
-    auto maybe_graph_info =
-        GraphInfo::Load((root_ / "ldbc_sample.graph.yml").string());
-    REQUIRE(maybe_graph_info.status().ok());
-    graph_info_ = maybe_graph_info.value();
-
-    auto vertex_info = graph_info_->GetVertexInfo(kVertexType);
-    REQUIRE(vertex_info != nullptr);
-    auto maybe_vertex_count_path = vertex_info->GetVerticesNumFilePath();
-    REQUIRE(maybe_vertex_count_path.status().ok());
-
-    std::string normalized_prefix;
-    auto maybe_fs = FileSystemFromUriOrPath(graph_info_->GetPrefix(),
-                                            &normalized_prefix);
-    REQUIRE(maybe_fs.status().ok());
-    REQUIRE(
-        maybe_fs.value()
-            ->WriteValueToFile(vertex_count,
-                               normalized_prefix + maybe_vertex_count_path.value())
-            .ok());
-  }
-
-  ~InflatedVertexCountGraphCopy() {
     std::error_code ec;
     std::filesystem::remove_all(root_, ec);
   }
@@ -282,25 +228,19 @@ IdType GetChunkStartNodeId(const std::shared_ptr<GraphInfo>& graph_info,
   return node_id;
 }
 
-std::string FirstPropertyName(const std::shared_ptr<VertexInfo>& vertex_info) {
-  for (const auto& property_group : vertex_info->GetPropertyGroups()) {
-    const auto& properties = property_group->GetProperties();
-    if (!properties.empty()) {
-      return properties.front().name;
-    }
-  }
-  return "";
+Result<std::shared_ptr<arrow::Table>> SubmitAndWaitFeatures(
+    const std::shared_ptr<GraphInfo>& graph_info, ChunkReadManager* manager,
+    const std::string& vertex_type, const std::vector<IdType>& node_ids,
+    const std::vector<std::string>& properties) {
+  return GetNodeFeatures(graph_info, vertex_type, node_ids, properties, manager);
 }
 
-Result<std::shared_ptr<arrow::Table>> SubmitAndWaitFeatures(
-    FeatureScanCoordinator* coordinator, const std::string& vertex_type,
-    const std::vector<IdType>& node_ids,
-    const std::vector<std::string>& properties) {
-  auto handle = coordinator->Submit(vertex_type, node_ids, properties);
-  if (handle.has_error()) {
-    return handle.status();
-  }
-  return handle.value()->Wait();
+ChunkReadManager MakeFeatureManagedChunkReader(size_t cursor_count = 1,
+                                              size_t trail_capacity = 10) {
+  ChunkReadManagerOptions options;
+  options.feature_cursor_count = cursor_count;
+  options.feature_cursor_trail_capacity_chunks = trail_capacity;
+  return ChunkReadManager(options);
 }
 
 }  // namespace
@@ -528,7 +468,7 @@ TEST_CASE_METHOD(
     GlobalFixture,
     "GetNodeFeatures preserves requested property order across groups") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
-  ChunkReadManager manager;
+  auto manager = MakeFeatureManagedChunkReader();
   const std::vector<std::string> properties = {"firstName", "id"};
 
   auto result = GetNodeFeatures(graph_info, kVertexType, {0, 1}, properties);
@@ -545,7 +485,7 @@ TEST_CASE_METHOD(
 TEST_CASE_METHOD(GlobalFixture,
                  "GetNodeFeatures - chunk manager matches uncached output") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
-  ChunkReadManager manager;
+  auto manager = MakeFeatureManagedChunkReader();
 
   auto uncached =
       GetNodeFeatures(graph_info, kVertexType, {5, 1, 3, 0}, {"id", "firstName"});
@@ -560,6 +500,7 @@ TEST_CASE_METHOD(GlobalFixture,
   REQUIRE(stats.leaders == stats.requests);
   REQUIRE(stats.completed == stats.requests);
   REQUIRE(stats.failed == 0);
+  REQUIRE(manager.feature_cursor_stats().requests == 1);
 }
 
 TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - empty node list") {
@@ -611,28 +552,26 @@ TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - unordered node ids") {
                                        21990232556027, 933});
 }
 
-/////////////////////////// FeatureScanCoordinator ///////////////////////////////
+/////////////////////////// Feature Cursor //////////////////////////////////////
 
 TEST_CASE_METHOD(
     GlobalFixture,
-    "FeatureScanCoordinator matches GetNodeFeatures on ldbc_sample") {
+    "Cursor-backed feature manager matches direct GetNodeFeatures on ldbc_sample") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureCursorOptions options;
-  options.cursor_count = 2;
-  FeatureScanCoordinator coordinator(graph_info, chunk_manager, options);
+  auto chunk_manager = MakeFeatureManagedChunkReader(2);
 
   const std::vector<IdType> node_ids = {5, 1, 3, 0};
   const std::vector<std::string> properties = {"id", "firstName"};
 
   auto expected = GetNodeFeatures(graph_info, kVertexType, node_ids, properties);
-  auto result =
-      SubmitAndWaitFeatures(&coordinator, kVertexType, node_ids, properties);
+  auto managed = SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType,
+                                       node_ids, properties);
   REQUIRE(expected.status().ok());
-  REQUIRE(result.status().ok());
-  REQUIRE(result.value()->Equals(*expected.value()));
+  REQUIRE(managed.status().ok());
+  REQUIRE(managed.value()->Equals(*expected.value()));
 
-  const auto stats = coordinator.stats();
+  const auto stats = chunk_manager.feature_cursor_stats();
+  REQUIRE(stats.cursor_count == 2);
   REQUIRE(stats.requests == 1);
   REQUIRE(stats.requests_completed == 1);
   REQUIRE(stats.requests_failed == 0);
@@ -642,36 +581,13 @@ TEST_CASE_METHOD(
 
 TEST_CASE_METHOD(
     GlobalFixture,
-    "FeatureScanCoordinator preserves requested property order across groups") {
-  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureScanCoordinator coordinator(graph_info, chunk_manager);
-  const std::vector<IdType> node_ids = {5, 1, 3, 0};
-  const std::vector<std::string> properties = {"firstName", "id"};
-
-  auto expected = GetNodeFeatures(graph_info, kVertexType, node_ids, properties);
-  auto result =
-      SubmitAndWaitFeatures(&coordinator, kVertexType, node_ids, properties);
-  REQUIRE(expected.status().ok());
-  REQUIRE(result.status().ok());
-
-  REQUIRE(result.value()->ColumnNames() == properties);
-  REQUIRE(result.value()->Equals(*expected.value()));
-}
-
-TEST_CASE_METHOD(
-    GlobalFixture,
-    "FeatureScanCoordinator handles concurrent submits for the same chunk") {
+    "Cursor-backed feature manager handles concurrent requests for the same chunk") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
   auto vertex_info = graph_info->GetVertexInfo(kVertexType);
   REQUIRE(vertex_info != nullptr);
   REQUIRE(vertex_info->GetChunkSize() >= 6);
 
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureCursorOptions options;
-  options.cursor_count = 1;
-  FeatureScanCoordinator coordinator(graph_info, chunk_manager, options);
-
+  auto chunk_manager = MakeFeatureManagedChunkReader(1);
   const std::vector<std::vector<IdType>> node_requests = {
       {0, 1}, {5, 1, 3, 0}, {2}, {4, 2, 1}, {0, 5}, {3, 4}};
   std::vector<std::shared_ptr<arrow::Table>> expected_tables(
@@ -695,9 +611,9 @@ TEST_CASE_METHOD(
   for (size_t i = 0; i < node_requests.size(); ++i) {
     threads.emplace_back([&, i]() {
       start.wait();
-      auto result =
-          SubmitAndWaitFeatures(&coordinator, kVertexType, node_requests[i],
-                                {"id"});
+      auto result = SubmitAndWaitFeatures(graph_info, &chunk_manager,
+                                          kVertexType, node_requests[i],
+                                          {"id"});
       statuses[i] = result.status();
       if (!result.has_error()) {
         actual_tables[i] = result.value();
@@ -718,7 +634,7 @@ TEST_CASE_METHOD(
     total_rows_served += static_cast<uint64_t>(node_requests[i].size());
   }
 
-  const auto stats = coordinator.stats();
+  const auto stats = chunk_manager.feature_cursor_stats();
   REQUIRE(stats.requests == node_requests.size());
   REQUIRE(stats.requests_completed == node_requests.size());
   REQUIRE(stats.requests_failed == 0);
@@ -730,7 +646,7 @@ TEST_CASE_METHOD(
 
 TEST_CASE_METHOD(
     GlobalFixture,
-    "FeatureScanCoordinator serves disjoint chunk ranges with multiple cursors") {
+    "Cursor-backed feature manager serves disjoint chunks across cursors") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
   auto vertex_info = graph_info->GetVertexInfo(kVertexType);
   REQUIRE(vertex_info != nullptr);
@@ -741,33 +657,54 @@ TEST_CASE_METHOD(
   REQUIRE(chunk_ids[0] < chunk_ids[1]);
   REQUIRE(chunk_ids[1] < chunk_ids[2]);
 
-  std::vector<IdType> node_ids;
-  node_ids.reserve(chunk_ids.size());
-  for (const auto chunk_id : chunk_ids) {
-    node_ids.push_back(GetChunkStartNodeId(graph_info, vertex_info, chunk_id));
+  auto chunk_manager = MakeFeatureManagedChunkReader(3);
+  std::promise<void> start_promise;
+  auto start = start_promise.get_future().share();
+  std::vector<std::shared_ptr<arrow::Table>> results(chunk_ids.size());
+  std::vector<Status> statuses(
+      chunk_ids.size(), Status::UnknownError("request not started"));
+  std::vector<std::thread> threads;
+  threads.reserve(chunk_ids.size());
+
+  for (size_t i = 0; i < chunk_ids.size(); ++i) {
+    threads.emplace_back([&, i]() {
+      start.wait();
+      const auto node_id =
+          GetChunkStartNodeId(graph_info, vertex_info, chunk_ids[i]);
+      auto result = SubmitAndWaitFeatures(graph_info, &chunk_manager,
+                                          kVertexType, {node_id}, {"id"});
+      statuses[i] = result.status();
+      if (!result.has_error()) {
+        results[i] = result.value();
+      }
+    });
   }
 
-  auto expected = GetNodeFeatures(graph_info, kVertexType, node_ids, {"id"});
-  REQUIRE(expected.status().ok());
+  start_promise.set_value();
+  for (auto& thread : threads) {
+    thread.join();
+  }
 
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureCursorOptions options;
-  options.cursor_count = 3;
-  FeatureScanCoordinator coordinator(graph_info, chunk_manager, options);
+  for (size_t i = 0; i < chunk_ids.size(); ++i) {
+    REQUIRE(statuses[i].ok());
+    auto expected =
+        GetNodeFeatures(graph_info, kVertexType,
+                        {GetChunkStartNodeId(graph_info, vertex_info,
+                                             chunk_ids[i])},
+                        {"id"});
+    REQUIRE(expected.status().ok());
+    REQUIRE(results[i] != nullptr);
+    REQUIRE(results[i]->Equals(*expected.value()));
+  }
 
-  auto result =
-      SubmitAndWaitFeatures(&coordinator, kVertexType, node_ids, {"id"});
-  REQUIRE(result.status().ok());
-  REQUIRE(result.value()->Equals(*expected.value()));
-
-  const auto stats = coordinator.stats();
+  const auto stats = chunk_manager.feature_cursor_stats();
   REQUIRE(stats.cursor_count == 3);
-  REQUIRE(stats.requests == 1);
-  REQUIRE(stats.requests_completed == 1);
+  REQUIRE(stats.requests == chunk_ids.size());
+  REQUIRE(stats.requests_completed == chunk_ids.size());
   REQUIRE(stats.requests_failed == 0);
   REQUIRE(stats.chunks_read == chunk_ids.size());
   REQUIRE(stats.chunks_served == chunk_ids.size());
-  REQUIRE(stats.rows_served == node_ids.size());
+  REQUIRE(stats.rows_served == chunk_ids.size());
   REQUIRE(stats.batches_served == chunk_ids.size());
   REQUIRE(stats.trail_hits == 0);
   REQUIRE(stats.trail_misses == chunk_ids.size());
@@ -775,23 +712,23 @@ TEST_CASE_METHOD(
 
 TEST_CASE_METHOD(
     GlobalFixture,
-    "FeatureScanCoordinator reuses trail cache for repeated chunk request") {
+    "Cursor-backed feature manager reuses trail cache for repeated chunk request") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
   auto vertex_info = graph_info->GetVertexInfo(kVertexType);
   REQUIRE(vertex_info != nullptr);
   REQUIRE(vertex_info->GetChunkSize() >= 4);
 
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureCursorOptions options;
-  options.cursor_count = 1;
-  options.trail_capacity_chunks = 1;
-  FeatureScanCoordinator coordinator(graph_info, chunk_manager, options);
+  auto chunk_manager = MakeFeatureManagedChunkReader(1, 1);
 
   auto first_expected = GetNodeFeatures(graph_info, kVertexType, {0, 1}, {"id"});
   auto second_expected =
       GetNodeFeatures(graph_info, kVertexType, {2, 3}, {"id"});
-  auto first = SubmitAndWaitFeatures(&coordinator, kVertexType, {0, 1}, {"id"});
-  auto second = SubmitAndWaitFeatures(&coordinator, kVertexType, {2, 3}, {"id"});
+  auto first =
+      SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType, {0, 1},
+                            {"id"});
+  auto second =
+      SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType, {2, 3},
+                            {"id"});
   REQUIRE(first_expected.status().ok());
   REQUIRE(second_expected.status().ok());
   REQUIRE(first.status().ok());
@@ -800,7 +737,7 @@ TEST_CASE_METHOD(
   REQUIRE(first.value()->Equals(*first_expected.value()));
   REQUIRE(second.value()->Equals(*second_expected.value()));
 
-  const auto stats = coordinator.stats();
+  const auto stats = chunk_manager.feature_cursor_stats();
   REQUIRE(stats.requests == 2);
   REQUIRE(stats.requests_completed == 2);
   REQUIRE(stats.requests_failed == 0);
@@ -813,21 +750,19 @@ TEST_CASE_METHOD(
 }
 
 TEST_CASE_METHOD(GlobalFixture,
-                 "FeatureScanCoordinator empty node list avoids cursor startup") {
+                 "Cursor-backed feature manager leaves empty node list fast path unchanged") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureCursorOptions options;
-  options.cursor_count = 3;
-  FeatureScanCoordinator coordinator(graph_info, chunk_manager, options);
+  auto chunk_manager = MakeFeatureManagedChunkReader(3);
 
-  auto result = SubmitAndWaitFeatures(&coordinator, kVertexType, {}, {"id"});
+  auto result = SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType,
+                                      {}, {"id"});
   REQUIRE(result.status().ok());
   REQUIRE(result.value()->num_rows() == 0);
 
-  const auto stats = coordinator.stats();
-  REQUIRE(stats.cursor_count == 0);
-  REQUIRE(stats.requests == 1);
-  REQUIRE(stats.requests_completed == 1);
+  const auto stats = chunk_manager.feature_cursor_stats();
+  REQUIRE(stats.cursor_count == 3);
+  REQUIRE(stats.requests == 0);
+  REQUIRE(stats.requests_completed == 0);
   REQUIRE(stats.requests_failed == 0);
   REQUIRE(stats.chunks_read == 0);
   REQUIRE(stats.chunks_served == 0);
@@ -835,106 +770,36 @@ TEST_CASE_METHOD(GlobalFixture,
   REQUIRE(stats.batches_served == 0);
 }
 
-TEST_CASE_METHOD(GlobalFixture, "FeatureScanCoordinator validates requests") {
-  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureScanCoordinator coordinator(graph_info, chunk_manager);
-
-  SECTION("empty properties") {
-    auto result = coordinator.Submit(kVertexType, {0}, {});
-    REQUIRE(result.has_error());
-    REQUIRE(result.status().IsInvalid());
-  }
-
-  SECTION("invalid property") {
-    auto result = coordinator.Submit(kVertexType, {0}, {"missing_property"});
-    REQUIRE(result.has_error());
-    REQUIRE(result.status().IsInvalid());
-  }
-
-  SECTION("invalid vertex type") {
-    auto result = coordinator.Submit("invalid_person", {0}, {"id"});
-    REQUIRE(result.has_error());
-    REQUIRE(result.status().IsInvalid());
-  }
-
-  SECTION("negative node id") {
-    auto result = coordinator.Submit(kVertexType, {-1}, {"id"});
-    REQUIRE(result.has_error());
-    REQUIRE(result.status().IsIndexError());
-  }
-
-  SECTION("node id outside vertex chunks") {
-    auto result = coordinator.Submit(kVertexType, {1000000000}, {"id"});
-    REQUIRE(result.has_error());
-    REQUIRE(result.status().IsIndexError());
-  }
-}
-
-TEST_CASE_METHOD(
-    GlobalFixture,
-    "FeatureScanCoordinator only supports one vertex type per instance") {
-  auto graph_info = LoadLdbcGraph(test_data_dir);
-  const auto& vertex_infos = graph_info->GetVertexInfos();
-
-  std::vector<std::shared_ptr<VertexInfo>> candidates;
-  for (const auto& vertex_info : vertex_infos) {
-    if (FirstPropertyName(vertex_info).empty()) {
-      continue;
-    }
-    auto vertex_num = util::GetVertexNum(graph_info->GetPrefix(), vertex_info);
-    if (vertex_num.has_error() || vertex_num.value() == 0) {
-      continue;
-    }
-    candidates.push_back(vertex_info);
-  }
-  REQUIRE(candidates.size() >= 2);
-
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureScanCoordinator coordinator(graph_info, chunk_manager);
-
-  const auto first_property = FirstPropertyName(candidates[0]);
-  const auto second_property = FirstPropertyName(candidates[1]);
-  REQUIRE(!first_property.empty());
-  REQUIRE(!second_property.empty());
-
-  auto first =
-      SubmitAndWaitFeatures(&coordinator, candidates[0]->GetType(), {0},
-                            {first_property});
-  REQUIRE(first.status().ok());
-
-  auto second =
-      coordinator.Submit(candidates[1]->GetType(), {0}, {second_property});
-  REQUIRE(second.has_error());
-  REQUIRE(second.status().IsInvalid());
-  REQUIRE(second.status().message().find("only supports one vertex type") !=
-          std::string::npos);
-}
-
 TEST_CASE_METHOD(GlobalFixture,
-                 "FeatureScanCoordinator rejects submits after shutdown") {
+                 "Cursor-backed feature manager rejects requests after shutdown") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureScanCoordinator coordinator(graph_info, chunk_manager);
+  auto chunk_manager = MakeFeatureManagedChunkReader(1);
 
-  coordinator.Shutdown();
+  chunk_manager.Shutdown();
 
-  auto result = coordinator.Submit(kVertexType, {0}, {"id"});
+  auto result =
+      SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType, {0},
+                            {"id"});
   REQUIRE(result.has_error());
   REQUIRE(result.status().IsInvalid());
   REQUIRE(result.status().message().find("shut down") != std::string::npos);
+
+  const auto stats = chunk_manager.feature_cursor_stats();
+  REQUIRE(stats.requests == 1);
+  REQUIRE(stats.requests_completed == 0);
+  REQUIRE(stats.requests_failed == 1);
 }
 
 TEST_CASE_METHOD(GlobalFixture,
-                 "FeatureScanCoordinator propagates chunk read failures") {
+                 "Cursor-backed feature manager propagates chunk read failures") {
   MissingPropertyChunkGraphCopy graph_copy(test_data_dir);
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureScanCoordinator coordinator(graph_copy.graph_info(), chunk_manager);
+  auto chunk_manager = MakeFeatureManagedChunkReader(1);
 
-  auto result = SubmitAndWaitFeatures(&coordinator, kVertexType, {0}, {"id"});
+  auto result = SubmitAndWaitFeatures(graph_copy.graph_info(), &chunk_manager,
+                                      kVertexType, {0}, {"id"});
   REQUIRE(result.has_error());
 
-  const auto stats = coordinator.stats();
+  const auto stats = chunk_manager.feature_cursor_stats();
   REQUIRE(stats.requests == 1);
   REQUIRE(stats.requests_completed == 0);
   REQUIRE(stats.requests_failed == 1);
@@ -958,36 +823,11 @@ TEST_CASE_METHOD(GlobalFixture,
   REQUIRE(direct.status().ok());
   REQUIRE(direct.value()->Equals(*expected.value()));
 
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureScanCoordinator coordinator(graph_copy.graph_info(), chunk_manager);
-  auto handle = coordinator.Submit(kVertexType, node_ids, properties);
-  REQUIRE(handle.status().ok());
-
-  auto coordinated = handle.value()->Wait();
-  REQUIRE(coordinated.status().ok());
-  REQUIRE(coordinated.value()->Equals(*expected.value()));
-}
-
-TEST_CASE_METHOD(GlobalFixture,
-                 "FeatureScanCoordinator shutdown fails pending requests") {
-  constexpr IdType kInflatedVertexCount = 1000000000;
-  InflatedVertexCountGraphCopy graph_copy(test_data_dir, kInflatedVertexCount);
-
-  auto chunk_manager = std::make_shared<ChunkReadManager>();
-  FeatureCursorOptions options;
-  options.cursor_count = 1;
-  FeatureScanCoordinator coordinator(graph_copy.graph_info(), chunk_manager,
-                                     options);
-
-  auto handle = coordinator.Submit(kVertexType, {kInflatedVertexCount - 1},
-                                   {"id"});
-  REQUIRE(handle.status().ok());
-
-  coordinator.Shutdown();
-
-  auto result = handle.value()->Wait();
-  REQUIRE(result.has_error());
-  REQUIRE(result.status().message().find("shutdown") != std::string::npos);
+  auto chunk_manager = MakeFeatureManagedChunkReader(1);
+  auto managed = SubmitAndWaitFeatures(graph_copy.graph_info(), &chunk_manager,
+                                       kVertexType, node_ids, properties);
+  REQUIRE(managed.status().ok());
+  REQUIRE(managed.value()->Equals(*expected.value()));
 }
 
 }  // namespace graphar::ml

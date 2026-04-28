@@ -1,8 +1,6 @@
 from .._core import (
     _ChunkReadManager,
     _ChunkReadManagerOptions,
-    _FeatureCursorOptions,
-    _FeatureScanCoordinator,
     get_node_features,
     sample_neighbors,
 )
