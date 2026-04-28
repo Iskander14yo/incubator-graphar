@@ -27,6 +27,7 @@ def _make_loader(
     shuffle=False,
     features=None,
     num_workers=0,
+    prefetch_batches=0,
     edge_ram_for_loader_mb=0,
     feature_ram_for_loader_mb=0,
 ):
@@ -42,6 +43,7 @@ def _make_loader(
         shuffle=shuffle,
         features=features,
         num_workers=num_workers,
+        prefetch_batches=prefetch_batches,
         edge_ram_for_loader_mb=edge_ram_for_loader_mb,
         feature_ram_for_loader_mb=feature_ram_for_loader_mb,
     )
@@ -303,6 +305,11 @@ def test_negative_edge_ram_for_loader_is_rejected(ldbc_graph):
         _make_loader(ldbc_graph, edge_ram_for_loader_mb=-1)
 
 
+def test_negative_prefetch_batches_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="prefetch_batches"):
+        _make_loader(ldbc_graph, prefetch_batches=-1)
+
+
 def test_negative_feature_ram_for_loader_is_rejected(ldbc_graph):
     with pytest.raises(ValueError, match="feature_ram_for_loader_mb"):
         _make_loader(ldbc_graph, feature_ram_for_loader_mb=-1)
@@ -491,3 +498,51 @@ def test_bounded_prefetch_limits_concurrency(ldbc_graph):
         list(loader)
 
     assert peak <= num_workers
+
+
+def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=list(range(10)),
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        num_workers=2,
+        prefetch_batches=4,
+    )
+
+    real_build = loader._build_batch
+    release_first = threading.Event()
+    started_fourth = threading.Event()
+    started_batches = set()
+    started_lock = threading.Lock()
+    thread_error = []
+
+    def tracked_build(seed_nodes, seed):
+        batch_idx = seed_nodes[0] // 2
+        with started_lock:
+            started_batches.add(batch_idx)
+            if batch_idx == 3:
+                started_fourth.set()
+        if batch_idx == 0:
+            if not release_first.wait(timeout=5.0):
+                raise TimeoutError("timed out waiting to release first batch")
+        return real_build(seed_nodes, seed)
+
+    def consume():
+        try:
+            list(loader)
+        except Exception as exc:  # pragma: no cover - surfaced by assertion below
+            thread_error.append(exc)
+
+    with mock.patch.object(loader, "_build_batch", side_effect=tracked_build):
+        consumer = threading.Thread(target=consume)
+        consumer.start()
+        assert started_fourth.wait(timeout=5.0)
+        with started_lock:
+            assert started_batches >= {0, 1, 2, 3}
+        release_first.set()
+        consumer.join(timeout=10.0)
+
+    assert not consumer.is_alive()
+    assert thread_error == []

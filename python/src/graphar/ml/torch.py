@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import time
-from collections import deque
 from collections.abc import Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 import pyarrow as pa
@@ -109,6 +108,7 @@ class GARNeighborLoader(IterableDataset):
         shuffle: bool = True,
         features: list[str] | None = None,
         num_workers: int = 0,
+        prefetch_batches: int = 0,
         edge_ram_for_loader_mb: int = 0,
         feature_ram_for_loader_mb: int = 0,
         feature_cursor_count: int = 1,
@@ -122,6 +122,9 @@ class GARNeighborLoader(IterableDataset):
             raise ValueError(msg)
         if num_workers < 0:
             msg = "num_workers must be >= 0"
+            raise ValueError(msg)
+        if prefetch_batches < 0:
+            msg = "prefetch_batches must be >= 0"
             raise ValueError(msg)
         if edge_ram_for_loader_mb < 0:
             msg = "edge_ram_for_loader_mb must be >= 0"
@@ -142,6 +145,7 @@ class GARNeighborLoader(IterableDataset):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
+        self.prefetch_batches = prefetch_batches
         edge_chunk_manager_options = gar_ml._ChunkReadManagerOptions()
         edge_chunk_manager_options.ram_budget_bytes = int(edge_ram_for_loader_mb) * 1024 * 1024
         self._sampling_chunk_manager = gar_ml._ChunkReadManager(edge_chunk_manager_options)
@@ -307,12 +311,47 @@ class GARNeighborLoader(IterableDataset):
             for seed_nodes, seed in jobs:
                 yield self._build_batch(seed_nodes, seed)
         else:
-            in_flight: deque[Future] = deque()
+            max_pending = (
+                self.prefetch_batches
+                if self.prefetch_batches > 0
+                else self.num_workers
+            )
+            next_seq = 0
+            next_to_yield = 0
+            jobs_exhausted = False
+            # Finished batches can arrive out of order; keep them here until
+            # the next ordered result is ready to yield.
+            completed: dict[int, tuple[Data, BatchProfile]] = {}
+            in_flight: dict[Future, int] = {}
+
+            def submit_until_full(executor: ThreadPoolExecutor) -> None:
+                nonlocal next_seq, jobs_exhausted
+                # Bound submitted-but-not-yielded work to avoid unbounded batch
+                # buffering while still letting workers run past a slow head.
+                while not jobs_exhausted and len(in_flight) + len(completed) < max_pending:
+                    try:
+                        seed_nodes, seed = next(jobs)
+                    except StopIteration:
+                        jobs_exhausted = True
+                        return
+                    future = executor.submit(self._build_batch, seed_nodes, seed)
+                    in_flight[future] = next_seq
+                    next_seq += 1
+
             with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                for seed_nodes, seed in jobs:
-                    in_flight.append(executor.submit(self._build_batch, seed_nodes, seed))
-                    if len(in_flight) < self.num_workers:
+                submit_until_full(executor)
+                while in_flight or completed:
+                    # Drain any newly available ordered prefix before waiting
+                    # for more work to finish.
+                    while next_to_yield in completed:
+                        yield completed.pop(next_to_yield)
+                        next_to_yield += 1
+                        submit_until_full(executor)
+                    if not in_flight:
                         continue
-                    yield in_flight.popleft().result()
-                while in_flight:
-                    yield in_flight.popleft().result()
+                    # Wait for whichever batch finishes first, then refill the
+                    # submission window.
+                    done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        completed[in_flight.pop(future)] = future.result()
+                    submit_until_full(executor)
