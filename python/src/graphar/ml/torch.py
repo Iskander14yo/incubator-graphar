@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -20,6 +21,77 @@ class BatchProfile:
     sampling_ms: float
     feature_fetch_ms: float
     conversion_ms: float
+
+
+@dataclass
+class _SampledBatch:
+    seed_nodes: list[int]
+    sampled_nodes: list[int]
+    src_indices: list[int]
+    dst_indices: list[int]
+    num_sampled_nodes: list[int]
+    num_sampled_edges: list[int]
+    sampling_ms: float
+
+
+@dataclass
+class _FeatureWindowMetrics:
+    windows: int = 0
+    window_batches_sum: int = 0
+    window_batches_max: int = 0
+    window_fetch_ms_sum: float = 0.0
+    window_conversion_ms_sum: float = 0.0
+    window_nodes_sum: int = 0
+    window_unique_nodes_sum: int = 0
+
+    def record(
+        self,
+        window_batches: int,
+        window_fetch_ms: float,
+        window_conversion_ms: float,
+        window_nodes: int,
+        window_unique_nodes: int,
+    ) -> None:
+        self.windows += 1
+        self.window_batches_sum += window_batches
+        self.window_batches_max = max(self.window_batches_max, window_batches)
+        self.window_fetch_ms_sum += window_fetch_ms
+        self.window_conversion_ms_sum += window_conversion_ms
+        self.window_nodes_sum += window_nodes
+        self.window_unique_nodes_sum += window_unique_nodes
+
+    def to_dict(self) -> dict[str, float | int]:
+        if self.windows == 0:
+            return {
+                "windows": 0,
+                "window_batches_sum": 0,
+                "window_batches_mean": 0.0,
+                "window_batches_max": 0,
+                "window_fetch_ms_sum": 0.0,
+                "window_fetch_ms_mean": 0.0,
+                "window_conversion_ms_sum": 0.0,
+                "window_conversion_ms_mean": 0.0,
+                "window_nodes_sum": 0,
+                "window_unique_nodes_sum": 0,
+                "window_reuse_ratio": 0.0,
+            }
+        return {
+            "windows": self.windows,
+            "window_batches_sum": self.window_batches_sum,
+            "window_batches_mean": self.window_batches_sum / self.windows,
+            "window_batches_max": self.window_batches_max,
+            "window_fetch_ms_sum": self.window_fetch_ms_sum,
+            "window_fetch_ms_mean": self.window_fetch_ms_sum / self.windows,
+            "window_conversion_ms_sum": self.window_conversion_ms_sum,
+            "window_conversion_ms_mean": self.window_conversion_ms_sum / self.windows,
+            "window_nodes_sum": self.window_nodes_sum,
+            "window_unique_nodes_sum": self.window_unique_nodes_sum,
+            "window_reuse_ratio": (
+                self.window_nodes_sum / self.window_unique_nodes_sum
+                if self.window_unique_nodes_sum
+                else 0.0
+            ),
+        }
 
 
 def _chunked_array_to_tensor(column: pa.ChunkedArray, name: str) -> torch.Tensor:
@@ -108,7 +180,8 @@ class GARNeighborLoader(IterableDataset):
         shuffle: bool = True,
         features: list[str] | None = None,
         num_workers: int = 0,
-        prefetch_batches: int = 0,
+        prefetch_windows: int = 0,
+        feature_buffer_batches: int = 1,
         edge_ram_for_loader_mb: int = 0,
         feature_ram_for_loader_mb: int = 0,
         feature_cursor_count: int = 1,
@@ -123,8 +196,11 @@ class GARNeighborLoader(IterableDataset):
         if num_workers < 0:
             msg = "num_workers must be >= 0"
             raise ValueError(msg)
-        if prefetch_batches < 0:
-            msg = "prefetch_batches must be >= 0"
+        if prefetch_windows < 0:
+            msg = "prefetch_windows must be >= 0"
+            raise ValueError(msg)
+        if feature_buffer_batches <= 0:
+            msg = "feature_buffer_batches must be > 0"
             raise ValueError(msg)
         if edge_ram_for_loader_mb < 0:
             msg = "edge_ram_for_loader_mb must be >= 0"
@@ -145,7 +221,8 @@ class GARNeighborLoader(IterableDataset):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
-        self.prefetch_batches = prefetch_batches
+        self.prefetch_windows = prefetch_windows
+        self.feature_buffer_batches = feature_buffer_batches
         edge_chunk_manager_options = gar_ml._ChunkReadManagerOptions()
         edge_chunk_manager_options.ram_budget_bytes = int(edge_ram_for_loader_mb) * 1024 * 1024
         self._sampling_chunk_manager = gar_ml._ChunkReadManager(edge_chunk_manager_options)
@@ -165,6 +242,8 @@ class GARNeighborLoader(IterableDataset):
         self.features = _properties_for_vertex(graph_info, vertex_type) if features is None else features
         self._rng = torch.Generator()  # used for both dataset shuffling and sampling seeds
         self._rng.manual_seed(int(torch.initial_seed()))
+        self._feature_window_metrics = _FeatureWindowMetrics()
+        self._feature_window_metrics_lock = threading.Lock()
 
     def __len__(self) -> int:
         if self._input_node_count == 0:
@@ -224,12 +303,14 @@ class GARNeighborLoader(IterableDataset):
             "service_ms_max": int(stats.service_ms_max),
         }
 
+    def feature_window_stats(self) -> dict[str, float | int]:
+        with self._feature_window_metrics_lock:
+            return self._feature_window_metrics.to_dict()
+
     def close(self) -> None:
         self._feature_chunk_manager.shutdown()
 
-    def _build_batch(self, seed_nodes: list[int], seed: int) -> tuple[Data, BatchProfile]:
-        t_total = time.perf_counter()
-
+    def _sample_batch(self, seed_nodes: list[int], seed: int) -> _SampledBatch:
         t_s = time.perf_counter()
         sampling = gar_ml.sample_neighbors(
             self.graph_info,
@@ -242,55 +323,115 @@ class GARNeighborLoader(IterableDataset):
         )
         sampling_ms = (time.perf_counter() - t_s) * 1000
 
-        n_id_list = [int(node) for node in sampling.sampled_nodes]
-        src_list = [int(src_idx) for src_idx in sampling.src_indices]
-        dst_list = [int(dst_idx) for dst_idx in sampling.dst_indices]
+        return _SampledBatch(
+            seed_nodes=list(seed_nodes),
+            sampled_nodes=[int(node) for node in sampling.sampled_nodes],
+            src_indices=[int(src_idx) for src_idx in sampling.src_indices],
+            dst_indices=[int(dst_idx) for dst_idx in sampling.dst_indices],
+            num_sampled_nodes=list(sampling.num_sampled_nodes_per_hop),
+            num_sampled_edges=list(sampling.num_sampled_edges_per_hop),
+            sampling_ms=sampling_ms,
+        )
 
-        if src_list:
-            edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-        else:
-            edge_index = torch.empty((2, 0), dtype=torch.long)
+    def _materialize_window(
+        self,
+        sampled_batches: list[_SampledBatch],
+    ) -> list[tuple[Data, BatchProfile]]:
+        if not sampled_batches:
+            return []
+        union_nodes: list[int] = []
+        row_index_by_node: dict[int, int] = {}
+        window_nodes = 0
+        for sampled_batch in sampled_batches:
+            window_nodes += len(sampled_batch.sampled_nodes)
+            for node in sampled_batch.sampled_nodes:
+                if node not in row_index_by_node:
+                    row_index_by_node[node] = len(union_nodes)
+                    union_nodes.append(node)
 
-        feature_fetch_ms = 0.0
-        conversion_ms = 0.0
+        window_fetch_ms = 0.0
+        window_conversion_ms = 0.0
         if self.features:
             t_s = time.perf_counter()
             feature_table = gar_ml.get_node_features(
                 self.graph_info,
                 self.vertex_type,
-                n_id_list,
+                union_nodes,
                 self.features,
                 chunk_manager=self._feature_chunk_manager,
             )
-            feature_fetch_ms = (time.perf_counter() - t_s) * 1000
+            window_fetch_ms = (time.perf_counter() - t_s) * 1000
 
             t_s = time.perf_counter()
-            x = _table_to_feature_tensor(feature_table)
-            conversion_ms = (time.perf_counter() - t_s) * 1000
+            union_x = _table_to_feature_tensor(feature_table)
+            window_conversion_ms = (time.perf_counter() - t_s) * 1000
         else:
-            x = torch.empty((len(n_id_list), 0), dtype=torch.float32)
+            union_x = torch.empty((len(union_nodes), 0), dtype=torch.float32)
 
-        n_id = torch.tensor(n_id_list, dtype=torch.long)
-        input_id = torch.tensor(seed_nodes, dtype=torch.long)
-        num_sampled_nodes = torch.tensor(list(sampling.num_sampled_nodes_per_hop), dtype=torch.long)
-        num_sampled_edges = torch.tensor(list(sampling.num_sampled_edges_per_hop), dtype=torch.long)
+        window_batches = len(sampled_batches)
+        feature_fetch_ms = window_fetch_ms / window_batches
+        conversion_ms = window_conversion_ms / window_batches
+        with self._feature_window_metrics_lock:
+            self._feature_window_metrics.record(
+                window_batches,
+                window_fetch_ms,
+                window_conversion_ms,
+                window_nodes,
+                len(union_nodes),
+            )
 
-        batch = Data(x=x, edge_index=edge_index)
-        batch.batch_size = len(seed_nodes)
-        batch.n_id = n_id
-        batch.input_id = input_id
-        batch.num_sampled_nodes = num_sampled_nodes
-        batch.num_sampled_edges = num_sampled_edges
-        batch.vertex_type = self.vertex_type
-        batch.edge_type = self.edge_type
+        results: list[tuple[Data, BatchProfile]] = []
+        for sampled_batch in sampled_batches:
+            row_indices = torch.tensor(
+                [row_index_by_node[node] for node in sampled_batch.sampled_nodes],
+                dtype=torch.long,
+            )
+            x = union_x.index_select(0, row_indices)
+            if sampled_batch.src_indices:
+                edge_index = torch.tensor(
+                    [sampled_batch.src_indices, sampled_batch.dst_indices],
+                    dtype=torch.long,
+                )
+            else:
+                edge_index = torch.empty((2, 0), dtype=torch.long)
 
-        prof = BatchProfile(
-            total_ms=(time.perf_counter() - t_total) * 1000,
-            sampling_ms=sampling_ms,
-            feature_fetch_ms=feature_fetch_ms,
-            conversion_ms=conversion_ms,
-        )
-        return batch, prof
+            batch = Data(x=x, edge_index=edge_index)
+            batch.batch_size = len(sampled_batch.seed_nodes)
+            batch.n_id = torch.tensor(sampled_batch.sampled_nodes, dtype=torch.long)
+            batch.input_id = torch.tensor(sampled_batch.seed_nodes, dtype=torch.long)
+            batch.num_sampled_nodes = torch.tensor(sampled_batch.num_sampled_nodes, dtype=torch.long)
+            batch.num_sampled_edges = torch.tensor(sampled_batch.num_sampled_edges, dtype=torch.long)
+            batch.vertex_type = self.vertex_type
+            batch.edge_type = self.edge_type
+
+            prof = BatchProfile(
+                total_ms=sampled_batch.sampling_ms + feature_fetch_ms + conversion_ms,
+                sampling_ms=sampled_batch.sampling_ms,
+                feature_fetch_ms=feature_fetch_ms,
+                conversion_ms=conversion_ms,
+            )
+            results.append((batch, prof))
+        return results
+
+    def _build_window(
+        self,
+        window_jobs: list[tuple[list[int], int]],
+    ) -> list[tuple[Data, BatchProfile]]:
+        sampled_batches = [
+            self._sample_batch(seed_nodes, seed)
+            for seed_nodes, seed in window_jobs
+        ]
+        return self._materialize_window(sampled_batches)
+
+    def _iter_input_windows(self) -> Iterator[list[tuple[list[int], int]]]:
+        window: list[tuple[list[int], int]] = []
+        for seed_nodes in self._iter_input_batches():
+            window.append((seed_nodes, self._sample_seed()))
+            if len(window) == self.feature_buffer_batches:
+                yield window
+                window = []
+        if window:
+            yield window
 
     def __iter__(self) -> Iterator[Data]:
         for batch, _ in self._iter_batches():
@@ -302,35 +443,37 @@ class GARNeighborLoader(IterableDataset):
 
     def _iter_batches(self) -> Iterator[tuple[Data, BatchProfile]]:
         """Yields (batch, timings) for both sequential and parallel modes."""
-        jobs = ((nodes, self._sample_seed()) for nodes in self._iter_input_batches())
+        with self._feature_window_metrics_lock:
+            self._feature_window_metrics = _FeatureWindowMetrics()
+        jobs = self._iter_input_windows()
         if self.num_workers == 0:
-            for seed_nodes, seed in jobs:
-                yield self._build_batch(seed_nodes, seed)
+            for window_jobs in jobs:
+                yield from self._build_window(window_jobs)
         else:
             max_pending = (
-                self.prefetch_batches
-                if self.prefetch_batches > 0
+                self.prefetch_windows
+                if self.prefetch_windows > 0
                 else self.num_workers
             )
             next_seq = 0
             next_to_yield = 0
             jobs_exhausted = False
-            # Finished batches can arrive out of order; keep them here until
+            # Finished windows can arrive out of order; keep them here until
             # the next ordered result is ready to yield.
-            completed: dict[int, tuple[Data, BatchProfile]] = {}
+            completed: dict[int, list[tuple[Data, BatchProfile]]] = {}
             in_flight: dict[Future, int] = {}
 
             def submit_until_full(executor: ThreadPoolExecutor) -> None:
                 nonlocal next_seq, jobs_exhausted
-                # Bound submitted-but-not-yielded work to avoid unbounded batch
+                # Bound submitted-but-not-yielded work to avoid unbounded window
                 # buffering while still letting workers run past a slow head.
                 while not jobs_exhausted and len(in_flight) + len(completed) < max_pending:
                     try:
-                        seed_nodes, seed = next(jobs)
+                        window_jobs = next(jobs)
                     except StopIteration:
                         jobs_exhausted = True
                         return
-                    future = executor.submit(self._build_batch, seed_nodes, seed)
+                    future = executor.submit(self._build_window, window_jobs)
                     in_flight[future] = next_seq
                     next_seq += 1
 
@@ -340,12 +483,13 @@ class GARNeighborLoader(IterableDataset):
                     # Drain any newly available ordered prefix before waiting
                     # for more work to finish.
                     while next_to_yield in completed:
-                        yield completed.pop(next_to_yield)
+                        for batch_and_profile in completed.pop(next_to_yield):
+                            yield batch_and_profile
                         next_to_yield += 1
                         submit_until_full(executor)
                     if not in_flight:
                         continue
-                    # Wait for whichever batch finishes first, then refill the
+                    # Wait for whichever window finishes first, then refill the
                     # submission window.
                     done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
                     for future in done:
