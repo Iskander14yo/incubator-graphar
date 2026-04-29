@@ -136,6 +136,10 @@ class ChunkReadManager {
 
   ChunkReadStats stats() const;
   FeatureCursorStats feature_cursor_stats() const;
+  void RegisterFeatureRequest();
+  void CompleteFeatureRequest(std::chrono::steady_clock::time_point start,
+                              bool ok);
+  void RecordFeatureBatchServed(size_t rows);
   void Shutdown();
 
  private:
@@ -155,9 +159,6 @@ class ChunkReadManager {
   };
 
   bool HasFeatureCursor() const;
-  void RegisterFeatureRequest();
-  void CompleteFeatureRequest(Clock::time_point start, bool ok);
-  void RecordFeatureBatchServed(size_t rows);
   void RecordResult(const TableResult& result);
   TablePtr LookupRamCacheLocked(const ChunkReadKey& key);
   void InsertRamCacheLocked(const ChunkReadKey& key, const TablePtr& table);
