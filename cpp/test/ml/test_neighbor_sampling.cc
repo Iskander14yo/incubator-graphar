@@ -12,6 +12,7 @@
 #include "graphar/filesystem.h"
 #include "graphar/graph_info.h"
 #include "graphar/ml/chunk_read_manager.h"
+#include "graphar/ml/feature_pipeline.h"
 #include "graphar/ml/neighbor_sampling.h"
 #include "graphar/reader_util.h"
 #include "graphar/writer_util.h"
@@ -241,6 +242,14 @@ ChunkReadManager MakeFeatureManagedChunkReader(size_t cursor_count = 1,
   options.feature_cursor_count = cursor_count;
   options.feature_cursor_trail_capacity_chunks = trail_capacity;
   return ChunkReadManager(options);
+}
+
+std::shared_ptr<ChunkReadManager> MakeSharedFeatureManagedChunkReader(
+    size_t cursor_count = 1, size_t trail_capacity = 10) {
+  ChunkReadManagerOptions options;
+  options.feature_cursor_count = cursor_count;
+  options.feature_cursor_trail_capacity_chunks = trail_capacity;
+  return std::make_shared<ChunkReadManager>(options);
 }
 
 }  // namespace
@@ -553,6 +562,60 @@ TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - unordered node ids") {
 }
 
 /////////////////////////// Feature Cursor //////////////////////////////////////
+
+TEST_CASE_METHOD(
+    GlobalFixture,
+    "Feature pipeline merges batches that share a feature chunk key") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  auto chunk_manager = MakeSharedFeatureManagedChunkReader(1);
+
+  FeaturePipelineOptions options;
+  options.num_readers = 1;
+  options.num_stitchers = 2;
+  options.max_active_batches = 4;
+  options.max_queued_chunk_reads = 4;
+  options.max_queued_stitch_tasks = 8;
+  FeaturePipelineCoordinator coordinator(chunk_manager, options);
+
+  auto expected_first = GetNodeFeatures(graph_info, kVertexType, {0, 1}, {"id"});
+  auto expected_second =
+      GetNodeFeatures(graph_info, kVertexType, {5, 1, 3, 0}, {"id"});
+  REQUIRE(expected_first.status().ok());
+  REQUIRE(expected_second.status().ok());
+
+  auto first_handle =
+      coordinator.SubmitSampledBatch(graph_info, kVertexType, {0, 1}, {"id"});
+  auto second_handle = coordinator.SubmitSampledBatch(
+      graph_info, kVertexType, {5, 1, 3, 0}, {"id"});
+  REQUIRE(first_handle.status().ok());
+  REQUIRE(second_handle.status().ok());
+
+  auto first = first_handle.value()->Wait();
+  auto second = second_handle.value()->Wait();
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+  REQUIRE(first.value()->Equals(*expected_first.value()));
+  REQUIRE(second.value()->Equals(*expected_second.value()));
+
+  const auto pipeline_stats = coordinator.Stats();
+  REQUIRE(pipeline_stats.submitted_batches == 2);
+  REQUIRE(pipeline_stats.completed_batches == 2);
+  REQUIRE(pipeline_stats.pending_batches_peak >= 1);
+  REQUIRE(pipeline_stats.active_chunk_keys_peak == 1);
+  REQUIRE(pipeline_stats.chunk_subscriptions == 2);
+  REQUIRE(pipeline_stats.chunk_reads == 1);
+  REQUIRE(pipeline_stats.chunk_reuses == 1);
+  REQUIRE(pipeline_stats.stitch_tasks == 2);
+
+  const auto cursor_stats = chunk_manager->feature_cursor_stats();
+  REQUIRE(cursor_stats.requests == 2);
+  REQUIRE(cursor_stats.requests_completed == 2);
+  REQUIRE(cursor_stats.requests_failed == 0);
+  REQUIRE(cursor_stats.chunks_read == 1);
+  REQUIRE(cursor_stats.chunks_served == 1);
+  REQUIRE(cursor_stats.rows_served == 6);
+  REQUIRE(cursor_stats.batches_served == 2);
+}
 
 TEST_CASE_METHOD(
     GlobalFixture,
