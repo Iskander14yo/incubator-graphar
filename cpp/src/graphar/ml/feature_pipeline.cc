@@ -361,7 +361,7 @@ struct FeaturePipelineCoordinator::Impl {
 
     std::shared_ptr<ActiveChunk> active_chunk;
     TablePtr ready_table;
-    Status chunk_error = Status::OK();
+    std::unique_ptr<Status> chunk_error;
     bool enqueue_read = false;
     bool enqueue_stitch = false;
 
@@ -400,7 +400,7 @@ struct FeaturePipelineCoordinator::Impl {
         active_chunk = it->second;
         chunk_reuses_.fetch_add(1, std::memory_order_relaxed);
         if (active_chunk->failed) {
-          chunk_error = active_chunk->error;
+          chunk_error = std::make_unique<Status>(active_chunk->error);
         } else if (active_chunk->ready) {
           active_chunk->in_flight_stitches += 1;
           ready_table = active_chunk->table;
@@ -415,8 +415,8 @@ struct FeaturePipelineCoordinator::Impl {
       read_cv_.notify_one();
       return Status::OK();
     }
-    if (!chunk_error.ok()) {
-      return chunk_error;
+    if (chunk_error != nullptr) {
+      return std::move(*chunk_error);
     }
     if (!enqueue_stitch) {
       return Status::OK();
