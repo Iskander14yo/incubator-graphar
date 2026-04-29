@@ -1,6 +1,7 @@
 #include "graphar/ml/neighbor_sampling.h"
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <random>
 #include <unordered_map>
@@ -364,6 +365,25 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
     }
   }
 
+  struct FeatureRequestTracker {
+    ChunkReadManager* manager = nullptr;
+    std::chrono::steady_clock::time_point start;
+    bool ok = false;
+
+    ~FeatureRequestTracker() {
+      if (manager != nullptr) {
+        manager->CompleteFeatureRequest(start, ok);
+      }
+    }
+  };
+
+  FeatureRequestTracker tracker;
+  if (chunk_manager != nullptr && chunk_manager->HasFeatureCursor()) {
+    chunk_manager->RegisterFeatureRequest();
+    tracker.manager = chunk_manager;
+    tracker.start = std::chrono::steady_clock::now();
+  }
+
   // Group properties by their property group
   std::unordered_map<std::shared_ptr<PropertyGroup>,
                      std::vector<std::string>>
@@ -377,9 +397,8 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
     pg_to_props[pg].push_back(prop);
   }
 
-  // Build Arrow schema and arrays for result
-  std::vector<std::shared_ptr<arrow::Field>> schema_fields;
-  std::vector<std::shared_ptr<arrow::Array>> result_arrays;
+  std::unordered_map<std::string, std::shared_ptr<arrow::Array>>
+      result_array_by_property;
 
   // For each property group, read the data
   for (const auto& [pg, props] : pg_to_props) {
@@ -444,12 +463,22 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
         if (!column) {
           return Status::Invalid("Column '", prop, "' not found in chunk");
         }
+        auto combined_result = arrow::Table::Make(
+            arrow::schema({arrow::field(prop, column->type())}), {column})
+                                   ->CombineChunks();
+        if (!combined_result.ok()) {
+          return Status::ArrowError(combined_result.status().ToString());
+        }
+        auto combined_column = combined_result.ValueOrDie()->column(0);
         auto take_result =
-            arrow::compute::Take(column->chunk(0), take_indices);
+            arrow::compute::Take(combined_column->chunk(0), take_indices);
         if (!take_result.ok()) {
           return Status::ArrowError(take_result.status().ToString());
         }
         prop_taken[prop].push_back(take_result.ValueOrDie().make_array());
+      }
+      if (tracker.manager != nullptr) {
+        tracker.manager->RecordFeatureBatchServed(indices.size());
       }
 
       for (size_t idx : indices) {
@@ -482,16 +511,33 @@ Result<std::shared_ptr<arrow::Table>> GetNodeFeatures(
 
       auto prop_type_result = vertex_info->GetPropertyType(prop);
       GAR_RETURN_NOT_OK(prop_type_result.status());
-      auto arrow_type =
-          DataType::DataTypeToArrowDataType(prop_type_result.value());
-
-      schema_fields.push_back(arrow::field(prop, arrow_type));
-      result_arrays.push_back(reorder_result.ValueOrDie().make_array());
+      result_array_by_property[prop] = reorder_result.ValueOrDie().make_array();
     }
+  }
+
+  // Rebuild columns in the exact order requested by the caller.
+  std::vector<std::shared_ptr<arrow::Field>> schema_fields;
+  std::vector<std::shared_ptr<arrow::Array>> result_arrays;
+  schema_fields.reserve(properties.size());
+  result_arrays.reserve(properties.size());
+  for (const auto& prop : properties) {
+    auto array_it = result_array_by_property.find(prop);
+    if (array_it == result_array_by_property.end()) {
+      return Status::Invalid("No feature data collected for property '", prop,
+                             "'");
+    }
+    auto prop_type_result = vertex_info->GetPropertyType(prop);
+    GAR_RETURN_NOT_OK(prop_type_result.status());
+    auto arrow_type =
+        DataType::DataTypeToArrowDataType(prop_type_result.value());
+
+    schema_fields.push_back(arrow::field(prop, arrow_type));
+    result_arrays.push_back(array_it->second);
   }
 
   // Create final table
   auto schema = arrow::schema(schema_fields);
+  tracker.ok = true;
   return arrow::Table::Make(schema, result_arrays, node_ids.size());
 }
 

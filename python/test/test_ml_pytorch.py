@@ -8,6 +8,7 @@ import torch
 from torch_geometric.data import Data
 
 import graphar as gar
+import graphar.ml.torch as gar_torch
 from graphar.ml.torch import BatchProfile, GARNeighborLoader
 
 
@@ -26,7 +27,9 @@ def _make_loader(
     shuffle=False,
     features=None,
     num_workers=0,
-    ram_for_loader_mb=0,
+    prefetch_batches=0,
+    edge_ram_for_loader_mb=0,
+    feature_ram_for_loader_mb=0,
 ):
     if num_neighbors is None:
         num_neighbors = [5]
@@ -40,7 +43,9 @@ def _make_loader(
         shuffle=shuffle,
         features=features,
         num_workers=num_workers,
-        ram_for_loader_mb=ram_for_loader_mb,
+        prefetch_batches=prefetch_batches,
+        edge_ram_for_loader_mb=edge_ram_for_loader_mb,
+        feature_ram_for_loader_mb=feature_ram_for_loader_mb,
     )
     return GARNeighborLoader(**kwargs)
 
@@ -165,6 +170,24 @@ def test_input_nodes_none_uses_all_nodes(ldbc_graph):
     assert batch.input_id.tolist() == [0, 1, 2, 3]
 
 
+def test_input_nodes_none_shuffle_false_is_lazy(ldbc_graph):
+    with mock.patch.object(
+        gar_torch,
+        "_normalize_input_nodes",
+        side_effect=AssertionError("lazy all-node path should bypass normalization"),
+    ):
+        loader = _make_loader(
+            ldbc_graph,
+            input_nodes=None,
+            features=["id"],
+            batch_size=4,
+            shuffle=False,
+        )
+
+    assert loader._input_nodes is None
+    assert loader._input_node_count == ldbc_graph.get_vertex_count("person")
+
+
 def test_empty_input_nodes_yields_no_batches(ldbc_graph):
     loader = _make_loader(ldbc_graph, input_nodes=[], features=["id"], batch_size=2, shuffle=False)
     assert list(iter(loader)) == []
@@ -210,7 +233,7 @@ def test_chunk_manager_uses_ram_budget(ldbc_graph):
         features=["id"],
         batch_size=2,
         shuffle=False,
-        ram_for_loader_mb=1,
+        edge_ram_for_loader_mb=1,
     )
     list(loader)
 
@@ -218,6 +241,47 @@ def test_chunk_manager_uses_ram_budget(ldbc_graph):
     assert stats["requests"] > 0
     assert stats["ram_cache_misses"] > 0
     assert stats["ram_cache_bytes"] > 0
+
+
+def test_feature_chunk_manager_uses_separate_ram_budget(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        edge_ram_for_loader_mb=0,
+        feature_ram_for_loader_mb=1,
+    )
+    list(loader)
+
+    sampling_stats = loader.chunk_manager_stats()
+    feature_stats = loader.feature_chunk_manager_stats()
+    assert sampling_stats["ram_cache_bytes"] == 0
+    assert feature_stats["requests"] > 0
+    assert feature_stats["ram_cache_misses"] > 0
+    assert feature_stats["ram_cache_bytes"] > 0
+
+
+def test_feature_chunk_manager_cache_can_be_disabled(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        edge_ram_for_loader_mb=1,
+        feature_ram_for_loader_mb=0,
+    )
+    list(loader)
+
+    sampling_stats = loader.chunk_manager_stats()
+    feature_stats = loader.feature_chunk_manager_stats()
+    assert sampling_stats["ram_cache_bytes"] > 0
+    assert feature_stats["requests"] > 0
+    assert feature_stats["ram_cache_hits"] == 0
+    assert feature_stats["ram_cache_misses"] == 0
+    assert feature_stats["ram_cache_bytes"] == 0
 
 
 def test_chunk_manager_is_used_for_sampling_without_features(ldbc_graph):
@@ -236,9 +300,19 @@ def test_chunk_manager_is_used_for_sampling_without_features(ldbc_graph):
     assert stats["failed"] == 0
 
 
-def test_negative_ram_for_loader_is_rejected(ldbc_graph):
-    with pytest.raises(ValueError, match="ram_for_loader_mb"):
-        _make_loader(ldbc_graph, ram_for_loader_mb=-1)
+def test_negative_edge_ram_for_loader_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="edge_ram_for_loader_mb"):
+        _make_loader(ldbc_graph, edge_ram_for_loader_mb=-1)
+
+
+def test_negative_prefetch_batches_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="prefetch_batches"):
+        _make_loader(ldbc_graph, prefetch_batches=-1)
+
+
+def test_negative_feature_ram_for_loader_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="feature_ram_for_loader_mb"):
+        _make_loader(ldbc_graph, feature_ram_for_loader_mb=-1)
 
 
 def test_valid_batch_with_zero_fanout(ldbc_graph):
@@ -424,3 +498,51 @@ def test_bounded_prefetch_limits_concurrency(ldbc_graph):
         list(loader)
 
     assert peak <= num_workers
+
+
+def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=list(range(10)),
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        num_workers=2,
+        prefetch_batches=4,
+    )
+
+    real_build = loader._build_batch
+    release_first = threading.Event()
+    started_fourth = threading.Event()
+    started_batches = set()
+    started_lock = threading.Lock()
+    thread_error = []
+
+    def tracked_build(seed_nodes, seed):
+        batch_idx = seed_nodes[0] // 2
+        with started_lock:
+            started_batches.add(batch_idx)
+            if batch_idx == 3:
+                started_fourth.set()
+        if batch_idx == 0:
+            if not release_first.wait(timeout=5.0):
+                raise TimeoutError("timed out waiting to release first batch")
+        return real_build(seed_nodes, seed)
+
+    def consume():
+        try:
+            list(loader)
+        except Exception as exc:  # pragma: no cover - surfaced by assertion below
+            thread_error.append(exc)
+
+    with mock.patch.object(loader, "_build_batch", side_effect=tracked_build):
+        consumer = threading.Thread(target=consume)
+        consumer.start()
+        assert started_fourth.wait(timeout=5.0)
+        with started_lock:
+            assert started_batches >= {0, 1, 2, 3}
+        release_first.set()
+        consumer.join(timeout=10.0)
+
+    assert not consumer.is_alive()
+    assert thread_error == []

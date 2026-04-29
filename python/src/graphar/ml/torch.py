@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import time
-from collections import deque
 from collections.abc import Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 
 import pyarrow as pa
@@ -80,6 +79,20 @@ def _normalize_input_nodes(
     return [int(node) for node in input_nodes]
 
 
+def _chunk_read_stats_to_dict(stats) -> dict[str, int]:
+    return {
+        "requests": int(stats.requests),
+        "leaders": int(stats.leaders),
+        "waiters": int(stats.waiters),
+        "completed": int(stats.completed),
+        "failed": int(stats.failed),
+        "ram_cache_hits": int(stats.ram_cache_hits),
+        "ram_cache_misses": int(stats.ram_cache_misses),
+        "ram_cache_evictions": int(stats.ram_cache_evictions),
+        "ram_cache_bytes": int(stats.ram_cache_bytes),
+    }
+
+
 
 class GARNeighborLoader(IterableDataset):
     """Minimal PyG-compatible neighbor loader over GraphAr APIs."""
@@ -95,7 +108,11 @@ class GARNeighborLoader(IterableDataset):
         shuffle: bool = True,
         features: list[str] | None = None,
         num_workers: int = 0,
-        ram_for_loader_mb: int = 0,
+        prefetch_batches: int = 0,
+        edge_ram_for_loader_mb: int = 0,
+        feature_ram_for_loader_mb: int = 0,
+        feature_cursor_count: int = 1,
+        feature_cursor_trail_chunks: int = 10,
     ) -> None:
         if batch_size <= 0:
             msg = "batch_size must be > 0"
@@ -106,8 +123,20 @@ class GARNeighborLoader(IterableDataset):
         if num_workers < 0:
             msg = "num_workers must be >= 0"
             raise ValueError(msg)
-        if ram_for_loader_mb < 0:
-            msg = "ram_for_loader_mb must be >= 0"
+        if prefetch_batches < 0:
+            msg = "prefetch_batches must be >= 0"
+            raise ValueError(msg)
+        if edge_ram_for_loader_mb < 0:
+            msg = "edge_ram_for_loader_mb must be >= 0"
+            raise ValueError(msg)
+        if feature_ram_for_loader_mb < 0:
+            msg = "feature_ram_for_loader_mb must be >= 0"
+            raise ValueError(msg)
+        if feature_cursor_count <= 0:
+            msg = "feature_cursor_count must be > 0"
+            raise ValueError(msg)
+        if feature_cursor_trail_chunks < 0:
+            msg = "feature_cursor_trail_chunks must be >= 0"
             raise ValueError(msg)
         self.graph_info = graph_info
         self.vertex_type = vertex_type
@@ -116,24 +145,40 @@ class GARNeighborLoader(IterableDataset):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
-        chunk_manager_options = gar_ml._ChunkReadManagerOptions()
-        chunk_manager_options.ram_budget_bytes = int(ram_for_loader_mb) * 1024 * 1024
-        self._chunk_manager = gar_ml._ChunkReadManager(chunk_manager_options)
-        self._input_nodes = list(dict.fromkeys(  #  dict.fromkeys preserves insertion order
-            _normalize_input_nodes(graph_info, vertex_type, input_nodes)
-        ))
+        self.prefetch_batches = prefetch_batches
+        edge_chunk_manager_options = gar_ml._ChunkReadManagerOptions()
+        edge_chunk_manager_options.ram_budget_bytes = int(edge_ram_for_loader_mb) * 1024 * 1024
+        self._sampling_chunk_manager = gar_ml._ChunkReadManager(edge_chunk_manager_options)
+        feature_chunk_manager_options = gar_ml._ChunkReadManagerOptions()
+        feature_chunk_manager_options.ram_budget_bytes = int(feature_ram_for_loader_mb) * 1024 * 1024
+        feature_chunk_manager_options.feature_cursor_count = int(feature_cursor_count)
+        feature_chunk_manager_options.feature_cursor_trail_capacity_chunks = int(feature_cursor_trail_chunks)
+        self._feature_chunk_manager = gar_ml._ChunkReadManager(feature_chunk_manager_options)
+        if input_nodes is None and not shuffle:
+            self._input_nodes = None
+            self._input_node_count = graph_info.get_vertex_count(vertex_type)
+        else:
+            self._input_nodes = list(dict.fromkeys(  # dict.fromkeys preserves insertion order
+                _normalize_input_nodes(graph_info, vertex_type, input_nodes)
+            ))
+            self._input_node_count = len(self._input_nodes)
         self.features = _properties_for_vertex(graph_info, vertex_type) if features is None else features
         self._rng = torch.Generator()  # used for both dataset shuffling and sampling seeds
         self._rng.manual_seed(int(torch.initial_seed()))
 
     def __len__(self) -> int:
-        if not self._input_nodes:
+        if self._input_node_count == 0:
             return 0
-        return (len(self._input_nodes) + self.batch_size - 1) // self.batch_size
+        return (self._input_node_count + self.batch_size - 1) // self.batch_size
 
     def _iter_input_batches(self) -> Iterator[list[int]]:
-        total = len(self._input_nodes)
+        total = self._input_node_count
         if total == 0:
+            return
+        if self._input_nodes is None:
+            for start in range(0, total, self.batch_size):
+                end = min(start + self.batch_size, total)
+                yield list(range(start, end))
             return
         if self.shuffle:
             order = torch.randperm(total, generator=self._rng).tolist()
@@ -149,18 +194,38 @@ class GARNeighborLoader(IterableDataset):
         )
 
     def chunk_manager_stats(self) -> dict[str, int]:
-        stats = self._chunk_manager.stats()
+        return self.sampling_chunk_manager_stats()
+
+    def sampling_chunk_manager_stats(self) -> dict[str, int]:
+        return _chunk_read_stats_to_dict(self._sampling_chunk_manager.stats())
+
+    def feature_chunk_manager_stats(self) -> dict[str, int]:
+        return _chunk_read_stats_to_dict(self._feature_chunk_manager.stats())
+
+    def feature_cursor_stats(self) -> dict[str, int]:
+        stats = self._feature_chunk_manager.feature_cursor_stats()
         return {
+            "cursor_count": int(stats.cursor_count),
+            "trail_capacity_chunks": int(stats.trail_capacity_chunks),
             "requests": int(stats.requests),
-            "leaders": int(stats.leaders),
-            "waiters": int(stats.waiters),
-            "completed": int(stats.completed),
-            "failed": int(stats.failed),
-            "ram_cache_hits": int(stats.ram_cache_hits),
-            "ram_cache_misses": int(stats.ram_cache_misses),
-            "ram_cache_evictions": int(stats.ram_cache_evictions),
-            "ram_cache_bytes": int(stats.ram_cache_bytes),
+            "requests_completed": int(stats.requests_completed),
+            "requests_failed": int(stats.requests_failed),
+            "active_requests_peak": int(stats.active_requests_peak),
+            "chunks_read": int(stats.chunks_read),
+            "chunks_served": int(stats.chunks_served),
+            "rows_served": int(stats.rows_served),
+            "batches_served": int(stats.batches_served),
+            "trail_hits": int(stats.trail_hits),
+            "trail_misses": int(stats.trail_misses),
+            "trail_evictions": int(stats.trail_evictions),
+            "wait_ms_sum": int(stats.wait_ms_sum),
+            "wait_ms_max": int(stats.wait_ms_max),
+            "service_ms_sum": int(stats.service_ms_sum),
+            "service_ms_max": int(stats.service_ms_max),
         }
+
+    def close(self) -> None:
+        self._feature_chunk_manager.shutdown()
 
     def _build_batch(self, seed_nodes: list[int], seed: int) -> tuple[Data, BatchProfile]:
         t_total = time.perf_counter()
@@ -173,7 +238,7 @@ class GARNeighborLoader(IterableDataset):
             seed_nodes,
             self.num_neighbors,
             seed=seed,
-            chunk_manager=self._chunk_manager,
+            chunk_manager=self._sampling_chunk_manager,
         )
         sampling_ms = (time.perf_counter() - t_s) * 1000
 
@@ -195,7 +260,7 @@ class GARNeighborLoader(IterableDataset):
                 self.vertex_type,
                 n_id_list,
                 self.features,
-                chunk_manager=self._chunk_manager,
+                chunk_manager=self._feature_chunk_manager,
             )
             feature_fetch_ms = (time.perf_counter() - t_s) * 1000
 
@@ -242,12 +307,47 @@ class GARNeighborLoader(IterableDataset):
             for seed_nodes, seed in jobs:
                 yield self._build_batch(seed_nodes, seed)
         else:
-            in_flight: deque[Future] = deque()
+            max_pending = (
+                self.prefetch_batches
+                if self.prefetch_batches > 0
+                else self.num_workers
+            )
+            next_seq = 0
+            next_to_yield = 0
+            jobs_exhausted = False
+            # Finished batches can arrive out of order; keep them here until
+            # the next ordered result is ready to yield.
+            completed: dict[int, tuple[Data, BatchProfile]] = {}
+            in_flight: dict[Future, int] = {}
+
+            def submit_until_full(executor: ThreadPoolExecutor) -> None:
+                nonlocal next_seq, jobs_exhausted
+                # Bound submitted-but-not-yielded work to avoid unbounded batch
+                # buffering while still letting workers run past a slow head.
+                while not jobs_exhausted and len(in_flight) + len(completed) < max_pending:
+                    try:
+                        seed_nodes, seed = next(jobs)
+                    except StopIteration:
+                        jobs_exhausted = True
+                        return
+                    future = executor.submit(self._build_batch, seed_nodes, seed)
+                    in_flight[future] = next_seq
+                    next_seq += 1
+
             with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                for seed_nodes, seed in jobs:
-                    in_flight.append(executor.submit(self._build_batch, seed_nodes, seed))
-                    if len(in_flight) < self.num_workers:
+                submit_until_full(executor)
+                while in_flight or completed:
+                    # Drain any newly available ordered prefix before waiting
+                    # for more work to finish.
+                    while next_to_yield in completed:
+                        yield completed.pop(next_to_yield)
+                        next_to_yield += 1
+                        submit_until_full(executor)
+                    if not in_flight:
                         continue
-                    yield in_flight.popleft().result()
-                while in_flight:
-                    yield in_flight.popleft().result()
+                    # Wait for whichever batch finishes first, then refill the
+                    # submission window.
+                    done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        completed[in_flight.pop(future)] = future.result()
+                    submit_until_full(executor)

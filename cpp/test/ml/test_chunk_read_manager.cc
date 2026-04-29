@@ -31,6 +31,19 @@ ChunkReadKey TestKey(IdType chunk_id = 0) {
   return key;
 }
 
+ChunkReadKey TestEdgeKey(const std::string& dst_type) {
+  ChunkReadKey key;
+  key.kind = ChunkReadKind::kEdgeAdjList;
+  key.graph_prefix = "graph";
+  key.vertex_type = "src";
+  key.edge_type = "knows";
+  key.dst_type = dst_type;
+  key.adj_list_type = AdjListType::ordered_by_source;
+  key.vertex_chunk_id = 0;
+  key.chunk_id = 0;
+  return key;
+}
+
 std::shared_ptr<arrow::Table> MakeTable(int64_t value) {
   arrow::Int64Builder builder;
   REQUIRE(builder.Append(value).ok());
@@ -132,6 +145,66 @@ TEST_CASE("ChunkReadManager does not merge distinct keys") {
   REQUIRE(stats.waiters == 0);
   REQUIRE(stats.completed == 2);
   REQUIRE(stats.failed == 0);
+}
+
+TEST_CASE("ChunkReadManager distinguishes edge keys by dst type") {
+  ChunkReadManagerOptions options;
+  options.ram_budget_bytes = 1024;
+  ChunkReadManager manager(options);
+  std::atomic<int> loader_calls{0};
+  std::atomic<int> started{0};
+
+  const auto key_a = TestEdgeKey("person");
+  const auto key_b = TestEdgeKey("forum");
+  std::vector<ChunkReadManager::TableResult> results(2);
+  std::vector<std::thread> threads;
+  threads.reserve(2);
+
+  for (int i = 0; i < 2; ++i) {
+    threads.emplace_back([&, i]() {
+      const auto& key = i == 0 ? key_a : key_b;
+      const auto value = i == 0 ? 1 : 2;
+      results[i] = manager.GetOrLoad(key, [&]() {
+        loader_calls.fetch_add(1, std::memory_order_relaxed);
+        started.fetch_add(1, std::memory_order_relaxed);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (started.load(std::memory_order_relaxed) < 2 &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return MakeTable(value);
+      });
+    });
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  REQUIRE(loader_calls.load() == 2);
+  REQUIRE(results[0].status().ok());
+  REQUIRE(results[1].status().ok());
+  REQUIRE(results[0].value() != results[1].value());
+
+  auto cached_a = manager.GetOrLoad(key_a, [&]() { return MakeTable(10); });
+  auto cached_b = manager.GetOrLoad(key_b, [&]() { return MakeTable(20); });
+  REQUIRE(cached_a.status().ok());
+  REQUIRE(cached_b.status().ok());
+  REQUIRE(cached_a.value() == results[0].value());
+  REQUIRE(cached_b.value() == results[1].value());
+  REQUIRE(loader_calls.load() == 2);
+
+  const auto stats = manager.stats();
+  // Different dst types must not collapse into one in-flight load.
+  REQUIRE(stats.requests == 4);
+  REQUIRE(stats.leaders == 2);
+  REQUIRE(stats.waiters == 0);
+  REQUIRE(stats.completed == 4);
+  REQUIRE(stats.failed == 0);
+  // Each edge key should also keep its own RAM cache entry.
+  REQUIRE(stats.ram_cache_hits == 2);
+  REQUIRE(stats.ram_cache_misses == 2);
 }
 
 TEST_CASE("ChunkReadManager serves later requests from RAM cache") {

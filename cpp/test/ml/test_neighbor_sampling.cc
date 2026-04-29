@@ -1,13 +1,20 @@
 #include <algorithm>
+#include <filesystem>
+#include <future>
+#include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "arrow/api.h"
+#include "graphar/filesystem.h"
 #include "graphar/graph_info.h"
 #include "graphar/ml/chunk_read_manager.h"
 #include "graphar/ml/neighbor_sampling.h"
+#include "graphar/reader_util.h"
+#include "graphar/writer_util.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -25,6 +32,134 @@ std::shared_ptr<GraphInfo> LoadLdbcSampleGraph(const std::string& test_data_dir)
   REQUIRE(maybe_graph_info.status().ok());
   return maybe_graph_info.value();
 }
+
+void CopyDirectoryTree(const std::filesystem::path& source,
+                       const std::filesystem::path& destination) {
+  std::filesystem::create_directories(destination);
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(
+           source)) {
+    const auto relative = std::filesystem::relative(entry.path(), source);
+    const auto target = destination / relative;
+    if (entry.is_directory()) {
+      std::filesystem::create_directories(target);
+    } else if (entry.is_regular_file()) {
+      std::filesystem::create_directories(target.parent_path());
+      std::filesystem::copy_file(
+          entry.path(), target,
+          std::filesystem::copy_options::overwrite_existing);
+    }
+  }
+}
+
+class MultiRowGroupGraphCopy {
+ public:
+  explicit MultiRowGroupGraphCopy(const std::string& test_data_dir) {
+    root_ = std::filesystem::temp_directory_path() /
+            "graphar_ml_multi_row_group";
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+
+    const auto source_root =
+        std::filesystem::path(test_data_dir) / "ldbc_sample" / "parquet";
+    CopyDirectoryTree(source_root, root_);
+
+    auto maybe_graph_info =
+        GraphInfo::Load((root_ / "ldbc_sample.graph.yml").string());
+    REQUIRE(maybe_graph_info.status().ok());
+    graph_info_ = maybe_graph_info.value();
+
+    auto vertex_info = graph_info_->GetVertexInfo(kVertexType);
+    REQUIRE(vertex_info != nullptr);
+    auto property_group = vertex_info->GetPropertyGroup("id");
+    REQUIRE(property_group != nullptr);
+
+    auto maybe_chunk_path = vertex_info->GetFilePath(property_group, 0);
+    REQUIRE(maybe_chunk_path.status().ok());
+
+    std::string normalized_prefix;
+    auto maybe_fs = FileSystemFromUriOrPath(graph_info_->GetPrefix(),
+                                            &normalized_prefix);
+    REQUIRE(maybe_fs.status().ok());
+    auto fs = maybe_fs.value();
+    const auto chunk_path = normalized_prefix + maybe_chunk_path.value();
+
+    auto maybe_table =
+        fs->ReadFileToTable(chunk_path, property_group->GetFileType());
+    REQUIRE(maybe_table.status().ok());
+
+    auto writer_options =
+        WriterOptions::ParquetOptionBuilder().max_row_group_length(10).build();
+    REQUIRE(fs->WriteTableToFile(maybe_table.value(), FileType::PARQUET,
+                                 chunk_path, writer_options)
+                .ok());
+
+    auto maybe_rewritten =
+        fs->ReadFileToTable(chunk_path, property_group->GetFileType());
+    REQUIRE(maybe_rewritten.status().ok());
+    auto column = maybe_rewritten.value()->GetColumnByName("id");
+    REQUIRE(column != nullptr);
+    REQUIRE(column->num_chunks() > 1);
+  }
+
+  ~MultiRowGroupGraphCopy() {
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+  }
+
+  const std::shared_ptr<GraphInfo>& graph_info() const { return graph_info_; }
+
+ private:
+  std::filesystem::path root_;
+  std::shared_ptr<GraphInfo> graph_info_;
+};
+
+class MissingPropertyChunkGraphCopy {
+ public:
+  explicit MissingPropertyChunkGraphCopy(const std::string& test_data_dir) {
+    root_ = std::filesystem::temp_directory_path() /
+            "graphar_ml_missing_property_chunk";
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+
+    const auto source_root =
+        std::filesystem::path(test_data_dir) / "ldbc_sample" / "parquet";
+    CopyDirectoryTree(source_root, root_);
+
+    auto maybe_graph_info =
+        GraphInfo::Load((root_ / "ldbc_sample.graph.yml").string());
+    REQUIRE(maybe_graph_info.status().ok());
+    graph_info_ = maybe_graph_info.value();
+
+    auto vertex_info = graph_info_->GetVertexInfo(kVertexType);
+    REQUIRE(vertex_info != nullptr);
+    auto property_group = vertex_info->GetPropertyGroup("id");
+    REQUIRE(property_group != nullptr);
+
+    auto maybe_chunk_path = vertex_info->GetFilePath(property_group, 0);
+    REQUIRE(maybe_chunk_path.status().ok());
+
+    std::string normalized_prefix;
+    auto maybe_fs = FileSystemFromUriOrPath(graph_info_->GetPrefix(),
+                                            &normalized_prefix);
+    REQUIRE(maybe_fs.status().ok());
+
+    const auto chunk_path =
+        std::filesystem::path(normalized_prefix + maybe_chunk_path.value());
+    REQUIRE(std::filesystem::exists(chunk_path));
+    REQUIRE(std::filesystem::remove(chunk_path));
+  }
+
+  ~MissingPropertyChunkGraphCopy() {
+    std::error_code ec;
+    std::filesystem::remove_all(root_, ec);
+  }
+
+  const std::shared_ptr<GraphInfo>& graph_info() const { return graph_info_; }
+
+ private:
+  std::filesystem::path root_;
+  std::shared_ptr<GraphInfo> graph_info_;
+};
 
 std::vector<std::pair<IdType, IdType>> ToNodeEdges(
     const SamplingResult& sampling) {
@@ -68,6 +203,44 @@ std::vector<std::string> StringValues(
     }
   }
   return values;
+}
+
+IdType GetVertexNumOrRequire(const std::shared_ptr<GraphInfo>& graph_info,
+                             const std::shared_ptr<VertexInfo>& vertex_info) {
+  auto vertex_num = util::GetVertexNum(graph_info->GetPrefix(), vertex_info);
+  REQUIRE(vertex_num.status().ok());
+  return vertex_num.value();
+}
+
+IdType GetVertexChunkNumOrRequire(
+    const std::shared_ptr<GraphInfo>& graph_info,
+    const std::shared_ptr<VertexInfo>& vertex_info) {
+  auto chunk_num = util::GetVertexChunkNum(graph_info->GetPrefix(), vertex_info);
+  REQUIRE(chunk_num.status().ok());
+  return chunk_num.value();
+}
+
+IdType GetChunkStartNodeId(const std::shared_ptr<GraphInfo>& graph_info,
+                           const std::shared_ptr<VertexInfo>& vertex_info,
+                           IdType chunk_id) {
+  const auto node_id = chunk_id * vertex_info->GetChunkSize();
+  REQUIRE(node_id < GetVertexNumOrRequire(graph_info, vertex_info));
+  return node_id;
+}
+
+Result<std::shared_ptr<arrow::Table>> SubmitAndWaitFeatures(
+    const std::shared_ptr<GraphInfo>& graph_info, ChunkReadManager* manager,
+    const std::string& vertex_type, const std::vector<IdType>& node_ids,
+    const std::vector<std::string>& properties) {
+  return GetNodeFeatures(graph_info, vertex_type, node_ids, properties, manager);
+}
+
+ChunkReadManager MakeFeatureManagedChunkReader(size_t cursor_count = 1,
+                                              size_t trail_capacity = 10) {
+  ChunkReadManagerOptions options;
+  options.feature_cursor_count = cursor_count;
+  options.feature_cursor_trail_capacity_chunks = trail_capacity;
+  return ChunkReadManager(options);
 }
 
 }  // namespace
@@ -291,10 +464,28 @@ TEST_CASE_METHOD(GlobalFixture,
           std::vector<std::string>{"Mahinda", "Eli"});
 }
 
+TEST_CASE_METHOD(
+    GlobalFixture,
+    "GetNodeFeatures preserves requested property order across groups") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  auto manager = MakeFeatureManagedChunkReader();
+  const std::vector<std::string> properties = {"firstName", "id"};
+
+  auto result = GetNodeFeatures(graph_info, kVertexType, {0, 1}, properties);
+  auto managed =
+      GetNodeFeatures(graph_info, kVertexType, {0, 1}, properties, &manager);
+  REQUIRE(result.status().ok());
+  REQUIRE(managed.status().ok());
+
+  REQUIRE(result.value()->ColumnNames() == properties);
+  REQUIRE(managed.value()->ColumnNames() == properties);
+  REQUIRE(managed.value()->Equals(*result.value()));
+}
+
 TEST_CASE_METHOD(GlobalFixture,
                  "GetNodeFeatures - chunk manager matches uncached output") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
-  ChunkReadManager manager;
+  auto manager = MakeFeatureManagedChunkReader();
 
   auto uncached =
       GetNodeFeatures(graph_info, kVertexType, {5, 1, 3, 0}, {"id", "firstName"});
@@ -309,6 +500,7 @@ TEST_CASE_METHOD(GlobalFixture,
   REQUIRE(stats.leaders == stats.requests);
   REQUIRE(stats.completed == stats.requests);
   REQUIRE(stats.failed == 0);
+  REQUIRE(manager.feature_cursor_stats().requests == 1);
 }
 
 TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - empty node list") {
@@ -358,6 +550,284 @@ TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - unordered node ids") {
   REQUIRE(Int64Values(id_column) == std::vector<IdType>{
                                        28587302322727, 6597069767117,
                                        21990232556027, 933});
+}
+
+/////////////////////////// Feature Cursor //////////////////////////////////////
+
+TEST_CASE_METHOD(
+    GlobalFixture,
+    "Cursor-backed feature manager matches direct GetNodeFeatures on ldbc_sample") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  auto chunk_manager = MakeFeatureManagedChunkReader(2);
+
+  const std::vector<IdType> node_ids = {5, 1, 3, 0};
+  const std::vector<std::string> properties = {"id", "firstName"};
+
+  auto expected = GetNodeFeatures(graph_info, kVertexType, node_ids, properties);
+  auto managed = SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType,
+                                       node_ids, properties);
+  REQUIRE(expected.status().ok());
+  REQUIRE(managed.status().ok());
+  REQUIRE(managed.value()->Equals(*expected.value()));
+
+  const auto stats = chunk_manager.feature_cursor_stats();
+  REQUIRE(stats.cursor_count == 2);
+  REQUIRE(stats.requests == 1);
+  REQUIRE(stats.requests_completed == 1);
+  REQUIRE(stats.requests_failed == 0);
+  REQUIRE(stats.chunks_read > 0);
+  REQUIRE(stats.batches_served > 0);
+}
+
+TEST_CASE_METHOD(
+    GlobalFixture,
+    "Cursor-backed feature manager handles concurrent requests for the same chunk") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  auto vertex_info = graph_info->GetVertexInfo(kVertexType);
+  REQUIRE(vertex_info != nullptr);
+  REQUIRE(vertex_info->GetChunkSize() >= 6);
+
+  auto chunk_manager = MakeFeatureManagedChunkReader(1);
+  const std::vector<std::vector<IdType>> node_requests = {
+      {0, 1}, {5, 1, 3, 0}, {2}, {4, 2, 1}, {0, 5}, {3, 4}};
+  std::vector<std::shared_ptr<arrow::Table>> expected_tables(
+      node_requests.size());
+  for (size_t i = 0; i < node_requests.size(); ++i) {
+    auto expected =
+        GetNodeFeatures(graph_info, kVertexType, node_requests[i], {"id"});
+    REQUIRE(expected.status().ok());
+    expected_tables[i] = expected.value();
+  }
+
+  std::promise<void> start_promise;
+  auto start = start_promise.get_future().share();
+  std::vector<std::shared_ptr<arrow::Table>> actual_tables(
+      node_requests.size());
+  std::vector<Status> statuses(
+      node_requests.size(), Status::UnknownError("request not started"));
+  std::vector<std::thread> threads;
+  threads.reserve(node_requests.size());
+
+  for (size_t i = 0; i < node_requests.size(); ++i) {
+    threads.emplace_back([&, i]() {
+      start.wait();
+      auto result = SubmitAndWaitFeatures(graph_info, &chunk_manager,
+                                          kVertexType, node_requests[i],
+                                          {"id"});
+      statuses[i] = result.status();
+      if (!result.has_error()) {
+        actual_tables[i] = result.value();
+      }
+    });
+  }
+
+  start_promise.set_value();
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  uint64_t total_rows_served = 0;
+  for (size_t i = 0; i < node_requests.size(); ++i) {
+    REQUIRE(statuses[i].ok());
+    REQUIRE(actual_tables[i] != nullptr);
+    REQUIRE(actual_tables[i]->Equals(*expected_tables[i]));
+    total_rows_served += static_cast<uint64_t>(node_requests[i].size());
+  }
+
+  const auto stats = chunk_manager.feature_cursor_stats();
+  REQUIRE(stats.requests == node_requests.size());
+  REQUIRE(stats.requests_completed == node_requests.size());
+  REQUIRE(stats.requests_failed == 0);
+  REQUIRE(stats.chunks_read == 1);
+  REQUIRE(stats.chunks_served == 1);
+  REQUIRE(stats.rows_served == total_rows_served);
+  REQUIRE(stats.batches_served == node_requests.size());
+}
+
+TEST_CASE_METHOD(
+    GlobalFixture,
+    "Cursor-backed feature manager serves disjoint chunks across cursors") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  auto vertex_info = graph_info->GetVertexInfo(kVertexType);
+  REQUIRE(vertex_info != nullptr);
+
+  const auto chunk_count = GetVertexChunkNumOrRequire(graph_info, vertex_info);
+  REQUIRE(chunk_count >= 3);
+  const std::vector<IdType> chunk_ids = {0, chunk_count / 2, chunk_count - 1};
+  REQUIRE(chunk_ids[0] < chunk_ids[1]);
+  REQUIRE(chunk_ids[1] < chunk_ids[2]);
+
+  auto chunk_manager = MakeFeatureManagedChunkReader(3);
+  std::promise<void> start_promise;
+  auto start = start_promise.get_future().share();
+  std::vector<std::shared_ptr<arrow::Table>> results(chunk_ids.size());
+  std::vector<Status> statuses(
+      chunk_ids.size(), Status::UnknownError("request not started"));
+  std::vector<std::thread> threads;
+  threads.reserve(chunk_ids.size());
+
+  for (size_t i = 0; i < chunk_ids.size(); ++i) {
+    threads.emplace_back([&, i]() {
+      start.wait();
+      const auto node_id =
+          GetChunkStartNodeId(graph_info, vertex_info, chunk_ids[i]);
+      auto result = SubmitAndWaitFeatures(graph_info, &chunk_manager,
+                                          kVertexType, {node_id}, {"id"});
+      statuses[i] = result.status();
+      if (!result.has_error()) {
+        results[i] = result.value();
+      }
+    });
+  }
+
+  start_promise.set_value();
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  for (size_t i = 0; i < chunk_ids.size(); ++i) {
+    REQUIRE(statuses[i].ok());
+    auto expected =
+        GetNodeFeatures(graph_info, kVertexType,
+                        {GetChunkStartNodeId(graph_info, vertex_info,
+                                             chunk_ids[i])},
+                        {"id"});
+    REQUIRE(expected.status().ok());
+    REQUIRE(results[i] != nullptr);
+    REQUIRE(results[i]->Equals(*expected.value()));
+  }
+
+  const auto stats = chunk_manager.feature_cursor_stats();
+  REQUIRE(stats.cursor_count == 3);
+  REQUIRE(stats.requests == chunk_ids.size());
+  REQUIRE(stats.requests_completed == chunk_ids.size());
+  REQUIRE(stats.requests_failed == 0);
+  REQUIRE(stats.chunks_read == chunk_ids.size());
+  REQUIRE(stats.chunks_served == chunk_ids.size());
+  REQUIRE(stats.rows_served == chunk_ids.size());
+  REQUIRE(stats.batches_served == chunk_ids.size());
+  REQUIRE(stats.trail_hits == 0);
+  REQUIRE(stats.trail_misses == chunk_ids.size());
+}
+
+TEST_CASE_METHOD(
+    GlobalFixture,
+    "Cursor-backed feature manager reuses trail cache for repeated chunk request") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  auto vertex_info = graph_info->GetVertexInfo(kVertexType);
+  REQUIRE(vertex_info != nullptr);
+  REQUIRE(vertex_info->GetChunkSize() >= 4);
+
+  auto chunk_manager = MakeFeatureManagedChunkReader(1, 1);
+
+  auto first_expected = GetNodeFeatures(graph_info, kVertexType, {0, 1}, {"id"});
+  auto second_expected =
+      GetNodeFeatures(graph_info, kVertexType, {2, 3}, {"id"});
+  auto first =
+      SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType, {0, 1},
+                            {"id"});
+  auto second =
+      SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType, {2, 3},
+                            {"id"});
+  REQUIRE(first_expected.status().ok());
+  REQUIRE(second_expected.status().ok());
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+
+  REQUIRE(first.value()->Equals(*first_expected.value()));
+  REQUIRE(second.value()->Equals(*second_expected.value()));
+
+  const auto stats = chunk_manager.feature_cursor_stats();
+  REQUIRE(stats.requests == 2);
+  REQUIRE(stats.requests_completed == 2);
+  REQUIRE(stats.requests_failed == 0);
+  REQUIRE(stats.chunks_read == 1);
+  REQUIRE(stats.chunks_served == 1);
+  REQUIRE(stats.rows_served == 4);
+  REQUIRE(stats.batches_served == 2);
+  REQUIRE(stats.trail_hits == 1);
+  REQUIRE(stats.trail_misses == 1);
+}
+
+TEST_CASE_METHOD(GlobalFixture,
+                 "Cursor-backed feature manager leaves empty node list fast path unchanged") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  auto chunk_manager = MakeFeatureManagedChunkReader(3);
+
+  auto result = SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType,
+                                      {}, {"id"});
+  REQUIRE(result.status().ok());
+  REQUIRE(result.value()->num_rows() == 0);
+
+  const auto stats = chunk_manager.feature_cursor_stats();
+  REQUIRE(stats.cursor_count == 3);
+  REQUIRE(stats.requests == 0);
+  REQUIRE(stats.requests_completed == 0);
+  REQUIRE(stats.requests_failed == 0);
+  REQUIRE(stats.chunks_read == 0);
+  REQUIRE(stats.chunks_served == 0);
+  REQUIRE(stats.rows_served == 0);
+  REQUIRE(stats.batches_served == 0);
+}
+
+TEST_CASE_METHOD(GlobalFixture,
+                 "Cursor-backed feature manager rejects requests after shutdown") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  auto chunk_manager = MakeFeatureManagedChunkReader(1);
+
+  chunk_manager.Shutdown();
+
+  auto result =
+      SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType, {0},
+                            {"id"});
+  REQUIRE(result.has_error());
+  REQUIRE(result.status().IsInvalid());
+  REQUIRE(result.status().message().find("shut down") != std::string::npos);
+
+  const auto stats = chunk_manager.feature_cursor_stats();
+  REQUIRE(stats.requests == 1);
+  REQUIRE(stats.requests_completed == 0);
+  REQUIRE(stats.requests_failed == 1);
+}
+
+TEST_CASE_METHOD(GlobalFixture,
+                 "Cursor-backed feature manager propagates chunk read failures") {
+  MissingPropertyChunkGraphCopy graph_copy(test_data_dir);
+  auto chunk_manager = MakeFeatureManagedChunkReader(1);
+
+  auto result = SubmitAndWaitFeatures(graph_copy.graph_info(), &chunk_manager,
+                                      kVertexType, {0}, {"id"});
+  REQUIRE(result.has_error());
+
+  const auto stats = chunk_manager.feature_cursor_stats();
+  REQUIRE(stats.requests == 1);
+  REQUIRE(stats.requests_completed == 0);
+  REQUIRE(stats.requests_failed == 1);
+  REQUIRE(stats.chunks_read == 1);
+  REQUIRE(stats.chunks_served == 0);
+}
+
+TEST_CASE_METHOD(GlobalFixture,
+                 "Feature reads handle multi-row-group parquet chunks") {
+  auto baseline_graph_info = LoadLdbcSampleGraph(test_data_dir);
+  MultiRowGroupGraphCopy graph_copy(test_data_dir);
+  const std::vector<IdType> node_ids = {0, 15, 27, 99};
+  const std::vector<std::string> properties = {"id"};
+
+  auto expected =
+      GetNodeFeatures(baseline_graph_info, kVertexType, node_ids, properties);
+  REQUIRE(expected.status().ok());
+
+  auto direct = GetNodeFeatures(graph_copy.graph_info(), kVertexType, node_ids,
+                                properties);
+  REQUIRE(direct.status().ok());
+  REQUIRE(direct.value()->Equals(*expected.value()));
+
+  auto chunk_manager = MakeFeatureManagedChunkReader(1);
+  auto managed = SubmitAndWaitFeatures(graph_copy.graph_info(), &chunk_manager,
+                                       kVertexType, node_ids, properties);
+  REQUIRE(managed.status().ok());
+  REQUIRE(managed.value()->Equals(*expected.value()));
 }
 
 }  // namespace graphar::ml
