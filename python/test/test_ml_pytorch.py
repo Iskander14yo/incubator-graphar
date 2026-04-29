@@ -98,7 +98,7 @@ def _make_mock_loader(
     )
 
 
-def _mock_sampling(seed_nodes, *_args, **_kwargs):
+def _mock_sampling(_graph_info, _vertex_type, _edge_type, seed_nodes, *_args, **_kwargs):
     if seed_nodes == [0, 1]:
         return _FakeSampling([0, 1, 10], [0, 1], [2, 2], [2, 1], [2])
     if seed_nodes == [2, 3]:
