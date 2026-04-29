@@ -26,7 +26,7 @@ def _make_loader(
     batch_size=2,
     shuffle=False,
     features=None,
-    num_workers=0,
+    num_samplers=0,
     prefetch_batches=0,
     edge_ram_for_loader_mb=0,
     feature_ram_for_loader_mb=0,
@@ -44,7 +44,7 @@ def _make_loader(
         batch_size=batch_size,
         shuffle=shuffle,
         features=features,
-        num_workers=num_workers,
+        num_samplers=num_samplers,
         prefetch_batches=prefetch_batches,
         edge_ram_for_loader_mb=edge_ram_for_loader_mb,
         feature_ram_for_loader_mb=feature_ram_for_loader_mb,
@@ -377,48 +377,48 @@ def test_loader_keeps_sampler_order(ldbc_graph):
     assert batch.num_sampled_edges.tolist() == [8]
 
 
-def test_multi_worker_matches_single_worker_shuffle_false(ldbc_graph):
-    single_worker_loader = _make_loader(
+def test_multi_sampler_matches_single_sampler_shuffle_false(ldbc_graph):
+    single_sampler_loader = _make_loader(
         ldbc_graph,
         input_nodes=[0, 1, 2, 3, 4, 5],
         features=["id"],
         batch_size=2,
         shuffle=False,
-        num_workers=0,
+        num_samplers=0,
     )
-    multi_worker_loader = _make_loader(
+    multi_sampler_loader = _make_loader(
         ldbc_graph,
         input_nodes=[0, 1, 2, 3, 4, 5],
         features=["id"],
         batch_size=2,
         shuffle=False,
-        num_workers=2,
+        num_samplers=2,
     )
 
-    assert _epoch_signature(single_worker_loader) == _epoch_signature(multi_worker_loader)
+    assert _epoch_signature(single_sampler_loader) == _epoch_signature(multi_sampler_loader)
 
 
-def test_multi_worker_shuffle_false_keeps_batch_order(ldbc_graph):
+def test_multi_sampler_shuffle_false_keeps_batch_order(ldbc_graph):
     loader = _make_loader(
         ldbc_graph,
         input_nodes=[0, 1, 2, 3, 4, 5],
         features=["id"],
         batch_size=2,
         shuffle=False,
-        num_workers=2,
+        num_samplers=2,
     )
 
     assert [batch.input_id.tolist() for batch in loader] == [[0, 1], [2, 3], [4, 5]]
 
 
-def test_multi_worker_is_deterministic_across_sessions(ldbc_graph):
+def test_multi_sampler_is_deterministic_across_sessions(ldbc_graph):
     loader1 = _make_loader(
         ldbc_graph,
         input_nodes=[0, 1, 2, 3, 4, 5],
         features=["id"],
         batch_size=2,
         shuffle=True,
-        num_workers=2,
+        num_samplers=2,
     )
     loader2 = _make_loader(
         ldbc_graph,
@@ -426,7 +426,7 @@ def test_multi_worker_is_deterministic_across_sessions(ldbc_graph):
         features=["id"],
         batch_size=2,
         shuffle=True,
-        num_workers=2,
+        num_samplers=2,
     )
 
     assert _epoch_signature(loader1) == _epoch_signature(loader2)
@@ -476,9 +476,9 @@ def test_profile_batches_match_iter(ldbc_graph):
     assert iter_sig == prof_sig
 
 
-def test_profile_works_with_multi_worker(ldbc_graph):
+def test_profile_works_with_multi_sampler(ldbc_graph):
     loader = _make_loader(
-        ldbc_graph, input_nodes=[0, 1, 2, 3, 4, 5], features=["id"], batch_size=2, num_workers=2
+        ldbc_graph, input_nodes=[0, 1, 2, 3, 4, 5], features=["id"], batch_size=2, num_samplers=2
     )
     pairs = list(loader.profile())
     assert all(isinstance(prof, BatchProfile) for _, prof in pairs)
@@ -490,15 +490,15 @@ def test_profile_works_with_multi_worker(ldbc_graph):
 # ---------------------------------------------------------------------------
 
 def test_bounded_prefetch_limits_concurrency(ldbc_graph):
-    """At most num_workers sampling submissions should run simultaneously."""
-    num_workers = 2
+    """At most num_samplers sampling submissions should run simultaneously."""
+    num_samplers = 2
     loader = _make_loader(
         ldbc_graph,
         input_nodes=list(range(8)),
         features=["id"],
         batch_size=2,
         shuffle=False,
-        num_workers=num_workers,
+        num_samplers=num_samplers,
     )
 
     peak = 0
@@ -520,7 +520,7 @@ def test_bounded_prefetch_limits_concurrency(ldbc_graph):
     with mock.patch.object(loader, "_sample_and_submit_batch", side_effect=tracked_submit):
         list(loader)
 
-    assert peak <= num_workers
+    assert peak <= num_samplers
 
 
 def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
@@ -530,7 +530,7 @@ def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
         features=["id"],
         batch_size=2,
         shuffle=False,
-        num_workers=2,
+        num_samplers=2,
         prefetch_batches=4,
     )
 

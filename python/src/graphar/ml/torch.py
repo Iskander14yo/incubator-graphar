@@ -144,7 +144,7 @@ class GARNeighborLoader(IterableDataset):
         batch_size: int = 128,
         shuffle: bool = True,
         features: list[str] | None = None,
-        num_workers: int = 0,
+        num_samplers: int = 0,
         prefetch_batches: int = 0,
         edge_ram_for_loader_mb: int = 0,
         feature_ram_for_loader_mb: int = 0,
@@ -159,8 +159,8 @@ class GARNeighborLoader(IterableDataset):
         if not num_neighbors:
             msg = "num_neighbors must not be empty"
             raise ValueError(msg)
-        if num_workers < 0:
-            msg = "num_workers must be >= 0"
+        if num_samplers < 0:
+            msg = "num_samplers must be >= 0"
             raise ValueError(msg)
         if prefetch_batches < 0:
             msg = "prefetch_batches must be >= 0"
@@ -191,7 +191,7 @@ class GARNeighborLoader(IterableDataset):
         self.num_neighbors = num_neighbors
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.num_workers = num_workers
+        self.num_samplers = num_samplers
         self.prefetch_batches = prefetch_batches
         self.num_readers = int(num_readers)
         self.num_stitchers = int(num_stitchers)
@@ -239,8 +239,8 @@ class GARNeighborLoader(IterableDataset):
     def _max_pending_batches(self) -> int:
         if self.prefetch_batches > 0:
             return self.prefetch_batches
-        if self.num_workers > 0:
-            return self.num_workers
+        if self.num_samplers > 0:
+            return self.num_samplers
         return 1
 
     def _iter_input_batches(self) -> Iterator[list[int]]:
@@ -398,7 +398,7 @@ class GARNeighborLoader(IterableDataset):
         jobs = ((nodes, self._sample_seed()) for nodes in self._iter_input_batches())
         max_pending = self._max_pending_batches()
 
-        if self.num_workers == 0:
+        if self.num_samplers == 0:
             next_seq = 0
             next_to_yield = 0
             jobs_exhausted = False
@@ -440,7 +440,7 @@ class GARNeighborLoader(IterableDataset):
                 in_flight[future] = next_seq
                 next_seq += 1
 
-        with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.num_samplers) as executor:
             submit_until_full(executor)
             while in_flight or completed:
                 while next_to_yield in completed:
