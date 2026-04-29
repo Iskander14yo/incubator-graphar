@@ -30,6 +30,8 @@ def _make_loader(
     prefetch_batches=0,
     edge_ram_for_loader_mb=0,
     feature_ram_for_loader_mb=0,
+    num_readers=None,
+    num_stitchers=1,
 ):
     if num_neighbors is None:
         num_neighbors = [5]
@@ -46,6 +48,8 @@ def _make_loader(
         prefetch_batches=prefetch_batches,
         edge_ram_for_loader_mb=edge_ram_for_loader_mb,
         feature_ram_for_loader_mb=feature_ram_for_loader_mb,
+        num_readers=num_readers,
+        num_stitchers=num_stitchers,
     )
     return GARNeighborLoader(**kwargs)
 
@@ -284,6 +288,25 @@ def test_feature_chunk_manager_cache_can_be_disabled(ldbc_graph):
     assert feature_stats["ram_cache_bytes"] == 0
 
 
+def test_feature_pipeline_stats_track_submitted_batches(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        prefetch_batches=2,
+    )
+    list(loader)
+
+    stats = loader.feature_pipeline_stats()
+    assert stats["submitted_batches"] == len(loader)
+    assert stats["completed_batches"] == len(loader)
+    assert stats["pending_batches_peak"] >= 1
+    assert stats["chunk_subscriptions"] >= len(loader)
+    assert stats["stitch_tasks"] == stats["chunk_subscriptions"]
+
+
 def test_chunk_manager_is_used_for_sampling_without_features(ldbc_graph):
     loader = _make_loader(
         ldbc_graph,
@@ -467,7 +490,7 @@ def test_profile_works_with_multi_worker(ldbc_graph):
 # ---------------------------------------------------------------------------
 
 def test_bounded_prefetch_limits_concurrency(ldbc_graph):
-    """At most num_workers _build_batch calls should run simultaneously."""
+    """At most num_workers sampling submissions should run simultaneously."""
     num_workers = 2
     loader = _make_loader(
         ldbc_graph,
@@ -481,20 +504,20 @@ def test_bounded_prefetch_limits_concurrency(ldbc_graph):
     peak = 0
     active = 0
     lock = threading.Lock()
-    real_build = loader._build_batch
+    real_submit = loader._sample_and_submit_batch
 
-    def tracked_build(seed_nodes, seed):
+    def tracked_submit(seed_nodes, seed):
         nonlocal peak, active
         with lock:
             active += 1
             peak = max(peak, active)
         try:
-            return real_build(seed_nodes, seed)
+            return real_submit(seed_nodes, seed)
         finally:
             with lock:
                 active -= 1
 
-    with mock.patch.object(loader, "_build_batch", side_effect=tracked_build):
+    with mock.patch.object(loader, "_sample_and_submit_batch", side_effect=tracked_submit):
         list(loader)
 
     assert peak <= num_workers
@@ -511,14 +534,14 @@ def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
         prefetch_batches=4,
     )
 
-    real_build = loader._build_batch
+    real_submit = loader._sample_and_submit_batch
     release_first = threading.Event()
     started_fourth = threading.Event()
     started_batches = set()
     started_lock = threading.Lock()
     thread_error = []
 
-    def tracked_build(seed_nodes, seed):
+    def tracked_submit(seed_nodes, seed):
         batch_idx = seed_nodes[0] // 2
         with started_lock:
             started_batches.add(batch_idx)
@@ -527,7 +550,7 @@ def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
         if batch_idx == 0:
             if not release_first.wait(timeout=5.0):
                 raise TimeoutError("timed out waiting to release first batch")
-        return real_build(seed_nodes, seed)
+        return real_submit(seed_nodes, seed)
 
     def consume():
         try:
@@ -535,7 +558,7 @@ def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
         except Exception as exc:  # pragma: no cover - surfaced by assertion below
             thread_error.append(exc)
 
-    with mock.patch.object(loader, "_build_batch", side_effect=tracked_build):
+    with mock.patch.object(loader, "_sample_and_submit_batch", side_effect=tracked_submit):
         consumer = threading.Thread(target=consume)
         consumer.start()
         assert started_fourth.wait(timeout=5.0)
