@@ -44,6 +44,18 @@ ChunkReadKey TestEdgeKey(const std::string& dst_type) {
   return key;
 }
 
+ChunkReadKey TestOffsetKey(const std::string& dst_type) {
+  ChunkReadKey key;
+  key.kind = ChunkReadKind::kEdgeOffset;
+  key.graph_prefix = "graph";
+  key.vertex_type = "src";
+  key.edge_type = "knows";
+  key.dst_type = dst_type;
+  key.adj_list_type = AdjListType::ordered_by_source;
+  key.vertex_chunk_id = 0;
+  return key;
+}
+
 std::shared_ptr<arrow::Table> MakeTable(int64_t value) {
   arrow::Int64Builder builder;
   REQUIRE(builder.Append(value).ok());
@@ -149,7 +161,7 @@ TEST_CASE("ChunkReadManager does not merge distinct keys") {
 
 TEST_CASE("ChunkReadManager distinguishes edge keys by dst type") {
   ChunkReadManagerOptions options;
-  options.ram_budget_bytes = 1024;
+  options.edge_adj_list_ram_budget_bytes = 1024;
   ChunkReadManager manager(options);
   std::atomic<int> loader_calls{0};
   std::atomic<int> started{0};
@@ -205,6 +217,8 @@ TEST_CASE("ChunkReadManager distinguishes edge keys by dst type") {
   // Each edge key should also keep its own RAM cache entry.
   REQUIRE(stats.ram_cache_hits == 2);
   REQUIRE(stats.ram_cache_misses == 2);
+  REQUIRE(stats.edge_adj_list_ram_cache_hits == 2);
+  REQUIRE(stats.edge_adj_list_ram_cache_misses == 2);
 }
 
 TEST_CASE("ChunkReadManager serves later requests from RAM cache") {
@@ -236,6 +250,48 @@ TEST_CASE("ChunkReadManager serves later requests from RAM cache") {
   REQUIRE(stats.ram_cache_misses == 1);
   REQUIRE(stats.ram_cache_evictions == 0);
   REQUIRE(stats.ram_cache_bytes >= TableBytes(table));
+}
+
+TEST_CASE("ChunkReadManager keeps offset and adjacency RAM caches separate") {
+  ChunkReadManagerOptions options;
+  options.edge_offset_ram_budget_bytes = 1024;
+  ChunkReadManager manager(options);
+  std::atomic<int> offset_loader_calls{0};
+  std::atomic<int> adj_loader_calls{0};
+
+  REQUIRE(manager.GetOrLoad(TestOffsetKey("person"), [&]() {
+                   offset_loader_calls.fetch_add(1, std::memory_order_relaxed);
+                   return MakeTable(1);
+                 })
+              .status()
+              .ok());
+  REQUIRE(manager.GetOrLoad(TestOffsetKey("person"), [&]() {
+                   offset_loader_calls.fetch_add(1, std::memory_order_relaxed);
+                   return MakeTable(2);
+                 })
+              .status()
+              .ok());
+  REQUIRE(manager.GetOrLoad(TestEdgeKey("person"), [&]() {
+                   adj_loader_calls.fetch_add(1, std::memory_order_relaxed);
+                   return MakeTable(3);
+                 })
+              .status()
+              .ok());
+  REQUIRE(manager.GetOrLoad(TestEdgeKey("person"), [&]() {
+                   adj_loader_calls.fetch_add(1, std::memory_order_relaxed);
+                   return MakeTable(4);
+                 })
+              .status()
+              .ok());
+
+  REQUIRE(offset_loader_calls.load() == 1);
+  REQUIRE(adj_loader_calls.load() == 2);
+
+  const auto stats = manager.stats();
+  REQUIRE(stats.edge_offset_ram_cache_hits == 1);
+  REQUIRE(stats.edge_offset_ram_cache_bytes >= TableBytes(MakeTable(1)));
+  REQUIRE(stats.edge_adj_list_ram_cache_hits == 0);
+  REQUIRE(stats.edge_adj_list_ram_cache_bytes == 0);
 }
 
 TEST_CASE("ChunkReadManager zero RAM budget disables cache") {
@@ -335,7 +391,7 @@ TEST_CASE("ChunkReadManager does not cache chunks larger than RAM budget") {
 TEST_CASE_METHOD(GlobalFixture, "ChunkReadManager caches edge offset chunks") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
   ChunkReadManagerOptions options;
-  options.ram_budget_bytes = 1024 * 1024;
+  options.edge_offset_ram_budget_bytes = 1024 * 1024;
   ChunkReadManager manager(options);
 
   auto first = manager.GetEdgeOffsetChunk(
@@ -354,13 +410,15 @@ TEST_CASE_METHOD(GlobalFixture, "ChunkReadManager caches edge offset chunks") {
   REQUIRE(stats.leaders == 1);
   REQUIRE(stats.ram_cache_hits == 1);
   REQUIRE(stats.ram_cache_misses == 1);
+  REQUIRE(stats.edge_offset_ram_cache_hits == 1);
+  REQUIRE(stats.edge_offset_ram_cache_misses == 1);
   REQUIRE(stats.failed == 0);
 }
 
 TEST_CASE_METHOD(GlobalFixture, "ChunkReadManager caches edge adjacency chunks") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
   ChunkReadManagerOptions options;
-  options.ram_budget_bytes = 1024 * 1024;
+  options.edge_adj_list_ram_budget_bytes = 1024 * 1024;
   ChunkReadManager manager(options);
 
   auto first = manager.GetEdgeAdjListChunk(
@@ -380,6 +438,8 @@ TEST_CASE_METHOD(GlobalFixture, "ChunkReadManager caches edge adjacency chunks")
   REQUIRE(stats.leaders == 1);
   REQUIRE(stats.ram_cache_hits == 1);
   REQUIRE(stats.ram_cache_misses == 1);
+  REQUIRE(stats.edge_adj_list_ram_cache_hits == 1);
+  REQUIRE(stats.edge_adj_list_ram_cache_misses == 1);
   REQUIRE(stats.failed == 0);
 }
 

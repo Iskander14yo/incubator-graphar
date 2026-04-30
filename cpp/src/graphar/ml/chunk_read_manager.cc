@@ -430,6 +430,104 @@ bool ChunkReadManager::HasFeatureCursor() const {
   return feature_cursor_ != nullptr;
 }
 
+ChunkReadManager::CacheDomain ChunkReadManager::CacheDomainFor(
+    const ChunkReadKey& key) const {
+  switch (key.kind) {
+  case ChunkReadKind::kVertexProperty:
+    return CacheDomain::kVertexProperty;
+  case ChunkReadKind::kEdgeOffset:
+    return CacheDomain::kEdgeOffset;
+  case ChunkReadKind::kEdgeAdjList:
+    return CacheDomain::kEdgeAdjList;
+  }
+  return CacheDomain::kVertexProperty;
+}
+
+void ChunkReadManager::RecordRamCacheHit(CacheDomain domain) {
+  switch (domain) {
+  case CacheDomain::kVertexProperty:
+    vertex_property_ram_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeOffset:
+    edge_offset_ram_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeAdjList:
+    edge_adj_list_ram_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  return;
+}
+
+void ChunkReadManager::RecordRamCacheMiss(CacheDomain domain) {
+  switch (domain) {
+  case CacheDomain::kVertexProperty:
+    vertex_property_ram_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeOffset:
+    edge_offset_ram_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeAdjList:
+    edge_adj_list_ram_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  return;
+}
+
+void ChunkReadManager::RecordRamCacheEviction(CacheDomain domain) {
+  switch (domain) {
+  case CacheDomain::kVertexProperty:
+    vertex_property_ram_cache_evictions_.fetch_add(1,
+                                                   std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeOffset:
+    edge_offset_ram_cache_evictions_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeAdjList:
+    edge_adj_list_ram_cache_evictions_.fetch_add(1,
+                                                 std::memory_order_relaxed);
+    return;
+  }
+  return;
+}
+
+ChunkReadManager::CacheStore* ChunkReadManager::CacheStoreFor(
+    CacheDomain domain) {
+  switch (domain) {
+  case CacheDomain::kVertexProperty:
+    return &vertex_property_ram_cache_;
+  case CacheDomain::kEdgeOffset:
+    return &edge_offset_ram_cache_;
+  case CacheDomain::kEdgeAdjList:
+    return &edge_adj_list_ram_cache_;
+  }
+  return &vertex_property_ram_cache_;
+}
+
+const ChunkReadManager::CacheStore* ChunkReadManager::CacheStoreFor(
+    CacheDomain domain) const {
+  switch (domain) {
+  case CacheDomain::kVertexProperty:
+    return &vertex_property_ram_cache_;
+  case CacheDomain::kEdgeOffset:
+    return &edge_offset_ram_cache_;
+  case CacheDomain::kEdgeAdjList:
+    return &edge_adj_list_ram_cache_;
+  }
+  return &vertex_property_ram_cache_;
+}
+
+size_t ChunkReadManager::RamBudgetBytesFor(CacheDomain domain) const {
+  switch (domain) {
+  case CacheDomain::kVertexProperty:
+    return options_.ram_budget_bytes;
+  case CacheDomain::kEdgeOffset:
+    return options_.edge_offset_ram_budget_bytes;
+  case CacheDomain::kEdgeAdjList:
+    return options_.edge_adj_list_ram_budget_bytes;
+  }
+  return options_.ram_budget_bytes;
+}
+
 void ChunkReadManager::RegisterFeatureRequest() {
   if (feature_cursor_ != nullptr) {
     feature_cursor_->RegisterRequest();
@@ -451,18 +549,20 @@ void ChunkReadManager::RecordFeatureBatchServed(size_t rows) {
 ChunkReadManager::TableResult ChunkReadManager::GetOrLoad(
     const ChunkReadKey& key, const TableLoader& loader) {
   requests_.fetch_add(1, std::memory_order_relaxed);
+  const auto domain = CacheDomainFor(key);
+  const size_t ram_budget_bytes = RamBudgetBytesFor(domain);
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto cached = LookupRamCacheLocked(key);
     if (cached != nullptr) {
-      ram_cache_hits_.fetch_add(1, std::memory_order_relaxed);
+      RecordRamCacheHit(domain);
       TableResult result = cached;
       RecordResult(result);
       return result;
     }
-    if (options_.ram_budget_bytes > 0) {
-      ram_cache_misses_.fetch_add(1, std::memory_order_relaxed);
+    if (ram_budget_bytes > 0) {
+      RecordRamCacheMiss(domain);
     }
   }
 
@@ -657,13 +757,41 @@ ChunkReadStats ChunkReadManager::stats() const {
   stats.waiters = waiters_.load(std::memory_order_relaxed);
   stats.completed = completed_.load(std::memory_order_relaxed);
   stats.failed = failed_.load(std::memory_order_relaxed);
-  stats.ram_cache_hits = ram_cache_hits_.load(std::memory_order_relaxed);
-  stats.ram_cache_misses = ram_cache_misses_.load(std::memory_order_relaxed);
-  stats.ram_cache_evictions =
-      ram_cache_evictions_.load(std::memory_order_relaxed);
+  stats.vertex_property_ram_cache_hits =
+      vertex_property_ram_cache_hits_.load(std::memory_order_relaxed);
+  stats.vertex_property_ram_cache_misses =
+      vertex_property_ram_cache_misses_.load(std::memory_order_relaxed);
+  stats.vertex_property_ram_cache_evictions =
+      vertex_property_ram_cache_evictions_.load(std::memory_order_relaxed);
+  stats.edge_offset_ram_cache_hits =
+      edge_offset_ram_cache_hits_.load(std::memory_order_relaxed);
+  stats.edge_offset_ram_cache_misses =
+      edge_offset_ram_cache_misses_.load(std::memory_order_relaxed);
+  stats.edge_offset_ram_cache_evictions =
+      edge_offset_ram_cache_evictions_.load(std::memory_order_relaxed);
+  stats.edge_adj_list_ram_cache_hits =
+      edge_adj_list_ram_cache_hits_.load(std::memory_order_relaxed);
+  stats.edge_adj_list_ram_cache_misses =
+      edge_adj_list_ram_cache_misses_.load(std::memory_order_relaxed);
+  stats.edge_adj_list_ram_cache_evictions =
+      edge_adj_list_ram_cache_evictions_.load(std::memory_order_relaxed);
+  stats.ram_cache_hits = stats.vertex_property_ram_cache_hits +
+                         stats.edge_offset_ram_cache_hits +
+                         stats.edge_adj_list_ram_cache_hits;
+  stats.ram_cache_misses = stats.vertex_property_ram_cache_misses +
+                           stats.edge_offset_ram_cache_misses +
+                           stats.edge_adj_list_ram_cache_misses;
+  stats.ram_cache_evictions = stats.vertex_property_ram_cache_evictions +
+                              stats.edge_offset_ram_cache_evictions +
+                              stats.edge_adj_list_ram_cache_evictions;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    stats.ram_cache_bytes = ram_cache_bytes_;
+    stats.vertex_property_ram_cache_bytes = vertex_property_ram_cache_.bytes;
+    stats.edge_offset_ram_cache_bytes = edge_offset_ram_cache_.bytes;
+    stats.edge_adj_list_ram_cache_bytes = edge_adj_list_ram_cache_.bytes;
+    stats.ram_cache_bytes = stats.vertex_property_ram_cache_bytes +
+                            stats.edge_offset_ram_cache_bytes +
+                            stats.edge_adj_list_ram_cache_bytes;
   }
   return stats;
 }
@@ -691,51 +819,57 @@ void ChunkReadManager::RecordResult(const TableResult& result) {
 
 ChunkReadManager::TablePtr ChunkReadManager::LookupRamCacheLocked(
     const ChunkReadKey& key) {
-  auto it = ram_cache_.find(key);
-  if (it == ram_cache_.end()) {
+  auto* store = CacheStoreFor(CacheDomainFor(key));
+  auto it = store->entries.find(key);
+  if (it == store->entries.end()) {
     return nullptr;
   }
-  ram_cache_lru_.splice(ram_cache_lru_.end(), ram_cache_lru_,
-                        it->second.lru_it);
+  store->lru.splice(store->lru.end(), store->lru, it->second.lru_it);
   return it->second.table;
 }
 
 void ChunkReadManager::InsertRamCacheLocked(const ChunkReadKey& key,
                                             const TablePtr& table) {
-  if (options_.ram_budget_bytes == 0 || table == nullptr) {
+  const auto domain = CacheDomainFor(key);
+  const size_t ram_budget_bytes = RamBudgetBytesFor(domain);
+  if (ram_budget_bytes == 0 || table == nullptr) {
     return;
   }
 
   const size_t bytes = TableBytes(table);
-  if (bytes > options_.ram_budget_bytes) {
+  if (bytes > ram_budget_bytes) {
     return;
   }
 
-  auto existing = ram_cache_.find(key);
-  if (existing != ram_cache_.end()) {
-    ram_cache_bytes_ -= existing->second.bytes;
-    ram_cache_lru_.erase(existing->second.lru_it);
-    ram_cache_.erase(existing);
+  auto* store = CacheStoreFor(domain);
+  auto existing = store->entries.find(key);
+  if (existing != store->entries.end()) {
+    store->bytes -= existing->second.bytes;
+    store->lru.erase(existing->second.lru_it);
+    store->entries.erase(existing);
   }
 
-  EvictRamCacheLocked(bytes);
-  ram_cache_lru_.push_back(key);
-  auto lru_it = std::prev(ram_cache_lru_.end());
-  ram_cache_.emplace(key, CacheEntry{table, bytes, lru_it});
-  ram_cache_bytes_ += bytes;
+  EvictRamCacheLocked(domain, bytes);
+  store->lru.push_back(key);
+  auto lru_it = std::prev(store->lru.end());
+  store->entries.emplace(key, CacheEntry{table, bytes, lru_it});
+  store->bytes += bytes;
 }
 
-void ChunkReadManager::EvictRamCacheLocked(size_t bytes_needed) {
-  while (ram_cache_bytes_ + bytes_needed > options_.ram_budget_bytes &&
-         !ram_cache_lru_.empty()) {
-    const auto& victim_key = ram_cache_lru_.front();
-    auto victim = ram_cache_.find(victim_key);
-    if (victim != ram_cache_.end()) {
-      ram_cache_bytes_ -= victim->second.bytes;
-      ram_cache_.erase(victim);
-      ram_cache_evictions_.fetch_add(1, std::memory_order_relaxed);
+void ChunkReadManager::EvictRamCacheLocked(CacheDomain domain,
+                                           size_t bytes_needed) {
+  auto* store = CacheStoreFor(domain);
+  const size_t ram_budget_bytes = RamBudgetBytesFor(domain);
+  while (store->bytes + bytes_needed > ram_budget_bytes &&
+         !store->lru.empty()) {
+    const auto& victim_key = store->lru.front();
+    auto victim = store->entries.find(victim_key);
+    if (victim != store->entries.end()) {
+      store->bytes -= victim->second.bytes;
+      store->entries.erase(victim);
+      RecordRamCacheEviction(domain);
     }
-    ram_cache_lru_.pop_front();
+    store->lru.pop_front();
   }
 }
 

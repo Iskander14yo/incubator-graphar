@@ -28,7 +28,8 @@ def _make_loader(
     features=None,
     num_samplers=0,
     prefetch_batches=0,
-    edge_ram_for_loader_mb=0,
+    adj_list_ram_for_loader_mb=0,
+    offset_ram_for_loader_mb=0,
     feature_ram_for_loader_mb=0,
     num_readers=None,
     num_stitchers=1,
@@ -46,7 +47,8 @@ def _make_loader(
         features=features,
         num_samplers=num_samplers,
         prefetch_batches=prefetch_batches,
-        edge_ram_for_loader_mb=edge_ram_for_loader_mb,
+        adj_list_ram_for_loader_mb=adj_list_ram_for_loader_mb,
+        offset_ram_for_loader_mb=offset_ram_for_loader_mb,
         feature_ram_for_loader_mb=feature_ram_for_loader_mb,
         num_readers=num_readers,
         num_stitchers=num_stitchers,
@@ -230,21 +232,40 @@ def test_chunk_manager_is_owned_by_loader(ldbc_graph):
     assert stats["ram_cache_bytes"] == 0
 
 
-def test_chunk_manager_uses_ram_budget(ldbc_graph):
+def test_chunk_manager_uses_offset_ram_budget(ldbc_graph):
     loader = _make_loader(
         ldbc_graph,
         input_nodes=[0, 1, 2, 3],
         features=["id"],
         batch_size=2,
         shuffle=False,
-        edge_ram_for_loader_mb=1,
+        offset_ram_for_loader_mb=1,
     )
     list(loader)
 
     stats = loader.chunk_manager_stats()
     assert stats["requests"] > 0
     assert stats["ram_cache_misses"] > 0
-    assert stats["ram_cache_bytes"] > 0
+    assert stats["edge_offset_ram_cache_bytes"] > 0
+    assert stats["edge_adj_list_ram_cache_bytes"] == 0
+
+
+def test_chunk_manager_uses_adj_list_ram_budget(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        adj_list_ram_for_loader_mb=1,
+    )
+    list(loader)
+
+    stats = loader.chunk_manager_stats()
+    assert stats["requests"] > 0
+    assert stats["ram_cache_misses"] > 0
+    assert stats["edge_offset_ram_cache_bytes"] == 0
+    assert stats["edge_adj_list_ram_cache_bytes"] > 0
 
 
 def test_feature_chunk_manager_uses_separate_ram_budget(ldbc_graph):
@@ -254,7 +275,8 @@ def test_feature_chunk_manager_uses_separate_ram_budget(ldbc_graph):
         features=["id"],
         batch_size=2,
         shuffle=False,
-        edge_ram_for_loader_mb=0,
+        adj_list_ram_for_loader_mb=0,
+        offset_ram_for_loader_mb=0,
         feature_ram_for_loader_mb=1,
     )
     list(loader)
@@ -274,14 +296,14 @@ def test_feature_chunk_manager_cache_can_be_disabled(ldbc_graph):
         features=["id"],
         batch_size=2,
         shuffle=False,
-        edge_ram_for_loader_mb=1,
+        adj_list_ram_for_loader_mb=1,
         feature_ram_for_loader_mb=0,
     )
     list(loader)
 
     sampling_stats = loader.chunk_manager_stats()
     feature_stats = loader.feature_chunk_manager_stats()
-    assert sampling_stats["ram_cache_bytes"] > 0
+    assert sampling_stats["edge_adj_list_ram_cache_bytes"] > 0
     assert feature_stats["requests"] > 0
     assert feature_stats["ram_cache_hits"] == 0
     assert feature_stats["ram_cache_misses"] == 0
@@ -323,9 +345,14 @@ def test_chunk_manager_is_used_for_sampling_without_features(ldbc_graph):
     assert stats["failed"] == 0
 
 
-def test_negative_edge_ram_for_loader_is_rejected(ldbc_graph):
-    with pytest.raises(ValueError, match="edge_ram_for_loader_mb"):
-        _make_loader(ldbc_graph, edge_ram_for_loader_mb=-1)
+def test_negative_adj_list_ram_for_loader_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="adj_list_ram_for_loader_mb"):
+        _make_loader(ldbc_graph, adj_list_ram_for_loader_mb=-1)
+
+
+def test_negative_offset_ram_for_loader_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="offset_ram_for_loader_mb"):
+        _make_loader(ldbc_graph, offset_ram_for_loader_mb=-1)
 
 
 def test_negative_prefetch_batches_is_rejected(ldbc_graph):
