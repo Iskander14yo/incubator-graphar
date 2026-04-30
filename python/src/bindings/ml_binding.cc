@@ -129,9 +129,6 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
           "max_active_batches",
           &graphar::ml::FeaturePipelineOptions::max_active_batches)
       .def_readwrite(
-          "max_queued_chunk_reads",
-          &graphar::ml::FeaturePipelineOptions::max_queued_chunk_reads)
-      .def_readwrite(
           "max_queued_stitch_tasks",
           &graphar::ml::FeaturePipelineOptions::max_queued_stitch_tasks);
 

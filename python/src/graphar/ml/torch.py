@@ -220,9 +220,6 @@ class GARNeighborLoader(IterableDataset):
             feature_pipeline_options.num_readers = self.num_readers
             feature_pipeline_options.num_stitchers = self.num_stitchers
             feature_pipeline_options.max_active_batches = self._max_pending_batches()
-            feature_pipeline_options.max_queued_chunk_reads = (
-                feature_pipeline_options.max_active_batches * self.num_readers
-            )
             feature_pipeline_options.max_queued_stitch_tasks = (
                 feature_pipeline_options.max_active_batches * self.num_stitchers
             )

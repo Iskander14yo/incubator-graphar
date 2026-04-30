@@ -40,7 +40,6 @@ struct FeaturePipelineOptions {
   size_t num_readers = 1;
   size_t num_stitchers = 1;
   size_t max_active_batches = 1;
-  size_t max_queued_chunk_reads = 1;
   size_t max_queued_stitch_tasks = 1;
 };
 

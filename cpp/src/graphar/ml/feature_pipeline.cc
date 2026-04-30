@@ -45,8 +45,6 @@ FeaturePipelineOptions NormalizeOptions(FeaturePipelineOptions options) {
   options.num_readers = std::max<size_t>(1, options.num_readers);
   options.num_stitchers = std::max<size_t>(1, options.num_stitchers);
   options.max_active_batches = std::max<size_t>(1, options.max_active_batches);
-  options.max_queued_chunk_reads =
-      std::max(options.max_queued_chunk_reads, options.num_readers);
   options.max_queued_stitch_tasks =
       std::max(options.max_queued_stitch_tasks, options.num_stitchers);
   return options;
@@ -323,7 +321,6 @@ struct FeaturePipelineCoordinator::Impl {
 
     active_batches_cv_.notify_all();
     read_cv_.notify_all();
-    read_space_cv_.notify_all();
     stitch_cv_.notify_all();
     stitch_space_cv_.notify_all();
 
@@ -385,15 +382,6 @@ struct FeaturePipelineCoordinator::Impl {
         active_chunks_.emplace(key, active_chunk);
         AtomicMax(&active_chunk_keys_peak_,
                   static_cast<uint64_t>(active_chunks_.size()));
-
-        read_space_cv_.wait(lock, [&]() {
-          return shutdown_ ||
-                 read_queue_.size() < options_.max_queued_chunk_reads;
-        });
-        if (shutdown_) {
-          active_chunks_.erase(key);
-          return Status::Invalid("Feature pipeline is shut down");
-        }
         read_queue_.push_back(active_chunk);
         enqueue_read = true;
       } else {
@@ -459,7 +447,6 @@ struct FeaturePipelineCoordinator::Impl {
         active_chunk = read_queue_.front();
         read_queue_.pop_front();
       }
-      read_space_cv_.notify_all();
 
       if (active_chunk == nullptr) {
         continue;
@@ -779,7 +766,6 @@ struct FeaturePipelineCoordinator::Impl {
   mutable std::mutex mutex_;
   std::condition_variable active_batches_cv_;
   std::condition_variable read_cv_;
-  std::condition_variable read_space_cv_;
   std::condition_variable stitch_cv_;
   std::condition_variable stitch_space_cv_;
   bool shutdown_ = false;

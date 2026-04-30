@@ -573,7 +573,6 @@ TEST_CASE_METHOD(
   options.num_readers = 1;
   options.num_stitchers = 2;
   options.max_active_batches = 4;
-  options.max_queued_chunk_reads = 4;
   options.max_queued_stitch_tasks = 8;
   FeaturePipelineCoordinator coordinator(chunk_manager, options);
 
