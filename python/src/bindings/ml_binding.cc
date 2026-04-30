@@ -25,6 +25,7 @@
 #include "arrow/c/bridge.h"
 #include "graphar/graph_info.h"
 #include "graphar/ml/chunk_read_manager.h"
+#include "graphar/ml/feature_pipeline.h"
 #include "graphar/ml/neighbor_sampling.h"
 
 namespace py = pybind11;
@@ -116,6 +117,85 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def("feature_cursor_stats",
            &graphar::ml::ChunkReadManager::feature_cursor_stats)
       .def("shutdown", &graphar::ml::ChunkReadManager::Shutdown);
+
+  py::class_<graphar::ml::FeaturePipelineOptions>(m,
+                                                  "_FeaturePipelineOptions")
+      .def(py::init<>())
+      .def_readwrite("num_readers",
+                     &graphar::ml::FeaturePipelineOptions::num_readers)
+      .def_readwrite("num_stitchers",
+                     &graphar::ml::FeaturePipelineOptions::num_stitchers)
+      .def_readwrite(
+          "max_active_batches",
+          &graphar::ml::FeaturePipelineOptions::max_active_batches)
+      .def_readwrite(
+          "max_queued_stitch_tasks",
+          &graphar::ml::FeaturePipelineOptions::max_queued_stitch_tasks);
+
+  py::class_<graphar::ml::FeaturePipelineStats>(m, "_FeaturePipelineStats")
+      .def_readonly("submitted_batches",
+                    &graphar::ml::FeaturePipelineStats::submitted_batches)
+      .def_readonly("completed_batches",
+                    &graphar::ml::FeaturePipelineStats::completed_batches)
+      .def_readonly("pending_batches_peak",
+                    &graphar::ml::FeaturePipelineStats::pending_batches_peak)
+      .def_readonly("active_chunk_keys_peak",
+                    &graphar::ml::FeaturePipelineStats::active_chunk_keys_peak)
+      .def_readonly("chunk_subscriptions",
+                    &graphar::ml::FeaturePipelineStats::chunk_subscriptions)
+      .def_readonly("chunk_reads",
+                    &graphar::ml::FeaturePipelineStats::chunk_reads)
+      .def_readonly("chunk_reuses",
+                    &graphar::ml::FeaturePipelineStats::chunk_reuses)
+      .def_readonly("stitch_tasks",
+                    &graphar::ml::FeaturePipelineStats::stitch_tasks)
+      .def_readonly(
+          "stitch_wait_ms_sum",
+          &graphar::ml::FeaturePipelineStats::stitch_wait_ms_sum)
+      .def_readonly(
+          "stitch_service_ms_sum",
+          &graphar::ml::FeaturePipelineStats::stitch_service_ms_sum);
+
+  py::class_<graphar::ml::FeatureBatchHandle,
+             std::shared_ptr<graphar::ml::FeatureBatchHandle>>(
+      m, "_FeatureBatchHandle")
+      .def("wait", [](const graphar::ml::FeatureBatchHandle& handle) {
+        auto result = [&]() {
+          py::gil_scoped_release release;
+          return handle.Wait();
+        }();
+        auto table = ThrowOrReturn(result);
+        return table_to_pyarrow(table);
+      })
+      .def("feature_fetch_ms",
+           &graphar::ml::FeatureBatchHandle::feature_fetch_ms)
+      .def("valid", &graphar::ml::FeatureBatchHandle::valid);
+
+  py::class_<graphar::ml::FeaturePipelineCoordinator,
+             std::shared_ptr<graphar::ml::FeaturePipelineCoordinator>>(
+      m, "_FeaturePipelineCoordinator")
+      .def(py::init<std::shared_ptr<graphar::ml::ChunkReadManager>,
+                    graphar::ml::FeaturePipelineOptions>(),
+           py::arg("chunk_manager"),
+           py::arg("options") = graphar::ml::FeaturePipelineOptions{})
+      .def(
+          "submit_sampled_batch",
+          [](graphar::ml::FeaturePipelineCoordinator& coordinator,
+             const std::shared_ptr<graphar::GraphInfo>& graph_info,
+             const std::string& vertex_type,
+             const std::vector<graphar::IdType>& node_ids,
+             const std::vector<std::string>& properties) {
+            auto result = [&]() {
+              py::gil_scoped_release release;
+              return coordinator.SubmitSampledBatch(graph_info, vertex_type,
+                                                    node_ids, properties);
+            }();
+            return ThrowOrReturn(result);
+          },
+          py::arg("graph_info"), py::arg("vertex_type"), py::arg("node_ids"),
+          py::arg("properties"))
+      .def("stats", &graphar::ml::FeaturePipelineCoordinator::Stats)
+      .def("shutdown", &graphar::ml::FeaturePipelineCoordinator::Shutdown);
 
   py::class_<graphar::ml::FeatureCursorStats>(m, "_FeatureCursorStats")
       .def_readonly("cursor_count",

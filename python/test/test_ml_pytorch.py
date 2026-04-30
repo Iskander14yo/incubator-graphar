@@ -26,10 +26,12 @@ def _make_loader(
     batch_size=2,
     shuffle=False,
     features=None,
-    num_workers=0,
+    num_samplers=0,
     prefetch_batches=0,
     edge_ram_for_loader_mb=0,
     feature_ram_for_loader_mb=0,
+    num_readers=None,
+    num_stitchers=1,
 ):
     if num_neighbors is None:
         num_neighbors = [5]
@@ -42,10 +44,12 @@ def _make_loader(
         batch_size=batch_size,
         shuffle=shuffle,
         features=features,
-        num_workers=num_workers,
+        num_samplers=num_samplers,
         prefetch_batches=prefetch_batches,
         edge_ram_for_loader_mb=edge_ram_for_loader_mb,
         feature_ram_for_loader_mb=feature_ram_for_loader_mb,
+        num_readers=num_readers,
+        num_stitchers=num_stitchers,
     )
     return GARNeighborLoader(**kwargs)
 
@@ -284,6 +288,25 @@ def test_feature_chunk_manager_cache_can_be_disabled(ldbc_graph):
     assert feature_stats["ram_cache_bytes"] == 0
 
 
+def test_feature_pipeline_stats_track_submitted_batches(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        prefetch_batches=2,
+    )
+    list(loader)
+
+    stats = loader.feature_pipeline_stats()
+    assert stats["submitted_batches"] == len(loader)
+    assert stats["completed_batches"] == len(loader)
+    assert stats["pending_batches_peak"] >= 1
+    assert stats["chunk_subscriptions"] >= len(loader)
+    assert stats["stitch_tasks"] == stats["chunk_subscriptions"]
+
+
 def test_chunk_manager_is_used_for_sampling_without_features(ldbc_graph):
     loader = _make_loader(
         ldbc_graph,
@@ -354,48 +377,48 @@ def test_loader_keeps_sampler_order(ldbc_graph):
     assert batch.num_sampled_edges.tolist() == [8]
 
 
-def test_multi_worker_matches_single_worker_shuffle_false(ldbc_graph):
-    single_worker_loader = _make_loader(
+def test_multi_sampler_matches_single_sampler_shuffle_false(ldbc_graph):
+    single_sampler_loader = _make_loader(
         ldbc_graph,
         input_nodes=[0, 1, 2, 3, 4, 5],
         features=["id"],
         batch_size=2,
         shuffle=False,
-        num_workers=0,
+        num_samplers=0,
     )
-    multi_worker_loader = _make_loader(
+    multi_sampler_loader = _make_loader(
         ldbc_graph,
         input_nodes=[0, 1, 2, 3, 4, 5],
         features=["id"],
         batch_size=2,
         shuffle=False,
-        num_workers=2,
+        num_samplers=2,
     )
 
-    assert _epoch_signature(single_worker_loader) == _epoch_signature(multi_worker_loader)
+    assert _epoch_signature(single_sampler_loader) == _epoch_signature(multi_sampler_loader)
 
 
-def test_multi_worker_shuffle_false_keeps_batch_order(ldbc_graph):
+def test_multi_sampler_shuffle_false_keeps_batch_order(ldbc_graph):
     loader = _make_loader(
         ldbc_graph,
         input_nodes=[0, 1, 2, 3, 4, 5],
         features=["id"],
         batch_size=2,
         shuffle=False,
-        num_workers=2,
+        num_samplers=2,
     )
 
     assert [batch.input_id.tolist() for batch in loader] == [[0, 1], [2, 3], [4, 5]]
 
 
-def test_multi_worker_is_deterministic_across_sessions(ldbc_graph):
+def test_multi_sampler_is_deterministic_across_sessions(ldbc_graph):
     loader1 = _make_loader(
         ldbc_graph,
         input_nodes=[0, 1, 2, 3, 4, 5],
         features=["id"],
         batch_size=2,
         shuffle=True,
-        num_workers=2,
+        num_samplers=2,
     )
     loader2 = _make_loader(
         ldbc_graph,
@@ -403,7 +426,7 @@ def test_multi_worker_is_deterministic_across_sessions(ldbc_graph):
         features=["id"],
         batch_size=2,
         shuffle=True,
-        num_workers=2,
+        num_samplers=2,
     )
 
     assert _epoch_signature(loader1) == _epoch_signature(loader2)
@@ -453,9 +476,9 @@ def test_profile_batches_match_iter(ldbc_graph):
     assert iter_sig == prof_sig
 
 
-def test_profile_works_with_multi_worker(ldbc_graph):
+def test_profile_works_with_multi_sampler(ldbc_graph):
     loader = _make_loader(
-        ldbc_graph, input_nodes=[0, 1, 2, 3, 4, 5], features=["id"], batch_size=2, num_workers=2
+        ldbc_graph, input_nodes=[0, 1, 2, 3, 4, 5], features=["id"], batch_size=2, num_samplers=2
     )
     pairs = list(loader.profile())
     assert all(isinstance(prof, BatchProfile) for _, prof in pairs)
@@ -467,37 +490,37 @@ def test_profile_works_with_multi_worker(ldbc_graph):
 # ---------------------------------------------------------------------------
 
 def test_bounded_prefetch_limits_concurrency(ldbc_graph):
-    """At most num_workers _build_batch calls should run simultaneously."""
-    num_workers = 2
+    """At most num_samplers sampling submissions should run simultaneously."""
+    num_samplers = 2
     loader = _make_loader(
         ldbc_graph,
         input_nodes=list(range(8)),
         features=["id"],
         batch_size=2,
         shuffle=False,
-        num_workers=num_workers,
+        num_samplers=num_samplers,
     )
 
     peak = 0
     active = 0
     lock = threading.Lock()
-    real_build = loader._build_batch
+    real_submit = loader._sample_and_submit_batch
 
-    def tracked_build(seed_nodes, seed):
+    def tracked_submit(seed_nodes, seed):
         nonlocal peak, active
         with lock:
             active += 1
             peak = max(peak, active)
         try:
-            return real_build(seed_nodes, seed)
+            return real_submit(seed_nodes, seed)
         finally:
             with lock:
                 active -= 1
 
-    with mock.patch.object(loader, "_build_batch", side_effect=tracked_build):
+    with mock.patch.object(loader, "_sample_and_submit_batch", side_effect=tracked_submit):
         list(loader)
 
-    assert peak <= num_workers
+    assert peak <= num_samplers
 
 
 def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
@@ -507,18 +530,18 @@ def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
         features=["id"],
         batch_size=2,
         shuffle=False,
-        num_workers=2,
+        num_samplers=2,
         prefetch_batches=4,
     )
 
-    real_build = loader._build_batch
+    real_submit = loader._sample_and_submit_batch
     release_first = threading.Event()
     started_fourth = threading.Event()
     started_batches = set()
     started_lock = threading.Lock()
     thread_error = []
 
-    def tracked_build(seed_nodes, seed):
+    def tracked_submit(seed_nodes, seed):
         batch_idx = seed_nodes[0] // 2
         with started_lock:
             started_batches.add(batch_idx)
@@ -527,7 +550,7 @@ def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
         if batch_idx == 0:
             if not release_first.wait(timeout=5.0):
                 raise TimeoutError("timed out waiting to release first batch")
-        return real_build(seed_nodes, seed)
+        return real_submit(seed_nodes, seed)
 
     def consume():
         try:
@@ -535,7 +558,7 @@ def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
         except Exception as exc:  # pragma: no cover - surfaced by assertion below
             thread_error.append(exc)
 
-    with mock.patch.object(loader, "_build_batch", side_effect=tracked_build):
+    with mock.patch.object(loader, "_sample_and_submit_batch", side_effect=tracked_submit):
         consumer = threading.Thread(target=consume)
         consumer.start()
         assert started_fourth.wait(timeout=5.0)
