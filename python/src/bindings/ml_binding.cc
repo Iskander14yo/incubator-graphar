@@ -86,6 +86,12 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
                      &graphar::ml::ChunkReadManagerOptions::enable_singleflight)
       .def_readwrite("ram_budget_bytes",
                      &graphar::ml::ChunkReadManagerOptions::ram_budget_bytes)
+      .def_readwrite("edge_offset_ram_budget_bytes",
+                     &graphar::ml::ChunkReadManagerOptions::
+                         edge_offset_ram_budget_bytes)
+      .def_readwrite("edge_adj_list_ram_budget_bytes",
+                     &graphar::ml::ChunkReadManagerOptions::
+                         edge_adj_list_ram_budget_bytes)
       .def_readwrite("feature_cursor_count",
                      &graphar::ml::ChunkReadManagerOptions::feature_cursor_count)
       .def_readwrite(
@@ -99,6 +105,16 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def_readonly("waiters", &graphar::ml::ChunkReadStats::waiters)
       .def_readonly("completed", &graphar::ml::ChunkReadStats::completed)
       .def_readonly("failed", &graphar::ml::ChunkReadStats::failed)
+      .def_readonly("vertex_property_requests",
+                    &graphar::ml::ChunkReadStats::vertex_property_requests)
+      .def_readonly("vertex_property_leaders",
+                    &graphar::ml::ChunkReadStats::vertex_property_leaders)
+      .def_readonly("vertex_property_waiters",
+                    &graphar::ml::ChunkReadStats::vertex_property_waiters)
+      .def_readonly("vertex_property_completed",
+                    &graphar::ml::ChunkReadStats::vertex_property_completed)
+      .def_readonly("vertex_property_failed",
+                    &graphar::ml::ChunkReadStats::vertex_property_failed)
       .def_readonly("ram_cache_hits",
                     &graphar::ml::ChunkReadStats::ram_cache_hits)
       .def_readonly("ram_cache_misses",
@@ -106,7 +122,61 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def_readonly("ram_cache_evictions",
                     &graphar::ml::ChunkReadStats::ram_cache_evictions)
       .def_readonly("ram_cache_bytes",
-                    &graphar::ml::ChunkReadStats::ram_cache_bytes);
+                    &graphar::ml::ChunkReadStats::ram_cache_bytes)
+      .def_readonly("edge_offset_requests",
+                    &graphar::ml::ChunkReadStats::edge_offset_requests)
+      .def_readonly("edge_offset_leaders",
+                    &graphar::ml::ChunkReadStats::edge_offset_leaders)
+      .def_readonly("edge_offset_waiters",
+                    &graphar::ml::ChunkReadStats::edge_offset_waiters)
+      .def_readonly("edge_offset_completed",
+                    &graphar::ml::ChunkReadStats::edge_offset_completed)
+      .def_readonly("edge_offset_failed",
+                    &graphar::ml::ChunkReadStats::edge_offset_failed)
+      .def_readonly("vertex_property_ram_cache_hits",
+                    &graphar::ml::ChunkReadStats::
+                        vertex_property_ram_cache_hits)
+      .def_readonly("vertex_property_ram_cache_misses",
+                    &graphar::ml::ChunkReadStats::
+                        vertex_property_ram_cache_misses)
+      .def_readonly("vertex_property_ram_cache_evictions",
+                    &graphar::ml::ChunkReadStats::
+                        vertex_property_ram_cache_evictions)
+      .def_readonly("vertex_property_ram_cache_bytes",
+                    &graphar::ml::ChunkReadStats::
+                        vertex_property_ram_cache_bytes)
+      .def_readonly("edge_offset_ram_cache_hits",
+                    &graphar::ml::ChunkReadStats::edge_offset_ram_cache_hits)
+      .def_readonly("edge_offset_ram_cache_misses",
+                    &graphar::ml::ChunkReadStats::
+                        edge_offset_ram_cache_misses)
+      .def_readonly("edge_offset_ram_cache_evictions",
+                    &graphar::ml::ChunkReadStats::
+                        edge_offset_ram_cache_evictions)
+      .def_readonly("edge_offset_ram_cache_bytes",
+                    &graphar::ml::ChunkReadStats::edge_offset_ram_cache_bytes)
+      .def_readonly("edge_adj_list_requests",
+                    &graphar::ml::ChunkReadStats::edge_adj_list_requests)
+      .def_readonly("edge_adj_list_leaders",
+                    &graphar::ml::ChunkReadStats::edge_adj_list_leaders)
+      .def_readonly("edge_adj_list_waiters",
+                    &graphar::ml::ChunkReadStats::edge_adj_list_waiters)
+      .def_readonly("edge_adj_list_completed",
+                    &graphar::ml::ChunkReadStats::edge_adj_list_completed)
+      .def_readonly("edge_adj_list_failed",
+                    &graphar::ml::ChunkReadStats::edge_adj_list_failed)
+      .def_readonly("edge_adj_list_ram_cache_hits",
+                    &graphar::ml::ChunkReadStats::
+                        edge_adj_list_ram_cache_hits)
+      .def_readonly("edge_adj_list_ram_cache_misses",
+                    &graphar::ml::ChunkReadStats::
+                        edge_adj_list_ram_cache_misses)
+      .def_readonly("edge_adj_list_ram_cache_evictions",
+                    &graphar::ml::ChunkReadStats::
+                        edge_adj_list_ram_cache_evictions)
+      .def_readonly("edge_adj_list_ram_cache_bytes",
+                    &graphar::ml::ChunkReadStats::
+                        edge_adj_list_ram_cache_bytes);
 
   py::class_<graphar::ml::ChunkReadManager,
              std::shared_ptr<graphar::ml::ChunkReadManager>>(

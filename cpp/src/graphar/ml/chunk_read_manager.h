@@ -68,6 +68,8 @@ struct ChunkReadKeyHash {
 struct ChunkReadManagerOptions {
   bool enable_singleflight = true;
   size_t ram_budget_bytes = 0;
+  size_t edge_offset_ram_budget_bytes = 0;
+  size_t edge_adj_list_ram_budget_bytes = 0;
   size_t feature_cursor_count = 0;
   size_t feature_cursor_trail_capacity_chunks = 0;
 };
@@ -78,10 +80,37 @@ struct ChunkReadStats {
   uint64_t waiters = 0;
   uint64_t completed = 0;
   uint64_t failed = 0;
+  uint64_t vertex_property_requests = 0;
+  uint64_t vertex_property_leaders = 0;
+  uint64_t vertex_property_waiters = 0;
+  uint64_t vertex_property_completed = 0;
+  uint64_t vertex_property_failed = 0;
   uint64_t ram_cache_hits = 0;
   uint64_t ram_cache_misses = 0;
   uint64_t ram_cache_evictions = 0;
   uint64_t ram_cache_bytes = 0;
+  uint64_t edge_offset_requests = 0;
+  uint64_t edge_offset_leaders = 0;
+  uint64_t edge_offset_waiters = 0;
+  uint64_t edge_offset_completed = 0;
+  uint64_t edge_offset_failed = 0;
+  uint64_t vertex_property_ram_cache_hits = 0;
+  uint64_t vertex_property_ram_cache_misses = 0;
+  uint64_t vertex_property_ram_cache_evictions = 0;
+  uint64_t vertex_property_ram_cache_bytes = 0;
+  uint64_t edge_adj_list_requests = 0;
+  uint64_t edge_adj_list_leaders = 0;
+  uint64_t edge_adj_list_waiters = 0;
+  uint64_t edge_adj_list_completed = 0;
+  uint64_t edge_adj_list_failed = 0;
+  uint64_t edge_offset_ram_cache_hits = 0;
+  uint64_t edge_offset_ram_cache_misses = 0;
+  uint64_t edge_offset_ram_cache_evictions = 0;
+  uint64_t edge_offset_ram_cache_bytes = 0;
+  uint64_t edge_adj_list_ram_cache_hits = 0;
+  uint64_t edge_adj_list_ram_cache_misses = 0;
+  uint64_t edge_adj_list_ram_cache_evictions = 0;
+  uint64_t edge_adj_list_ram_cache_bytes = 0;
 };
 
 struct FeatureCursorStats {
@@ -152,23 +181,43 @@ class ChunkReadManager {
   using Clock = std::chrono::steady_clock;
 
   struct FeatureCursorState;
+  enum class CacheDomain {
+    kVertexProperty,
+    kEdgeOffset,
+    kEdgeAdjList,
+  };
   struct CacheEntry {
     TablePtr table;
     size_t bytes = 0;
     std::list<ChunkReadKey>::iterator lru_it;
   };
+  struct CacheStore {
+    std::list<ChunkReadKey> lru;
+    std::unordered_map<ChunkReadKey, CacheEntry, ChunkReadKeyHash> entries;
+    size_t bytes = 0;
+  };
 
   bool HasFeatureCursor() const;
-  void RecordResult(const TableResult& result);
+  CacheDomain CacheDomainFor(const ChunkReadKey& key) const;
+  void RecordRequest(CacheDomain domain);
+  void RecordLeader(CacheDomain domain);
+  void RecordWaiter(CacheDomain domain);
+  void RecordResult(CacheDomain domain, const TableResult& result);
+  void RecordRamCacheHit(CacheDomain domain);
+  void RecordRamCacheMiss(CacheDomain domain);
+  void RecordRamCacheEviction(CacheDomain domain);
+  CacheStore* CacheStoreFor(CacheDomain domain);
+  const CacheStore* CacheStoreFor(CacheDomain domain) const;
+  size_t RamBudgetBytesFor(CacheDomain domain) const;
   TablePtr LookupRamCacheLocked(const ChunkReadKey& key);
   void InsertRamCacheLocked(const ChunkReadKey& key, const TablePtr& table);
-  void EvictRamCacheLocked(size_t bytes_needed);
+  void EvictRamCacheLocked(CacheDomain domain, size_t bytes_needed);
 
   ChunkReadManagerOptions options_;
   mutable std::mutex mutex_;
-  std::list<ChunkReadKey> ram_cache_lru_;
-  std::unordered_map<ChunkReadKey, CacheEntry, ChunkReadKeyHash> ram_cache_;
-  size_t ram_cache_bytes_ = 0;
+  CacheStore vertex_property_ram_cache_;
+  CacheStore edge_offset_ram_cache_;
+  CacheStore edge_adj_list_ram_cache_;
   std::unordered_map<ChunkReadKey, std::shared_future<TableResult>,
                      ChunkReadKeyHash>
       in_flight_;
@@ -179,9 +228,30 @@ class ChunkReadManager {
   std::atomic<uint64_t> waiters_{0};
   std::atomic<uint64_t> completed_{0};
   std::atomic<uint64_t> failed_{0};
-  std::atomic<uint64_t> ram_cache_hits_{0};
-  std::atomic<uint64_t> ram_cache_misses_{0};
-  std::atomic<uint64_t> ram_cache_evictions_{0};
+  std::atomic<uint64_t> vertex_property_requests_{0};
+  std::atomic<uint64_t> vertex_property_leaders_{0};
+  std::atomic<uint64_t> vertex_property_waiters_{0};
+  std::atomic<uint64_t> vertex_property_completed_{0};
+  std::atomic<uint64_t> vertex_property_failed_{0};
+  std::atomic<uint64_t> vertex_property_ram_cache_hits_{0};
+  std::atomic<uint64_t> vertex_property_ram_cache_misses_{0};
+  std::atomic<uint64_t> vertex_property_ram_cache_evictions_{0};
+  std::atomic<uint64_t> edge_offset_requests_{0};
+  std::atomic<uint64_t> edge_offset_leaders_{0};
+  std::atomic<uint64_t> edge_offset_waiters_{0};
+  std::atomic<uint64_t> edge_offset_completed_{0};
+  std::atomic<uint64_t> edge_offset_failed_{0};
+  std::atomic<uint64_t> edge_offset_ram_cache_hits_{0};
+  std::atomic<uint64_t> edge_offset_ram_cache_misses_{0};
+  std::atomic<uint64_t> edge_offset_ram_cache_evictions_{0};
+  std::atomic<uint64_t> edge_adj_list_requests_{0};
+  std::atomic<uint64_t> edge_adj_list_leaders_{0};
+  std::atomic<uint64_t> edge_adj_list_waiters_{0};
+  std::atomic<uint64_t> edge_adj_list_completed_{0};
+  std::atomic<uint64_t> edge_adj_list_failed_{0};
+  std::atomic<uint64_t> edge_adj_list_ram_cache_hits_{0};
+  std::atomic<uint64_t> edge_adj_list_ram_cache_misses_{0};
+  std::atomic<uint64_t> edge_adj_list_ram_cache_evictions_{0};
 };
 
 }  // namespace graphar::ml

@@ -94,10 +94,51 @@ def _chunk_read_stats_to_dict(stats) -> dict[str, int]:
         "waiters": int(stats.waiters),
         "completed": int(stats.completed),
         "failed": int(stats.failed),
+        "vertex_property_requests": int(stats.vertex_property_requests),
+        "vertex_property_leaders": int(stats.vertex_property_leaders),
+        "vertex_property_waiters": int(stats.vertex_property_waiters),
+        "vertex_property_completed": int(stats.vertex_property_completed),
+        "vertex_property_failed": int(stats.vertex_property_failed),
         "ram_cache_hits": int(stats.ram_cache_hits),
         "ram_cache_misses": int(stats.ram_cache_misses),
         "ram_cache_evictions": int(stats.ram_cache_evictions),
         "ram_cache_bytes": int(stats.ram_cache_bytes),
+        "edge_offset_requests": int(stats.edge_offset_requests),
+        "edge_offset_leaders": int(stats.edge_offset_leaders),
+        "edge_offset_waiters": int(stats.edge_offset_waiters),
+        "edge_offset_completed": int(stats.edge_offset_completed),
+        "edge_offset_failed": int(stats.edge_offset_failed),
+        "vertex_property_ram_cache_hits": int(
+            stats.vertex_property_ram_cache_hits
+        ),
+        "vertex_property_ram_cache_misses": int(
+            stats.vertex_property_ram_cache_misses
+        ),
+        "vertex_property_ram_cache_evictions": int(
+            stats.vertex_property_ram_cache_evictions
+        ),
+        "vertex_property_ram_cache_bytes": int(
+            stats.vertex_property_ram_cache_bytes
+        ),
+        "edge_offset_ram_cache_hits": int(stats.edge_offset_ram_cache_hits),
+        "edge_offset_ram_cache_misses": int(stats.edge_offset_ram_cache_misses),
+        "edge_offset_ram_cache_evictions": int(
+            stats.edge_offset_ram_cache_evictions
+        ),
+        "edge_offset_ram_cache_bytes": int(stats.edge_offset_ram_cache_bytes),
+        "edge_adj_list_requests": int(stats.edge_adj_list_requests),
+        "edge_adj_list_leaders": int(stats.edge_adj_list_leaders),
+        "edge_adj_list_waiters": int(stats.edge_adj_list_waiters),
+        "edge_adj_list_completed": int(stats.edge_adj_list_completed),
+        "edge_adj_list_failed": int(stats.edge_adj_list_failed),
+        "edge_adj_list_ram_cache_hits": int(stats.edge_adj_list_ram_cache_hits),
+        "edge_adj_list_ram_cache_misses": int(
+            stats.edge_adj_list_ram_cache_misses
+        ),
+        "edge_adj_list_ram_cache_evictions": int(
+            stats.edge_adj_list_ram_cache_evictions
+        ),
+        "edge_adj_list_ram_cache_bytes": int(stats.edge_adj_list_ram_cache_bytes),
     }
 
 
@@ -146,7 +187,8 @@ class GARNeighborLoader(IterableDataset):
         features: list[str] | None = None,
         num_samplers: int = 0,
         prefetch_batches: int = 0,
-        edge_ram_for_loader_mb: int = 0,
+        adj_list_ram_for_loader_mb: int = 0,
+        offset_ram_for_loader_mb: int = 0,
         feature_ram_for_loader_mb: int = 0,
         num_readers: int | None = None,
         num_stitchers: int = 1,
@@ -165,8 +207,11 @@ class GARNeighborLoader(IterableDataset):
         if prefetch_batches < 0:
             msg = "prefetch_batches must be >= 0"
             raise ValueError(msg)
-        if edge_ram_for_loader_mb < 0:
-            msg = "edge_ram_for_loader_mb must be >= 0"
+        if adj_list_ram_for_loader_mb < 0:
+            msg = "adj_list_ram_for_loader_mb must be >= 0"
+            raise ValueError(msg)
+        if offset_ram_for_loader_mb < 0:
+            msg = "offset_ram_for_loader_mb must be >= 0"
             raise ValueError(msg)
         if feature_ram_for_loader_mb < 0:
             msg = "feature_ram_for_loader_mb must be >= 0"
@@ -196,13 +241,26 @@ class GARNeighborLoader(IterableDataset):
         self.num_readers = int(num_readers)
         self.num_stitchers = int(num_stitchers)
         edge_chunk_manager_options = gar_ml._ChunkReadManagerOptions()
-        edge_chunk_manager_options.ram_budget_bytes = int(edge_ram_for_loader_mb) * 1024 * 1024
-        self._sampling_chunk_manager = gar_ml._ChunkReadManager(edge_chunk_manager_options)
+        edge_chunk_manager_options.edge_adj_list_ram_budget_bytes = (
+            int(adj_list_ram_for_loader_mb) * 1024 * 1024
+        )
+        edge_chunk_manager_options.edge_offset_ram_budget_bytes = (
+            int(offset_ram_for_loader_mb) * 1024 * 1024
+        )
+        self._sampling_chunk_manager = gar_ml._ChunkReadManager(
+            edge_chunk_manager_options
+        )
         feature_chunk_manager_options = gar_ml._ChunkReadManagerOptions()
-        feature_chunk_manager_options.ram_budget_bytes = int(feature_ram_for_loader_mb) * 1024 * 1024
+        feature_chunk_manager_options.ram_budget_bytes = (
+            int(feature_ram_for_loader_mb) * 1024 * 1024
+        )
         feature_chunk_manager_options.feature_cursor_count = self.num_readers
-        feature_chunk_manager_options.feature_cursor_trail_capacity_chunks = int(feature_cursor_trail_chunks)
-        self._feature_chunk_manager = gar_ml._ChunkReadManager(feature_chunk_manager_options)
+        feature_chunk_manager_options.feature_cursor_trail_capacity_chunks = int(
+            feature_cursor_trail_chunks
+        )
+        self._feature_chunk_manager = gar_ml._ChunkReadManager(
+            feature_chunk_manager_options
+        )
         if input_nodes is None and not shuffle:
             self._input_nodes = None
             self._input_node_count = graph_info.get_vertex_count(vertex_type)
