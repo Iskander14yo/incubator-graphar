@@ -246,6 +246,8 @@ def test_chunk_manager_uses_offset_ram_budget(ldbc_graph):
     stats = loader.chunk_manager_stats()
     assert stats["requests"] > 0
     assert stats["ram_cache_misses"] > 0
+    assert stats["edge_offset_requests"] > 0
+    assert stats["edge_offset_completed"] == stats["edge_offset_requests"]
     assert stats["edge_offset_ram_cache_bytes"] > 0
     assert stats["edge_adj_list_ram_cache_bytes"] == 0
 
@@ -264,6 +266,8 @@ def test_chunk_manager_uses_adj_list_ram_budget(ldbc_graph):
     stats = loader.chunk_manager_stats()
     assert stats["requests"] > 0
     assert stats["ram_cache_misses"] > 0
+    assert stats["edge_adj_list_requests"] > 0
+    assert stats["edge_adj_list_completed"] == stats["edge_adj_list_requests"]
     assert stats["edge_offset_ram_cache_bytes"] == 0
     assert stats["edge_adj_list_ram_cache_bytes"] > 0
 

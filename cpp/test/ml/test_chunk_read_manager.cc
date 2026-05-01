@@ -214,6 +214,11 @@ TEST_CASE("ChunkReadManager distinguishes edge keys by dst type") {
   REQUIRE(stats.waiters == 0);
   REQUIRE(stats.completed == 4);
   REQUIRE(stats.failed == 0);
+  REQUIRE(stats.edge_adj_list_requests == 4);
+  REQUIRE(stats.edge_adj_list_leaders == 2);
+  REQUIRE(stats.edge_adj_list_waiters == 0);
+  REQUIRE(stats.edge_adj_list_completed == 4);
+  REQUIRE(stats.edge_adj_list_failed == 0);
   // Each edge key should also keep its own RAM cache entry.
   REQUIRE(stats.ram_cache_hits == 2);
   REQUIRE(stats.ram_cache_misses == 2);
@@ -288,8 +293,14 @@ TEST_CASE("ChunkReadManager keeps offset and adjacency RAM caches separate") {
   REQUIRE(adj_loader_calls.load() == 2);
 
   const auto stats = manager.stats();
+  REQUIRE(stats.edge_offset_requests == 2);
+  REQUIRE(stats.edge_offset_leaders == 1);
+  REQUIRE(stats.edge_offset_completed == 2);
   REQUIRE(stats.edge_offset_ram_cache_hits == 1);
   REQUIRE(stats.edge_offset_ram_cache_bytes >= TableBytes(MakeTable(1)));
+  REQUIRE(stats.edge_adj_list_requests == 2);
+  REQUIRE(stats.edge_adj_list_leaders == 2);
+  REQUIRE(stats.edge_adj_list_completed == 2);
   REQUIRE(stats.edge_adj_list_ram_cache_hits == 0);
   REQUIRE(stats.edge_adj_list_ram_cache_bytes == 0);
 }
@@ -410,6 +421,11 @@ TEST_CASE_METHOD(GlobalFixture, "ChunkReadManager caches edge offset chunks") {
   REQUIRE(stats.leaders == 1);
   REQUIRE(stats.ram_cache_hits == 1);
   REQUIRE(stats.ram_cache_misses == 1);
+  REQUIRE(stats.edge_offset_requests == 2);
+  REQUIRE(stats.edge_offset_leaders == 1);
+  REQUIRE(stats.edge_offset_waiters == 0);
+  REQUIRE(stats.edge_offset_completed == 2);
+  REQUIRE(stats.edge_offset_failed == 0);
   REQUIRE(stats.edge_offset_ram_cache_hits == 1);
   REQUIRE(stats.edge_offset_ram_cache_misses == 1);
   REQUIRE(stats.failed == 0);
@@ -438,6 +454,11 @@ TEST_CASE_METHOD(GlobalFixture, "ChunkReadManager caches edge adjacency chunks")
   REQUIRE(stats.leaders == 1);
   REQUIRE(stats.ram_cache_hits == 1);
   REQUIRE(stats.ram_cache_misses == 1);
+  REQUIRE(stats.edge_adj_list_requests == 2);
+  REQUIRE(stats.edge_adj_list_leaders == 1);
+  REQUIRE(stats.edge_adj_list_waiters == 0);
+  REQUIRE(stats.edge_adj_list_completed == 2);
+  REQUIRE(stats.edge_adj_list_failed == 0);
   REQUIRE(stats.edge_adj_list_ram_cache_hits == 1);
   REQUIRE(stats.edge_adj_list_ram_cache_misses == 1);
   REQUIRE(stats.failed == 0);

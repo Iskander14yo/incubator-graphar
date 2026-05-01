@@ -94,10 +94,20 @@ def _chunk_read_stats_to_dict(stats) -> dict[str, int]:
         "waiters": int(stats.waiters),
         "completed": int(stats.completed),
         "failed": int(stats.failed),
+        "vertex_property_requests": int(stats.vertex_property_requests),
+        "vertex_property_leaders": int(stats.vertex_property_leaders),
+        "vertex_property_waiters": int(stats.vertex_property_waiters),
+        "vertex_property_completed": int(stats.vertex_property_completed),
+        "vertex_property_failed": int(stats.vertex_property_failed),
         "ram_cache_hits": int(stats.ram_cache_hits),
         "ram_cache_misses": int(stats.ram_cache_misses),
         "ram_cache_evictions": int(stats.ram_cache_evictions),
         "ram_cache_bytes": int(stats.ram_cache_bytes),
+        "edge_offset_requests": int(stats.edge_offset_requests),
+        "edge_offset_leaders": int(stats.edge_offset_leaders),
+        "edge_offset_waiters": int(stats.edge_offset_waiters),
+        "edge_offset_completed": int(stats.edge_offset_completed),
+        "edge_offset_failed": int(stats.edge_offset_failed),
         "vertex_property_ram_cache_hits": int(
             stats.vertex_property_ram_cache_hits
         ),
@@ -116,6 +126,11 @@ def _chunk_read_stats_to_dict(stats) -> dict[str, int]:
             stats.edge_offset_ram_cache_evictions
         ),
         "edge_offset_ram_cache_bytes": int(stats.edge_offset_ram_cache_bytes),
+        "edge_adj_list_requests": int(stats.edge_adj_list_requests),
+        "edge_adj_list_leaders": int(stats.edge_adj_list_leaders),
+        "edge_adj_list_waiters": int(stats.edge_adj_list_waiters),
+        "edge_adj_list_completed": int(stats.edge_adj_list_completed),
+        "edge_adj_list_failed": int(stats.edge_adj_list_failed),
         "edge_adj_list_ram_cache_hits": int(stats.edge_adj_list_ram_cache_hits),
         "edge_adj_list_ram_cache_misses": int(
             stats.edge_adj_list_ram_cache_misses

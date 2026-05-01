@@ -458,6 +458,54 @@ void ChunkReadManager::RecordRamCacheHit(CacheDomain domain) {
   return;
 }
 
+void ChunkReadManager::RecordRequest(CacheDomain domain) {
+  requests_.fetch_add(1, std::memory_order_relaxed);
+  switch (domain) {
+  case CacheDomain::kVertexProperty:
+    vertex_property_requests_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeOffset:
+    edge_offset_requests_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeAdjList:
+    edge_adj_list_requests_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  return;
+}
+
+void ChunkReadManager::RecordLeader(CacheDomain domain) {
+  leaders_.fetch_add(1, std::memory_order_relaxed);
+  switch (domain) {
+  case CacheDomain::kVertexProperty:
+    vertex_property_leaders_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeOffset:
+    edge_offset_leaders_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeAdjList:
+    edge_adj_list_leaders_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  return;
+}
+
+void ChunkReadManager::RecordWaiter(CacheDomain domain) {
+  waiters_.fetch_add(1, std::memory_order_relaxed);
+  switch (domain) {
+  case CacheDomain::kVertexProperty:
+    vertex_property_waiters_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeOffset:
+    edge_offset_waiters_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  case CacheDomain::kEdgeAdjList:
+    edge_adj_list_waiters_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  return;
+}
+
 void ChunkReadManager::RecordRamCacheMiss(CacheDomain domain) {
   switch (domain) {
   case CacheDomain::kVertexProperty:
@@ -548,8 +596,8 @@ void ChunkReadManager::RecordFeatureBatchServed(size_t rows) {
 
 ChunkReadManager::TableResult ChunkReadManager::GetOrLoad(
     const ChunkReadKey& key, const TableLoader& loader) {
-  requests_.fetch_add(1, std::memory_order_relaxed);
   const auto domain = CacheDomainFor(key);
+  RecordRequest(domain);
   const size_t ram_budget_bytes = RamBudgetBytesFor(domain);
 
   {
@@ -558,7 +606,7 @@ ChunkReadManager::TableResult ChunkReadManager::GetOrLoad(
     if (cached != nullptr) {
       RecordRamCacheHit(domain);
       TableResult result = cached;
-      RecordResult(result);
+      RecordResult(domain, result);
       return result;
     }
     if (ram_budget_bytes > 0) {
@@ -567,13 +615,13 @@ ChunkReadManager::TableResult ChunkReadManager::GetOrLoad(
   }
 
   if (!options_.enable_singleflight) {
-    leaders_.fetch_add(1, std::memory_order_relaxed);
+    RecordLeader(domain);
     TableResult result = loader();
     if (!result.has_error()) {
       std::lock_guard<std::mutex> lock(mutex_);
       InsertRamCacheLocked(key, result.value());
     }
-    RecordResult(result);
+    RecordResult(domain, result);
     return result;
   }
 
@@ -586,19 +634,19 @@ ChunkReadManager::TableResult ChunkReadManager::GetOrLoad(
     auto it = in_flight_.find(key);
     if (it != in_flight_.end()) {
       future = it->second;
-      waiters_.fetch_add(1, std::memory_order_relaxed);
+      RecordWaiter(domain);
     } else {
       promise = std::make_shared<std::promise<TableResult>>();
       future = promise->get_future().share();
       in_flight_.emplace(key, future);
       is_leader = true;
-      leaders_.fetch_add(1, std::memory_order_relaxed);
+      RecordLeader(domain);
     }
   }
 
   if (!is_leader) {
     TableResult result = future.get();
-    RecordResult(result);
+    RecordResult(domain, result);
     return result;
   }
 
@@ -623,7 +671,7 @@ ChunkReadManager::TableResult ChunkReadManager::GetOrLoad(
     in_flight_.erase(key);
   }
 
-  RecordResult(result);
+  RecordResult(domain, result);
   return result;
 }
 
@@ -757,18 +805,48 @@ ChunkReadStats ChunkReadManager::stats() const {
   stats.waiters = waiters_.load(std::memory_order_relaxed);
   stats.completed = completed_.load(std::memory_order_relaxed);
   stats.failed = failed_.load(std::memory_order_relaxed);
+  stats.vertex_property_requests =
+      vertex_property_requests_.load(std::memory_order_relaxed);
+  stats.vertex_property_leaders =
+      vertex_property_leaders_.load(std::memory_order_relaxed);
+  stats.vertex_property_waiters =
+      vertex_property_waiters_.load(std::memory_order_relaxed);
+  stats.vertex_property_completed =
+      vertex_property_completed_.load(std::memory_order_relaxed);
+  stats.vertex_property_failed =
+      vertex_property_failed_.load(std::memory_order_relaxed);
   stats.vertex_property_ram_cache_hits =
       vertex_property_ram_cache_hits_.load(std::memory_order_relaxed);
   stats.vertex_property_ram_cache_misses =
       vertex_property_ram_cache_misses_.load(std::memory_order_relaxed);
   stats.vertex_property_ram_cache_evictions =
       vertex_property_ram_cache_evictions_.load(std::memory_order_relaxed);
+  stats.edge_offset_requests =
+      edge_offset_requests_.load(std::memory_order_relaxed);
+  stats.edge_offset_leaders =
+      edge_offset_leaders_.load(std::memory_order_relaxed);
+  stats.edge_offset_waiters =
+      edge_offset_waiters_.load(std::memory_order_relaxed);
+  stats.edge_offset_completed =
+      edge_offset_completed_.load(std::memory_order_relaxed);
+  stats.edge_offset_failed =
+      edge_offset_failed_.load(std::memory_order_relaxed);
   stats.edge_offset_ram_cache_hits =
       edge_offset_ram_cache_hits_.load(std::memory_order_relaxed);
   stats.edge_offset_ram_cache_misses =
       edge_offset_ram_cache_misses_.load(std::memory_order_relaxed);
   stats.edge_offset_ram_cache_evictions =
       edge_offset_ram_cache_evictions_.load(std::memory_order_relaxed);
+  stats.edge_adj_list_requests =
+      edge_adj_list_requests_.load(std::memory_order_relaxed);
+  stats.edge_adj_list_leaders =
+      edge_adj_list_leaders_.load(std::memory_order_relaxed);
+  stats.edge_adj_list_waiters =
+      edge_adj_list_waiters_.load(std::memory_order_relaxed);
+  stats.edge_adj_list_completed =
+      edge_adj_list_completed_.load(std::memory_order_relaxed);
+  stats.edge_adj_list_failed =
+      edge_adj_list_failed_.load(std::memory_order_relaxed);
   stats.edge_adj_list_ram_cache_hits =
       edge_adj_list_ram_cache_hits_.load(std::memory_order_relaxed);
   stats.edge_adj_list_ram_cache_misses =
@@ -809,11 +887,34 @@ void ChunkReadManager::Shutdown() {
   }
 }
 
-void ChunkReadManager::RecordResult(const TableResult& result) {
+void ChunkReadManager::RecordResult(CacheDomain domain,
+                                    const TableResult& result) {
   if (result.has_error()) {
     failed_.fetch_add(1, std::memory_order_relaxed);
+    switch (domain) {
+    case CacheDomain::kVertexProperty:
+      vertex_property_failed_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case CacheDomain::kEdgeOffset:
+      edge_offset_failed_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case CacheDomain::kEdgeAdjList:
+      edge_adj_list_failed_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
   } else {
     completed_.fetch_add(1, std::memory_order_relaxed);
+    switch (domain) {
+    case CacheDomain::kVertexProperty:
+      vertex_property_completed_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case CacheDomain::kEdgeOffset:
+      edge_offset_completed_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    case CacheDomain::kEdgeAdjList:
+      edge_adj_list_completed_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
   }
 }
 
