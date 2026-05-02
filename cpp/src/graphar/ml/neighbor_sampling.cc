@@ -43,6 +43,28 @@ void AppendReservoirSample(std::vector<IdType>* neighbors, IdType* seen_neighbor
   }
 }
 
+// Floyd's algorithm: k distinct uniform picks from [0, n-1]. Requires k <= n.
+void SampleUniformLocalIndices(IdType n, IdType k, std::mt19937* gen,
+                               std::vector<IdType>* sorted_out) {
+  sorted_out->clear();
+  if (k == 0 || n == 0) {
+    return;
+  }
+  std::unordered_set<IdType> chosen;
+  chosen.reserve(static_cast<size_t>(k) * 2);
+  for (IdType i = n - k; i < n; ++i) {
+    std::uniform_int_distribution<IdType> dist(0, i);
+    const IdType j = dist(*gen);
+    if (chosen.find(j) != chosen.end()) {
+      chosen.insert(i);
+    } else {
+      chosen.insert(j);
+    }
+  }
+  sorted_out->assign(chosen.begin(), chosen.end());
+  std::sort(sorted_out->begin(), sorted_out->end());
+}
+
 class Int64ChunkedArrayCursor {
  public:
   explicit Int64ChunkedArrayCursor(
@@ -227,7 +249,9 @@ Result<SamplingResult> SampleNeighbors(
       Int64ChunkedArrayCursor offset_cursor(offset_column);
       IdType offset_len = offset_column->length();
 
-      GAR_RETURN_NOT_OK(adj_reader.seek_chunk_index(vertex_chunk_idx));
+      if (chunk_manager == nullptr) {
+        GAR_RETURN_NOT_OK(adj_reader.seek_chunk_index(vertex_chunk_idx));
+      }
 
       IdType cached_edge_chunk_idx = -1;
       std::shared_ptr<arrow::ChunkedArray> cached_dst_column;
@@ -244,52 +268,101 @@ Result<SamplingResult> SampleNeighbors(
 
         IdType total_edges = end_off - begin_off;
         std::vector<IdType> neighbors;
-        neighbors.reserve(std::min<IdType>(total_edges, max_neighbors));
-        IdType seen_neighbors = 0;
-
-        IdType cur_off = begin_off;
-        while (cur_off < end_off) {
-          IdType edge_chunk_idx = cur_off / edge_chunk_size;
-          IdType edge_chunk_start = edge_chunk_idx * edge_chunk_size;
-          IdType edge_chunk_end =
-              std::min(end_off, edge_chunk_start + edge_chunk_size);
-
-          if (edge_chunk_idx != cached_edge_chunk_idx) {
-            std::shared_ptr<arrow::Table> chunk_table;
-            if (chunk_manager != nullptr) {
-              GAR_ASSIGN_OR_RAISE(
-                  chunk_table,
-                  chunk_manager->GetEdgeAdjListChunk(
-                      graph_info, vertex_type, edge_type, vertex_type, adj_type,
-                      vertex_chunk_idx, edge_chunk_idx));
-            } else {
-              GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
-              GAR_ASSIGN_OR_RAISE(chunk_table, adj_reader.GetChunk());
-            }
-            if (!chunk_table) break;
-
-            cached_dst_column = chunk_table->column(1);
-            cached_cursor =
-                std::make_shared<Int64ChunkedArrayCursor>(cached_dst_column);
-            cached_edge_chunk_idx = edge_chunk_idx;
-          }
-
-          IdType row = cur_off - edge_chunk_start;
-          IdType row_end = edge_chunk_end - edge_chunk_start;
-          while (row < row_end) {
-            IdType available = 0;
-            GAR_ASSIGN_OR_RAISE(auto raw,
-                                cached_cursor->RawValuesAt(row, &available));
-            IdType batch = std::min(row_end - row, available);
-            AppendReservoirSample(&neighbors, &seen_neighbors, raw, batch,
-                                  max_neighbors, &gen);
-            row += batch;
-          }
-
-          cur_off = edge_chunk_end;
+        if (max_neighbors > 0) {
+          neighbors.reserve(
+              static_cast<size_t>(std::min<IdType>(total_edges, max_neighbors)));
         }
 
-        if (total_edges > max_neighbors) {
+        if (max_neighbors <= 0) {
+          // no outgoing edges recorded
+        } else if (total_edges <= static_cast<IdType>(max_neighbors)) {
+          IdType seen_neighbors = 0;
+          IdType cur_off = begin_off;
+          while (cur_off < end_off) {
+            IdType edge_chunk_idx = cur_off / edge_chunk_size;
+            IdType edge_chunk_start = edge_chunk_idx * edge_chunk_size;
+            IdType edge_chunk_end =
+                std::min(end_off, edge_chunk_start + edge_chunk_size);
+
+            if (edge_chunk_idx != cached_edge_chunk_idx) {
+              std::shared_ptr<arrow::Table> chunk_table;
+              if (chunk_manager != nullptr) {
+                GAR_ASSIGN_OR_RAISE(
+                    chunk_table,
+                    chunk_manager->GetEdgeAdjListChunk(
+                        graph_info, vertex_type, edge_type, vertex_type, adj_type,
+                        vertex_chunk_idx, edge_chunk_idx));
+              } else {
+                GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
+                GAR_ASSIGN_OR_RAISE(chunk_table, adj_reader.GetChunk());
+              }
+              if (!chunk_table) break;
+
+              cached_dst_column = chunk_table->column(1);
+              cached_cursor =
+                  std::make_shared<Int64ChunkedArrayCursor>(cached_dst_column);
+              cached_edge_chunk_idx = edge_chunk_idx;
+            }
+
+            IdType row = cur_off - edge_chunk_start;
+            IdType row_end = edge_chunk_end - edge_chunk_start;
+            while (row < row_end) {
+              IdType available = 0;
+              GAR_ASSIGN_OR_RAISE(auto raw,
+                                  cached_cursor->RawValuesAt(row, &available));
+              IdType batch = std::min(row_end - row, available);
+              AppendReservoirSample(&neighbors, &seen_neighbors, raw, batch,
+                                    max_neighbors, &gen);
+              row += batch;
+            }
+
+            cur_off = edge_chunk_end;
+          }
+        } else {
+          std::vector<IdType> local_indices;
+          SampleUniformLocalIndices(total_edges, static_cast<IdType>(max_neighbors),
+                                    &gen, &local_indices);
+          size_t pick_i = 0;
+          const size_t num_picks = local_indices.size();
+          while (pick_i < num_picks) {
+            const IdType abs_off = begin_off + local_indices[pick_i];
+            IdType edge_chunk_idx = abs_off / edge_chunk_size;
+            IdType edge_chunk_start = edge_chunk_idx * edge_chunk_size;
+
+            if (edge_chunk_idx != cached_edge_chunk_idx) {
+              std::shared_ptr<arrow::Table> chunk_table;
+              if (chunk_manager != nullptr) {
+                GAR_ASSIGN_OR_RAISE(
+                    chunk_table,
+                    chunk_manager->GetEdgeAdjListChunk(
+                        graph_info, vertex_type, edge_type, vertex_type, adj_type,
+                        vertex_chunk_idx, edge_chunk_idx));
+              } else {
+                GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
+                GAR_ASSIGN_OR_RAISE(chunk_table, adj_reader.GetChunk());
+              }
+              if (!chunk_table) break;
+
+              cached_dst_column = chunk_table->column(1);
+              cached_cursor =
+                  std::make_shared<Int64ChunkedArrayCursor>(cached_dst_column);
+              cached_edge_chunk_idx = edge_chunk_idx;
+            }
+
+            while (pick_i < num_picks) {
+              const IdType abs_off2 = begin_off + local_indices[pick_i];
+              if (abs_off2 / edge_chunk_size != edge_chunk_idx) {
+                break;
+              }
+              const IdType row = abs_off2 - edge_chunk_start;
+              GAR_ASSIGN_OR_RAISE(auto dst_val, cached_cursor->ValueAt(row));
+              neighbors.push_back(static_cast<IdType>(dst_val));
+              ++pick_i;
+            }
+          }
+        }
+
+        if (total_edges > max_neighbors && max_neighbors > 0) {
           std::shuffle(neighbors.begin(), neighbors.end(), gen);
         }
 

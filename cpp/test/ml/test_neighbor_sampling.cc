@@ -290,6 +290,20 @@ TEST_CASE_METHOD(GlobalFixture, "SampleNeighbors - fanout respected on ldbc_samp
 }
 
 TEST_CASE_METHOD(GlobalFixture,
+                 "SampleNeighbors - sparse fanout when degree exceeds fanout") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+
+  auto result =
+      SampleNeighbors(graph_info, kVertexType, kEdgeType, {0}, {1}, 777);
+  REQUIRE(result.status().ok());
+
+  const auto edges = ToNodeEdges(result.value());
+  REQUIRE(edges.size() == 1);
+  REQUIRE(edges[0].first == 0);
+  REQUIRE(std::set<IdType>{87, 623, 849}.count(edges[0].second) == 1);
+}
+
+TEST_CASE_METHOD(GlobalFixture,
                  "SampleNeighbors - deterministic with seed on ldbc_sample") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
 

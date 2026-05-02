@@ -33,6 +33,9 @@ struct SamplingResult {
  * @param edge_type The edge type to traverse
  * @param seed_nodes Vector of seed node internal IDs
  * @param fanout Vector of neighbor counts per hop (e.g., [10, 5] for 2-hop)
+ * @param seed RNG seed. When a source has more neighbors than the hop cap, a
+ *   uniform without-replacement subset of that size is taken (Floyd; then
+ *   shuffled). If it has at most that many neighbors, all are used in CSR order.
  * @return Result containing sampled nodes and edge structure
  */
 Result<SamplingResult> SampleNeighbors(
