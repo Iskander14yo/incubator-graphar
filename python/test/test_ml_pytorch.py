@@ -31,6 +31,8 @@ def _make_loader(
     adj_list_ram_for_loader_mb=0,
     offset_ram_for_loader_mb=0,
     feature_ram_for_loader_mb=0,
+    edge_cursor_count=0,
+    edge_cursor_trail_chunks=0,
     num_readers=None,
     num_stitchers=1,
 ):
@@ -50,6 +52,8 @@ def _make_loader(
         adj_list_ram_for_loader_mb=adj_list_ram_for_loader_mb,
         offset_ram_for_loader_mb=offset_ram_for_loader_mb,
         feature_ram_for_loader_mb=feature_ram_for_loader_mb,
+        edge_cursor_count=edge_cursor_count,
+        edge_cursor_trail_chunks=edge_cursor_trail_chunks,
         num_readers=num_readers,
         num_stitchers=num_stitchers,
     )
@@ -349,6 +353,28 @@ def test_chunk_manager_is_used_for_sampling_without_features(ldbc_graph):
     assert stats["failed"] == 0
 
 
+def test_edge_cursor_stats_are_exposed(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=[],
+        batch_size=2,
+        shuffle=False,
+        edge_cursor_count=1,
+        edge_cursor_trail_chunks=1,
+    )
+    list(loader)
+
+    offset_stats = loader.edge_offset_cursor_stats()
+    adj_stats = loader.edge_adj_list_cursor_stats()
+    assert offset_stats["cursor_count"] == 1
+    assert adj_stats["cursor_count"] == 1
+    assert offset_stats["requests"] > 0
+    assert adj_stats["requests"] > 0
+    assert offset_stats["requests_completed"] == offset_stats["requests"]
+    assert adj_stats["requests_completed"] == adj_stats["requests"]
+
+
 def test_negative_adj_list_ram_for_loader_is_rejected(ldbc_graph):
     with pytest.raises(ValueError, match="adj_list_ram_for_loader_mb"):
         _make_loader(ldbc_graph, adj_list_ram_for_loader_mb=-1)
@@ -367,6 +393,16 @@ def test_negative_prefetch_batches_is_rejected(ldbc_graph):
 def test_negative_feature_ram_for_loader_is_rejected(ldbc_graph):
     with pytest.raises(ValueError, match="feature_ram_for_loader_mb"):
         _make_loader(ldbc_graph, feature_ram_for_loader_mb=-1)
+
+
+def test_negative_edge_cursor_count_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="edge_cursor_count"):
+        _make_loader(ldbc_graph, edge_cursor_count=-1)
+
+
+def test_negative_edge_cursor_trail_chunks_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="edge_cursor_trail_chunks"):
+        _make_loader(ldbc_graph, edge_cursor_trail_chunks=-1)
 
 
 def test_valid_batch_with_zero_fanout(ldbc_graph):

@@ -142,6 +142,29 @@ def _chunk_read_stats_to_dict(stats) -> dict[str, int]:
     }
 
 
+def _cursor_stats_to_dict(stats) -> dict[str, int]:
+    return {
+        "cursor_count": int(stats.cursor_count),
+        "trail_capacity_chunks": int(stats.trail_capacity_chunks),
+        "requests": int(stats.requests),
+        "requests_completed": int(stats.requests_completed),
+        "requests_failed": int(stats.requests_failed),
+        "active_requests_peak": int(stats.active_requests_peak),
+        "chunks_read": int(stats.chunks_read),
+        "chunks_served": int(stats.chunks_served),
+        "chunk_order_wraps": int(stats.chunk_order_wraps),
+        "rows_served": int(stats.rows_served),
+        "batches_served": int(stats.batches_served),
+        "trail_hits": int(stats.trail_hits),
+        "trail_misses": int(stats.trail_misses),
+        "trail_evictions": int(stats.trail_evictions),
+        "wait_ms_sum": int(stats.wait_ms_sum),
+        "wait_ms_max": int(stats.wait_ms_max),
+        "service_ms_sum": int(stats.service_ms_sum),
+        "service_ms_max": int(stats.service_ms_max),
+    }
+
+
 def _feature_pipeline_stats_to_dict(stats) -> dict[str, int]:
     return {
         "submitted_batches": int(stats.submitted_batches),
@@ -198,6 +221,8 @@ class GARNeighborLoader(IterableDataset):
         adj_list_ram_for_loader_mb: int = 0,
         offset_ram_for_loader_mb: int = 0,
         feature_ram_for_loader_mb: int = 0,
+        edge_cursor_count: int = 0,
+        edge_cursor_trail_chunks: int = 0,
         num_readers: int | None = None,
         num_stitchers: int = 1,
         feature_cursor_count: int | None = None,
@@ -223,6 +248,12 @@ class GARNeighborLoader(IterableDataset):
             raise ValueError(msg)
         if feature_ram_for_loader_mb < 0:
             msg = "feature_ram_for_loader_mb must be >= 0"
+            raise ValueError(msg)
+        if edge_cursor_count < 0:
+            msg = "edge_cursor_count must be >= 0"
+            raise ValueError(msg)
+        if edge_cursor_trail_chunks < 0:
+            msg = "edge_cursor_trail_chunks must be >= 0"
             raise ValueError(msg)
         if num_readers is None:
             num_readers = 1 if feature_cursor_count is None else feature_cursor_count
@@ -254,6 +285,10 @@ class GARNeighborLoader(IterableDataset):
         )
         edge_chunk_manager_options.edge_offset_ram_budget_bytes = (
             int(offset_ram_for_loader_mb) * 1024 * 1024
+        )
+        edge_chunk_manager_options.edge_cursor_count = int(edge_cursor_count)
+        edge_chunk_manager_options.edge_cursor_trail_capacity_chunks = int(
+            edge_cursor_trail_chunks
         )
         self._sampling_chunk_manager = gar_ml._ChunkReadManager(
             edge_chunk_manager_options
@@ -341,32 +376,19 @@ class GARNeighborLoader(IterableDataset):
         return _feature_pipeline_stats_to_dict(self._feature_pipeline.stats())
 
     def feature_cursor_stats(self) -> dict[str, int]:
-        stats = self._feature_chunk_manager.feature_cursor_stats()
-        return {
-            "cursor_count": int(stats.cursor_count),
-            "trail_capacity_chunks": int(stats.trail_capacity_chunks),
-            "requests": int(stats.requests),
-            "requests_completed": int(stats.requests_completed),
-            "requests_failed": int(stats.requests_failed),
-            "active_requests_peak": int(stats.active_requests_peak),
-            "chunks_read": int(stats.chunks_read),
-            "chunks_served": int(stats.chunks_served),
-            "chunk_order_wraps": int(stats.chunk_order_wraps),
-            "rows_served": int(stats.rows_served),
-            "batches_served": int(stats.batches_served),
-            "trail_hits": int(stats.trail_hits),
-            "trail_misses": int(stats.trail_misses),
-            "trail_evictions": int(stats.trail_evictions),
-            "wait_ms_sum": int(stats.wait_ms_sum),
-            "wait_ms_max": int(stats.wait_ms_max),
-            "service_ms_sum": int(stats.service_ms_sum),
-            "service_ms_max": int(stats.service_ms_max),
-        }
+        return _cursor_stats_to_dict(self._feature_chunk_manager.feature_cursor_stats())
+
+    def edge_offset_cursor_stats(self) -> dict[str, int]:
+        return _cursor_stats_to_dict(self._sampling_chunk_manager.edge_offset_cursor_stats())
+
+    def edge_adj_list_cursor_stats(self) -> dict[str, int]:
+        return _cursor_stats_to_dict(self._sampling_chunk_manager.edge_adj_list_cursor_stats())
 
     def close(self) -> None:
         if self._feature_pipeline is not None:
             self._feature_pipeline.shutdown()
         self._feature_chunk_manager.shutdown()
+        self._sampling_chunk_manager.shutdown()
 
     def _sample_and_submit_batch(self, seed_nodes: list[int], seed: int) -> _SampledBatch:
         total_started_at = time.perf_counter()
