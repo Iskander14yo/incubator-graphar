@@ -300,6 +300,13 @@ struct FeaturePipelineCoordinator::Impl {
         stitch_wait_ms_sum_.load(std::memory_order_relaxed);
     stats.stitch_service_ms_sum =
         stitch_service_ms_sum_.load(std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stats.active_batches_current = active_batches_.size();
+      stats.active_chunk_keys_current = active_chunks_.size();
+      stats.read_queue_current = read_queue_.size();
+      stats.stitch_queue_current = stitch_queue_.size();
+    }
     return stats;
   }
 

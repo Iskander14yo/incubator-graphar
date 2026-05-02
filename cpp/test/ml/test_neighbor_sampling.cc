@@ -613,8 +613,12 @@ TEST_CASE_METHOD(
   const auto pipeline_stats = coordinator.Stats();
   REQUIRE(pipeline_stats.submitted_batches == 2);
   REQUIRE(pipeline_stats.completed_batches == 2);
+  REQUIRE(pipeline_stats.active_batches_current == 0);
   REQUIRE(pipeline_stats.pending_batches_peak >= 1);
+  REQUIRE(pipeline_stats.active_chunk_keys_current == 0);
   REQUIRE(pipeline_stats.active_chunk_keys_peak == 1);
+  REQUIRE(pipeline_stats.read_queue_current == 0);
+  REQUIRE(pipeline_stats.stitch_queue_current == 0);
   REQUIRE(pipeline_stats.chunk_subscriptions == 2);
   REQUIRE(pipeline_stats.chunk_reads == 1);
   REQUIRE(pipeline_stats.chunk_reuses == 1);
