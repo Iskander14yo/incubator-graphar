@@ -716,6 +716,7 @@ TEST_CASE_METHOD(
   REQUIRE(stats.requests_failed == 0);
   REQUIRE(stats.chunks_read == 1);
   REQUIRE(stats.chunks_served == 1);
+  REQUIRE(stats.chunk_order_wraps == 0);
   REQUIRE(stats.rows_served == total_rows_served);
   REQUIRE(stats.batches_served == node_requests.size());
 }
@@ -788,6 +789,51 @@ TEST_CASE_METHOD(
 
 TEST_CASE_METHOD(
     GlobalFixture,
+    "Cursor-backed feature manager wraps chunk order for lower chunk ids") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  auto vertex_info = graph_info->GetVertexInfo(kVertexType);
+  REQUIRE(vertex_info != nullptr);
+
+  const auto chunk_count = GetVertexChunkNumOrRequire(graph_info, vertex_info);
+  REQUIRE(chunk_count >= 2);
+
+  auto chunk_manager = MakeFeatureManagedChunkReader(1);
+  const IdType high_chunk_id = chunk_count - 1;
+  const IdType low_chunk_id = 0;
+  const IdType high_node_id =
+      GetChunkStartNodeId(graph_info, vertex_info, high_chunk_id);
+  const IdType low_node_id =
+      GetChunkStartNodeId(graph_info, vertex_info, low_chunk_id);
+
+  auto first_expected =
+      GetNodeFeatures(graph_info, kVertexType, {high_node_id}, {"id"});
+  auto second_expected =
+      GetNodeFeatures(graph_info, kVertexType, {low_node_id}, {"id"});
+
+  auto first =
+      SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType,
+                            {high_node_id}, {"id"});
+  auto second =
+      SubmitAndWaitFeatures(graph_info, &chunk_manager, kVertexType,
+                            {low_node_id}, {"id"});
+  REQUIRE(first_expected.status().ok());
+  REQUIRE(second_expected.status().ok());
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+  REQUIRE(first.value()->Equals(*first_expected.value()));
+  REQUIRE(second.value()->Equals(*second_expected.value()));
+
+  const auto stats = chunk_manager.feature_cursor_stats();
+  REQUIRE(stats.requests == 2);
+  REQUIRE(stats.requests_completed == 2);
+  REQUIRE(stats.requests_failed == 0);
+  REQUIRE(stats.chunks_read == 2);
+  REQUIRE(stats.chunks_served == 2);
+  REQUIRE(stats.chunk_order_wraps == 1);
+}
+
+TEST_CASE_METHOD(
+    GlobalFixture,
     "Cursor-backed feature manager reuses trail cache for repeated chunk request") {
   auto graph_info = LoadLdbcSampleGraph(test_data_dir);
   auto vertex_info = graph_info->GetVertexInfo(kVertexType);
@@ -819,6 +865,7 @@ TEST_CASE_METHOD(
   REQUIRE(stats.requests_failed == 0);
   REQUIRE(stats.chunks_read == 1);
   REQUIRE(stats.chunks_served == 1);
+  REQUIRE(stats.chunk_order_wraps == 0);
   REQUIRE(stats.rows_served == 4);
   REQUIRE(stats.batches_served == 2);
   REQUIRE(stats.trail_hits == 1);
