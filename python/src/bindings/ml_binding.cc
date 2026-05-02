@@ -207,10 +207,18 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
                     &graphar::ml::FeaturePipelineStats::submitted_batches)
       .def_readonly("completed_batches",
                     &graphar::ml::FeaturePipelineStats::completed_batches)
+      .def_readonly("active_batches_current",
+                    &graphar::ml::FeaturePipelineStats::active_batches_current)
       .def_readonly("pending_batches_peak",
                     &graphar::ml::FeaturePipelineStats::pending_batches_peak)
+      .def_readonly("active_chunk_keys_current",
+                    &graphar::ml::FeaturePipelineStats::active_chunk_keys_current)
       .def_readonly("active_chunk_keys_peak",
                     &graphar::ml::FeaturePipelineStats::active_chunk_keys_peak)
+      .def_readonly("read_queue_current",
+                    &graphar::ml::FeaturePipelineStats::read_queue_current)
+      .def_readonly("stitch_queue_current",
+                    &graphar::ml::FeaturePipelineStats::stitch_queue_current)
       .def_readonly("chunk_subscriptions",
                     &graphar::ml::FeaturePipelineStats::chunk_subscriptions)
       .def_readonly("chunk_reads",
@@ -283,6 +291,8 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
                     &graphar::ml::FeatureCursorStats::chunks_read)
       .def_readonly("chunks_served",
                     &graphar::ml::FeatureCursorStats::chunks_served)
+      .def_readonly("chunk_order_wraps",
+                    &graphar::ml::FeatureCursorStats::chunk_order_wraps)
       .def_readonly("rows_served",
                     &graphar::ml::FeatureCursorStats::rows_served)
       .def_readonly("batches_served",

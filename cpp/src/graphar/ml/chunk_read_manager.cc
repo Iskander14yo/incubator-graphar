@@ -23,6 +23,8 @@
 #include <deque>
 #include <exception>
 #include <iterator>
+#include <limits>
+#include <map>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -150,6 +152,13 @@ struct ChunkReadManager::FeatureCursorState {
     std::promise<TableResult> promise;
   };
 
+  struct QueueState {
+    std::map<IdType, std::deque<std::shared_ptr<Task>>> tasks_by_chunk_id;
+    size_t task_count = 0;
+    IdType next_chunk_id = 0;
+    bool has_next_chunk_id = false;
+  };
+
   explicit FeatureCursorState(const ChunkReadManagerOptions& options)
       : cursor_count_(options.feature_cursor_count),
         trail_capacity_chunks_(options.feature_cursor_trail_capacity_chunks),
@@ -194,7 +203,9 @@ struct ChunkReadManager::FeatureCursorState {
       if (shutdown_) {
         return Status::Invalid("Feature cursor is shut down");
       }
-      queues_[CursorIndexFor(key)].push_back(task);
+      auto& queue = queues_[CursorIndexFor(key)];
+      queue.tasks_by_chunk_id[task->chunk_id].push_back(task);
+      queue.task_count += 1;
     }
     cv_.notify_all();
     return future.get();
@@ -212,6 +223,8 @@ struct ChunkReadManager::FeatureCursorState {
         active_requests_peak_.load(std::memory_order_relaxed);
     stats.chunks_read = chunks_read_.load(std::memory_order_relaxed);
     stats.chunks_served = chunks_served_.load(std::memory_order_relaxed);
+    stats.chunk_order_wraps =
+        chunk_order_wraps_.load(std::memory_order_relaxed);
     stats.rows_served = rows_served_.load(std::memory_order_relaxed);
     stats.batches_served = batches_served_.load(std::memory_order_relaxed);
     stats.trail_hits = trail_hits_.load(std::memory_order_relaxed);
@@ -233,10 +246,14 @@ struct ChunkReadManager::FeatureCursorState {
       }
       shutdown_ = true;
       for (auto& queue : queues_) {
-        while (!queue.empty()) {
-          pending.push_back(std::move(queue.front()));
-          queue.pop_front();
+        for (auto& [_, tasks] : queue.tasks_by_chunk_id) {
+          while (!tasks.empty()) {
+            pending.push_back(std::move(tasks.front()));
+            tasks.pop_front();
+          }
         }
+        queue.tasks_by_chunk_id.clear();
+        queue.task_count = 0;
       }
     }
 
@@ -280,17 +297,55 @@ struct ChunkReadManager::FeatureCursorState {
     return ChunkReadKeyHash{}(key) % cursor_count_;
   }
 
+  static IdType NextChunkIdAfter(IdType chunk_id) {
+    if (chunk_id == std::numeric_limits<IdType>::max()) {
+      return std::numeric_limits<IdType>::min();
+    }
+    return chunk_id + 1;
+  }
+
+  std::shared_ptr<Task> PopNextTaskLocked(size_t index, bool* wrapped) {
+    auto& queue = queues_[index];
+    if (queue.task_count == 0) {
+      return nullptr;
+    }
+
+    auto it = queue.tasks_by_chunk_id.begin();
+    if (queue.has_next_chunk_id) {
+      it = queue.tasks_by_chunk_id.lower_bound(queue.next_chunk_id);
+      if (it == queue.tasks_by_chunk_id.end()) {
+        it = queue.tasks_by_chunk_id.begin();
+        *wrapped = true;
+      }
+    }
+
+    auto task = std::move(it->second.front());
+    it->second.pop_front();
+    if (it->second.empty()) {
+      queue.tasks_by_chunk_id.erase(it);
+    }
+    queue.task_count -= 1;
+    queue.next_chunk_id = NextChunkIdAfter(task->chunk_id);
+    queue.has_next_chunk_id = true;
+    return task;
+  }
+
   void WorkerLoop(size_t index) {
     while (true) {
       std::shared_ptr<Task> task;
+      bool wrapped = false;
       {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&]() { return shutdown_ || !queues_[index].empty(); });
-        if (shutdown_ && queues_[index].empty()) {
+        cv_.wait(lock,
+                 [&]() { return shutdown_ || queues_[index].task_count > 0; });
+        if (shutdown_ && queues_[index].task_count == 0) {
           return;
         }
-        task = std::move(queues_[index].front());
-        queues_[index].pop_front();
+        task = PopNextTaskLocked(index, &wrapped);
+      }
+
+      if (wrapped) {
+        chunk_order_wraps_.fetch_add(1, std::memory_order_relaxed);
       }
 
       if (IsShutdown()) {
@@ -393,7 +448,7 @@ struct ChunkReadManager::FeatureCursorState {
   std::condition_variable cv_;
   bool shutdown_ = false;
   std::vector<std::thread> workers_;
-  std::vector<std::deque<std::shared_ptr<Task>>> queues_;
+  std::vector<QueueState> queues_;
   std::list<TrailEntry> trail_;
   std::unordered_map<ChunkReadKey, std::list<TrailEntry>::iterator,
                      ChunkReadKeyHash>
@@ -406,6 +461,7 @@ struct ChunkReadManager::FeatureCursorState {
   std::atomic<uint64_t> active_requests_peak_{0};
   std::atomic<uint64_t> chunks_read_{0};
   std::atomic<uint64_t> chunks_served_{0};
+  std::atomic<uint64_t> chunk_order_wraps_{0};
   std::atomic<uint64_t> rows_served_{0};
   std::atomic<uint64_t> batches_served_{0};
   std::atomic<uint64_t> trail_hits_{0};

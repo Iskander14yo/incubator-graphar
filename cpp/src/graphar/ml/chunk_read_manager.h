@@ -122,6 +122,7 @@ struct FeatureCursorStats {
   uint64_t active_requests_peak = 0;
   uint64_t chunks_read = 0;
   uint64_t chunks_served = 0;
+  uint64_t chunk_order_wraps = 0;
   uint64_t rows_served = 0;
   uint64_t batches_served = 0;
   uint64_t trail_hits = 0;

@@ -46,8 +46,12 @@ struct FeaturePipelineOptions {
 struct FeaturePipelineStats {
   uint64_t submitted_batches = 0;
   uint64_t completed_batches = 0;
+  uint64_t active_batches_current = 0;
   uint64_t pending_batches_peak = 0;
+  uint64_t active_chunk_keys_current = 0;
   uint64_t active_chunk_keys_peak = 0;
+  uint64_t read_queue_current = 0;
+  uint64_t stitch_queue_current = 0;
   uint64_t chunk_subscriptions = 0;
   uint64_t chunk_reads = 0;
   uint64_t chunk_reuses = 0;
