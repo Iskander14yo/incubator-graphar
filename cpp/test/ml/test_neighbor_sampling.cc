@@ -447,6 +447,42 @@ TEST_CASE_METHOD(GlobalFixture,
   REQUIRE(stats.failed == 0);
 }
 
+TEST_CASE_METHOD(GlobalFixture,
+                 "SampleNeighbors - edge cursors preserve uncached output") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  ChunkReadManagerOptions options;
+  options.edge_cursor_count = 1;
+  options.edge_cursor_trail_capacity_chunks = 1;
+  ChunkReadManager manager(options);
+
+  auto uncached =
+      SampleNeighbors(graph_info, kVertexType, kEdgeType, {0, 1}, {3, 2}, 42);
+  auto managed = SampleNeighbors(graph_info, kVertexType, kEdgeType, {0, 1},
+                                 {3, 2}, 42, &manager);
+  REQUIRE(uncached.status().ok());
+  REQUIRE(managed.status().ok());
+
+  REQUIRE(managed.value().sampled_nodes == uncached.value().sampled_nodes);
+  REQUIRE(managed.value().src_indices == uncached.value().src_indices);
+  REQUIRE(managed.value().dst_indices == uncached.value().dst_indices);
+  REQUIRE(managed.value().num_sampled_nodes_per_hop ==
+          uncached.value().num_sampled_nodes_per_hop);
+  REQUIRE(managed.value().num_sampled_edges_per_hop ==
+          uncached.value().num_sampled_edges_per_hop);
+
+  const auto offset_stats = manager.edge_offset_cursor_stats();
+  REQUIRE(offset_stats.cursor_count == 1);
+  REQUIRE(offset_stats.requests > 0);
+  REQUIRE(offset_stats.requests_completed == offset_stats.requests);
+  REQUIRE(offset_stats.requests_failed == 0);
+
+  const auto adj_stats = manager.edge_adj_list_cursor_stats();
+  REQUIRE(adj_stats.cursor_count == 1);
+  REQUIRE(adj_stats.requests > 0);
+  REQUIRE(adj_stats.requests_completed == adj_stats.requests);
+  REQUIRE(adj_stats.requests_failed == 0);
+}
+
 //////////////////////////// GetNodeFeatures /////////////////////////////////////
 
 TEST_CASE_METHOD(GlobalFixture, "GetNodeFeatures - single property on ldbc_sample") {

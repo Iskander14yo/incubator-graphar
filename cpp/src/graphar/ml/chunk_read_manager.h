@@ -70,6 +70,8 @@ struct ChunkReadManagerOptions {
   size_t ram_budget_bytes = 0;
   size_t edge_offset_ram_budget_bytes = 0;
   size_t edge_adj_list_ram_budget_bytes = 0;
+  size_t edge_cursor_count = 0;
+  size_t edge_cursor_trail_capacity_chunks = 0;
   size_t feature_cursor_count = 0;
   size_t feature_cursor_trail_capacity_chunks = 0;
 };
@@ -166,6 +168,8 @@ class ChunkReadManager {
 
   ChunkReadStats stats() const;
   FeatureCursorStats feature_cursor_stats() const;
+  FeatureCursorStats edge_offset_cursor_stats() const;
+  FeatureCursorStats edge_adj_list_cursor_stats() const;
   void RegisterFeatureRequest();
   void CompleteFeatureRequest(std::chrono::steady_clock::time_point start,
                               bool ok);
@@ -181,7 +185,7 @@ class ChunkReadManager {
 
   using Clock = std::chrono::steady_clock;
 
-  struct FeatureCursorState;
+  struct CursorState;
   enum class CacheDomain {
     kVertexProperty,
     kEdgeOffset,
@@ -222,7 +226,9 @@ class ChunkReadManager {
   std::unordered_map<ChunkReadKey, std::shared_future<TableResult>,
                      ChunkReadKeyHash>
       in_flight_;
-  std::unique_ptr<FeatureCursorState> feature_cursor_;
+  std::unique_ptr<CursorState> feature_cursor_;
+  std::unique_ptr<CursorState> edge_offset_cursor_;
+  std::unique_ptr<CursorState> edge_adj_list_cursor_;
 
   std::atomic<uint64_t> requests_{0};
   std::atomic<uint64_t> leaders_{0};

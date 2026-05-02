@@ -110,6 +110,39 @@ Result<std::shared_ptr<arrow::Table>> LoadVertexPropertyChunkDirect(
   return chunk_result.value();
 }
 
+Result<std::shared_ptr<arrow::Table>> LoadEdgeOffsetChunkDirect(
+    const std::shared_ptr<GraphInfo>& graph_info,
+    const std::shared_ptr<EdgeInfo>& edge_info, AdjListType adj_list_type,
+    IdType vertex_chunk_id) {
+  const std::string& prefix = graph_info->GetPrefix();
+  std::string normalized_prefix;
+  GAR_ASSIGN_OR_RAISE(auto fs,
+                      FileSystemFromUriOrPath(prefix, &normalized_prefix));
+  GAR_ASSIGN_OR_RAISE(
+      auto chunk_file_path,
+      edge_info->GetAdjListOffsetFilePath(vertex_chunk_id, adj_list_type));
+  auto file_type = edge_info->GetAdjacentList(adj_list_type)->GetFileType();
+  GAR_ASSIGN_OR_RAISE(auto table,
+                      fs->ReadFileToTable(normalized_prefix + chunk_file_path,
+                                          file_type));
+  if (table->num_columns() == 0) {
+    return Status::Invalid("Offset file for edge type '", edge_info->GetEdgeType(),
+                           "' has no columns");
+  }
+  return table;
+}
+
+Result<std::shared_ptr<arrow::Table>> LoadEdgeAdjListChunkDirect(
+    const std::shared_ptr<GraphInfo>& graph_info,
+    const std::shared_ptr<EdgeInfo>& edge_info, AdjListType adj_list_type,
+    IdType vertex_chunk_id, IdType chunk_id) {
+  AdjListArrowChunkReader reader(edge_info, adj_list_type, graph_info->GetPrefix());
+  GAR_RETURN_NOT_OK(reader.seek_chunk_index(vertex_chunk_id, chunk_id));
+  auto chunk_result = reader.GetChunk();
+  GAR_RETURN_NOT_OK(chunk_result.status());
+  return chunk_result.value();
+}
+
 }  // namespace
 
 bool ChunkReadKey::operator==(const ChunkReadKey& other) const {
@@ -136,7 +169,17 @@ size_t ChunkReadKeyHash::operator()(const ChunkReadKey& key) const {
   return seed;
 }
 
-struct ChunkReadManager::FeatureCursorState {
+struct ChunkReadManager::CursorState {
+  struct OrderKey {
+    IdType primary = 0;
+    IdType secondary = 0;
+
+    bool operator<(const OrderKey& other) const {
+      return primary < other.primary ||
+             (primary == other.primary && secondary < other.secondary);
+    }
+  };
+
   struct TrailEntry {
     ChunkReadKey key;
     TablePtr table;
@@ -144,24 +187,23 @@ struct ChunkReadManager::FeatureCursorState {
 
   struct Task {
     ChunkReadKey key;
-    std::shared_ptr<GraphInfo> graph_info;
-    std::string vertex_type;
-    std::shared_ptr<PropertyGroup> property_group;
-    std::shared_ptr<VertexInfo> vertex_info;
-    IdType chunk_id = 0;
+    OrderKey order_key;
+    TableLoader loader;
     std::promise<TableResult> promise;
   };
 
   struct QueueState {
-    std::map<IdType, std::deque<std::shared_ptr<Task>>> tasks_by_chunk_id;
+    std::map<OrderKey, std::deque<std::shared_ptr<Task>>> tasks_by_order_key;
     size_t task_count = 0;
-    IdType next_chunk_id = 0;
-    bool has_next_chunk_id = false;
+    OrderKey next_order_key;
+    bool has_next_order_key = false;
   };
 
-  explicit FeatureCursorState(const ChunkReadManagerOptions& options)
-      : cursor_count_(options.feature_cursor_count),
-        trail_capacity_chunks_(options.feature_cursor_trail_capacity_chunks),
+  CursorState(size_t cursor_count, size_t trail_capacity_chunks,
+              bool auto_track_requests)
+      : cursor_count_(cursor_count),
+        trail_capacity_chunks_(trail_capacity_chunks),
+        auto_track_requests_(auto_track_requests),
         queues_(cursor_count_) {
     workers_.reserve(cursor_count_);
     for (size_t i = 0; i < cursor_count_; ++i) {
@@ -169,21 +211,38 @@ struct ChunkReadManager::FeatureCursorState {
     }
   }
 
-  ~FeatureCursorState() { Shutdown(); }
+  ~CursorState() { Shutdown(); }
 
-  TableResult LoadChunk(const std::shared_ptr<GraphInfo>& graph_info,
-                        const std::string& vertex_type,
-                        const std::shared_ptr<PropertyGroup>& property_group,
-                        const std::shared_ptr<VertexInfo>& vertex_info,
-                        const ChunkReadKey& key, IdType chunk_id) {
+  TableResult LoadChunk(const ChunkReadKey& key, OrderKey order_key,
+                        const TableLoader& loader) {
+    struct AutoRequestTracker {
+      CursorState* state = nullptr;
+      Clock::time_point start;
+      bool ok = false;
+
+      ~AutoRequestTracker() {
+        if (state != nullptr) {
+          state->CompleteRequest(start, ok);
+        }
+      }
+    };
+
+    AutoRequestTracker tracker;
+    if (auto_track_requests_) {
+      RegisterRequest();
+      tracker.state = this;
+      tracker.start = Clock::now();
+    }
+
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (shutdown_) {
-        return Status::Invalid("Feature cursor is shut down");
+        return Status::Invalid("Chunk cursor is shut down");
       }
       auto trail_table = LookupTrailLocked(key);
       if (trail_table != nullptr) {
         trail_hits_.fetch_add(1, std::memory_order_relaxed);
+        tracker.ok = true;
         return trail_table;
       }
       trail_misses_.fetch_add(1, std::memory_order_relaxed);
@@ -191,24 +250,25 @@ struct ChunkReadManager::FeatureCursorState {
 
     auto task = std::make_shared<Task>();
     task->key = key;
-    task->graph_info = graph_info;
-    task->vertex_type = vertex_type;
-    task->property_group = property_group;
-    task->vertex_info = vertex_info;
-    task->chunk_id = chunk_id;
+    task->order_key = order_key;
+    task->loader = loader;
     auto future = task->promise.get_future();
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (shutdown_) {
-        return Status::Invalid("Feature cursor is shut down");
+        return Status::Invalid("Chunk cursor is shut down");
       }
       auto& queue = queues_[CursorIndexFor(key)];
-      queue.tasks_by_chunk_id[task->chunk_id].push_back(task);
+      queue.tasks_by_order_key[task->order_key].push_back(task);
       queue.task_count += 1;
     }
     cv_.notify_all();
-    return future.get();
+    auto result = future.get();
+    if (tracker.state != nullptr) {
+      tracker.ok = !result.has_error();
+    }
+    return result;
   }
 
   FeatureCursorStats stats() const {
@@ -246,20 +306,20 @@ struct ChunkReadManager::FeatureCursorState {
       }
       shutdown_ = true;
       for (auto& queue : queues_) {
-        for (auto& [_, tasks] : queue.tasks_by_chunk_id) {
+        for (auto& [_, tasks] : queue.tasks_by_order_key) {
           while (!tasks.empty()) {
             pending.push_back(std::move(tasks.front()));
             tasks.pop_front();
           }
         }
-        queue.tasks_by_chunk_id.clear();
+        queue.tasks_by_order_key.clear();
         queue.task_count = 0;
       }
     }
 
     cv_.notify_all();
     for (const auto& task : pending) {
-      task->promise.set_value(Status::Invalid("Feature cursor is shut down"));
+      task->promise.set_value(Status::Invalid("Chunk cursor is shut down"));
     }
     for (auto& worker : workers_) {
       if (worker.joinable()) {
@@ -297,36 +357,30 @@ struct ChunkReadManager::FeatureCursorState {
     return ChunkReadKeyHash{}(key) % cursor_count_;
   }
 
-  static IdType NextChunkIdAfter(IdType chunk_id) {
-    if (chunk_id == std::numeric_limits<IdType>::max()) {
-      return std::numeric_limits<IdType>::min();
-    }
-    return chunk_id + 1;
-  }
-
   std::shared_ptr<Task> PopNextTaskLocked(size_t index, bool* wrapped) {
     auto& queue = queues_[index];
     if (queue.task_count == 0) {
       return nullptr;
     }
 
-    auto it = queue.tasks_by_chunk_id.begin();
-    if (queue.has_next_chunk_id) {
-      it = queue.tasks_by_chunk_id.lower_bound(queue.next_chunk_id);
-      if (it == queue.tasks_by_chunk_id.end()) {
-        it = queue.tasks_by_chunk_id.begin();
+    auto it = queue.tasks_by_order_key.begin();
+    if (queue.has_next_order_key) {
+      it = queue.tasks_by_order_key.lower_bound(queue.next_order_key);
+      if (it == queue.tasks_by_order_key.end()) {
+        it = queue.tasks_by_order_key.begin();
         *wrapped = true;
       }
     }
 
+    const auto order_key = it->first;
     auto task = std::move(it->second.front());
     it->second.pop_front();
     if (it->second.empty()) {
-      queue.tasks_by_chunk_id.erase(it);
+      queue.tasks_by_order_key.erase(it);
     }
     queue.task_count -= 1;
-    queue.next_chunk_id = NextChunkIdAfter(task->chunk_id);
-    queue.has_next_chunk_id = true;
+    queue.next_order_key = order_key;
+    queue.has_next_order_key = true;
     return task;
   }
 
@@ -349,12 +403,12 @@ struct ChunkReadManager::FeatureCursorState {
       }
 
       if (IsShutdown()) {
-        task->promise.set_value(Status::Invalid("Feature cursor is shut down"));
+        task->promise.set_value(Status::Invalid("Chunk cursor is shut down"));
         continue;
       }
 
       const auto service_start = Clock::now();
-      TableResult result = Status::Invalid("feature trail miss");
+      TableResult result = Status::Invalid("chunk cursor trail miss");
       bool served_from_trail = false;
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -376,20 +430,17 @@ struct ChunkReadManager::FeatureCursorState {
 
       result = [&]() -> TableResult {
         try {
-          auto chunk_result = LoadVertexPropertyChunkDirect(
-              task->graph_info, task->vertex_type, task->property_group,
-              task->vertex_info, task->chunk_id);
+          auto chunk_result = task->loader();
           if (!chunk_result.has_error()) {
             std::lock_guard<std::mutex> lock(mutex_);
             InsertTrailLocked(task->key, chunk_result.value());
           }
           return chunk_result;
         } catch (const std::exception& e) {
-          return Status::UnknownError("Feature cursor chunk read threw: ",
+          return Status::UnknownError("Chunk cursor read threw: ",
                                       e.what());
         } catch (...) {
-          return Status::UnknownError(
-              "Feature cursor chunk read threw unknown error");
+          return Status::UnknownError("Chunk cursor read threw unknown error");
         }
       }();
 
@@ -443,6 +494,7 @@ struct ChunkReadManager::FeatureCursorState {
 
   const size_t cursor_count_;
   const size_t trail_capacity_chunks_;
+  const bool auto_track_requests_;
 
   mutable std::mutex mutex_;
   std::condition_variable cv_;
@@ -476,7 +528,17 @@ struct ChunkReadManager::FeatureCursorState {
 ChunkReadManager::ChunkReadManager(ChunkReadManagerOptions options)
     : options_(std::move(options)) {
   if (options_.feature_cursor_count > 0) {
-    feature_cursor_ = std::make_unique<FeatureCursorState>(options_);
+    feature_cursor_ = std::make_unique<CursorState>(
+        options_.feature_cursor_count,
+        options_.feature_cursor_trail_capacity_chunks, false);
+  }
+  if (options_.edge_cursor_count > 0) {
+    edge_offset_cursor_ = std::make_unique<CursorState>(
+        options_.edge_cursor_count,
+        options_.edge_cursor_trail_capacity_chunks, true);
+    edge_adj_list_cursor_ = std::make_unique<CursorState>(
+        options_.edge_cursor_count,
+        options_.edge_cursor_trail_capacity_chunks, true);
   }
 }
 
@@ -757,8 +819,14 @@ ChunkReadManager::TableResult ChunkReadManager::GetVertexPropertyChunk(
   if (feature_cursor_ != nullptr) {
     return GetOrLoad(key, [this, graph_info, vertex_type, property_group,
                            vertex_info, key, chunk_id]() -> TableResult {
-      return feature_cursor_->LoadChunk(graph_info, vertex_type, property_group,
-                                        vertex_info, key, chunk_id);
+      return feature_cursor_->LoadChunk(
+          key, CursorState::OrderKey{0, chunk_id},
+          [graph_info, vertex_type, property_group, vertex_info,
+           chunk_id]() -> TableResult {
+            return LoadVertexPropertyChunkDirect(graph_info, vertex_type,
+                                                 property_group, vertex_info,
+                                                 chunk_id);
+          });
     });
   }
 
@@ -795,24 +863,25 @@ ChunkReadManager::TableResult ChunkReadManager::GetEdgeOffsetChunk(
   key.file_type = edge_info->GetAdjacentList(adj_list_type)->GetFileType();
   key.vertex_chunk_id = vertex_chunk_id;
 
+  if (edge_offset_cursor_ != nullptr) {
+    return GetOrLoad(
+        key, [this, key, graph_info, edge_info, adj_list_type,
+              vertex_chunk_id]() -> TableResult {
+          return edge_offset_cursor_->LoadChunk(
+              key, CursorState::OrderKey{vertex_chunk_id, 0},
+              [graph_info, edge_info, adj_list_type,
+               vertex_chunk_id]() -> TableResult {
+                return LoadEdgeOffsetChunkDirect(graph_info, edge_info,
+                                                 adj_list_type,
+                                                 vertex_chunk_id);
+              });
+        });
+  }
+
   return GetOrLoad(key, [graph_info, edge_info, adj_list_type,
                          vertex_chunk_id]() -> TableResult {
-    const std::string& prefix = graph_info->GetPrefix();
-    std::string normalized_prefix;
-    GAR_ASSIGN_OR_RAISE(auto fs,
-                        FileSystemFromUriOrPath(prefix, &normalized_prefix));
-    GAR_ASSIGN_OR_RAISE(
-        auto chunk_file_path,
-        edge_info->GetAdjListOffsetFilePath(vertex_chunk_id, adj_list_type));
-    auto file_type = edge_info->GetAdjacentList(adj_list_type)->GetFileType();
-    GAR_ASSIGN_OR_RAISE(auto table,
-                        fs->ReadFileToTable(normalized_prefix + chunk_file_path,
-                                            file_type));
-    if (table->num_columns() == 0) {
-      return Status::Invalid("Offset file for edge type '",
-                             edge_info->GetEdgeType(), "' has no columns");
-    }
-    return table;
+    return LoadEdgeOffsetChunkDirect(graph_info, edge_info, adj_list_type,
+                                     vertex_chunk_id);
   });
 }
 
@@ -843,14 +912,25 @@ ChunkReadManager::TableResult ChunkReadManager::GetEdgeAdjListChunk(
   key.vertex_chunk_id = vertex_chunk_id;
   key.chunk_id = chunk_id;
 
-  return GetOrLoad(key, [edge_info, adj_list_type, graph_info, vertex_chunk_id,
+  if (edge_adj_list_cursor_ != nullptr) {
+    return GetOrLoad(
+        key, [this, key, graph_info, edge_info, adj_list_type,
+              vertex_chunk_id, chunk_id]() -> TableResult {
+          return edge_adj_list_cursor_->LoadChunk(
+              key, CursorState::OrderKey{vertex_chunk_id, chunk_id},
+              [graph_info, edge_info, adj_list_type, vertex_chunk_id,
+               chunk_id]() -> TableResult {
+                return LoadEdgeAdjListChunkDirect(graph_info, edge_info,
+                                                  adj_list_type,
+                                                  vertex_chunk_id, chunk_id);
+              });
+        });
+  }
+
+  return GetOrLoad(key, [graph_info, edge_info, adj_list_type, vertex_chunk_id,
                          chunk_id]() -> TableResult {
-    AdjListArrowChunkReader reader(edge_info, adj_list_type,
-                                   graph_info->GetPrefix());
-    GAR_RETURN_NOT_OK(reader.seek_chunk_index(vertex_chunk_id, chunk_id));
-    auto chunk_result = reader.GetChunk();
-    GAR_RETURN_NOT_OK(chunk_result.status());
-    return chunk_result.value();
+    return LoadEdgeAdjListChunkDirect(graph_info, edge_info, adj_list_type,
+                                      vertex_chunk_id, chunk_id);
   });
 }
 
@@ -937,9 +1017,29 @@ FeatureCursorStats ChunkReadManager::feature_cursor_stats() const {
   return feature_cursor_->stats();
 }
 
+FeatureCursorStats ChunkReadManager::edge_offset_cursor_stats() const {
+  if (edge_offset_cursor_ == nullptr) {
+    return {};
+  }
+  return edge_offset_cursor_->stats();
+}
+
+FeatureCursorStats ChunkReadManager::edge_adj_list_cursor_stats() const {
+  if (edge_adj_list_cursor_ == nullptr) {
+    return {};
+  }
+  return edge_adj_list_cursor_->stats();
+}
+
 void ChunkReadManager::Shutdown() {
   if (feature_cursor_ != nullptr) {
     feature_cursor_->Shutdown();
+  }
+  if (edge_offset_cursor_ != nullptr) {
+    edge_offset_cursor_->Shutdown();
+  }
+  if (edge_adj_list_cursor_ != nullptr) {
+    edge_adj_list_cursor_->Shutdown();
   }
 }
 

@@ -464,6 +464,71 @@ TEST_CASE_METHOD(GlobalFixture, "ChunkReadManager caches edge adjacency chunks")
   REQUIRE(stats.failed == 0);
 }
 
+TEST_CASE_METHOD(GlobalFixture,
+                 "ChunkReadManager edge offset cursor reuses trail cache") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  ChunkReadManagerOptions options;
+  options.edge_cursor_count = 1;
+  options.edge_cursor_trail_capacity_chunks = 1;
+  ChunkReadManager manager(options);
+
+  auto first = manager.GetEdgeOffsetChunk(
+      graph_info, kVertexType, kEdgeType, kVertexType,
+      AdjListType::ordered_by_source, /*vertex_chunk_id=*/0);
+  auto second = manager.GetEdgeOffsetChunk(
+      graph_info, kVertexType, kEdgeType, kVertexType,
+      AdjListType::ordered_by_source, /*vertex_chunk_id=*/0);
+
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+  REQUIRE(first.value()->Equals(*second.value()));
+
+  const auto stats = manager.edge_offset_cursor_stats();
+  REQUIRE(stats.cursor_count == 1);
+  REQUIRE(stats.trail_capacity_chunks == 1);
+  REQUIRE(stats.requests == 2);
+  REQUIRE(stats.requests_completed == 2);
+  REQUIRE(stats.requests_failed == 0);
+  REQUIRE(stats.chunks_read == 1);
+  REQUIRE(stats.chunks_served == 1);
+  REQUIRE(stats.chunk_order_wraps == 0);
+  REQUIRE(stats.trail_hits == 1);
+  REQUIRE(stats.trail_misses == 1);
+}
+
+TEST_CASE_METHOD(GlobalFixture,
+                 "ChunkReadManager edge adjacency cursor reuses trail cache") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  ChunkReadManagerOptions options;
+  options.edge_cursor_count = 1;
+  options.edge_cursor_trail_capacity_chunks = 1;
+  ChunkReadManager manager(options);
+
+  auto first = manager.GetEdgeAdjListChunk(
+      graph_info, kVertexType, kEdgeType, kVertexType,
+      AdjListType::ordered_by_source, /*vertex_chunk_id=*/0, /*chunk_id=*/0);
+  auto second = manager.GetEdgeAdjListChunk(
+      graph_info, kVertexType, kEdgeType, kVertexType,
+      AdjListType::ordered_by_source, /*vertex_chunk_id=*/0, /*chunk_id=*/0);
+
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+  REQUIRE(first.value() != nullptr);
+  REQUIRE(first.value()->Equals(*second.value()));
+
+  const auto stats = manager.edge_adj_list_cursor_stats();
+  REQUIRE(stats.cursor_count == 1);
+  REQUIRE(stats.trail_capacity_chunks == 1);
+  REQUIRE(stats.requests == 2);
+  REQUIRE(stats.requests_completed == 2);
+  REQUIRE(stats.requests_failed == 0);
+  REQUIRE(stats.chunks_read == 1);
+  REQUIRE(stats.chunks_served == 1);
+  REQUIRE(stats.chunk_order_wraps == 0);
+  REQUIRE(stats.trail_hits == 1);
+  REQUIRE(stats.trail_misses == 1);
+}
+
 TEST_CASE("ChunkReadManager propagates failures and allows retry") {
   ChunkReadManager manager;
   std::atomic<int> loader_calls{0};
