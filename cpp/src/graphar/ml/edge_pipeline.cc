@@ -189,6 +189,7 @@ struct SamplingBatchState {
     IdType src_node = 0;
     bool needs_shuffle = false;
     std::vector<AdjChunkSpan> spans;
+    std::vector<IdType> neighbors;
   };
 
   struct HopState {
@@ -199,8 +200,6 @@ struct SamplingBatchState {
     std::vector<TablePtr> offset_tables;
     size_t pending_offset_groups = 0;
     std::vector<SourcePlan> source_plans;
-    std::unordered_map<ChunkReadKey, TablePtr, ChunkReadKeyHash>
-        adjacency_tables;
     size_t pending_adj_chunks = 0;
   };
 
@@ -565,7 +564,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
 
       auto& hop = batch->hop_state;
       hop.source_plans.clear();
-      hop.adjacency_tables.clear();
       hop.pending_adj_chunks = 0;
 
       for (size_t group_index = 0; group_index < hop.source_groups.size();
@@ -606,6 +604,11 @@ struct EdgeSamplingPipelineCoordinator::Impl {
           const IdType total_edges = end_off - begin_off;
           SamplingBatchState::SourcePlan plan;
           plan.src_node = src_node;
+          if (hop.max_neighbors > 0) {
+            plan.neighbors.reserve(
+                static_cast<size_t>(
+                    std::min<IdType>(total_edges, hop.max_neighbors)));
+          }
 
           if (total_edges <= static_cast<IdType>(hop.max_neighbors)) {
             IdType cur_off = begin_off;
@@ -660,7 +663,12 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       }
 
       hop.pending_adj_chunks = unique_adj_keys.size();
-      hop.adjacency_tables.reserve(unique_adj_keys.size());
+      hop.offset_tables.clear();
+      hop.offset_tables.shrink_to_fit();
+      hop.source_groups.clear();
+      hop.source_groups.shrink_to_fit();
+      hop.sorted_frontier.clear();
+      hop.sorted_frontier.shrink_to_fit();
     }
 
     if (unique_adj_keys.empty()) {
@@ -689,62 +697,16 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       }
 
       auto& hop = batch->hop_state;
-      std::unordered_map<ChunkReadKey, std::shared_ptr<Int64ChunkedArrayCursor>,
-                         ChunkReadKeyHash>
-          cursor_cache;
       std::vector<IdType> next_frontier;
       IdType hop_num_sampled_nodes = 0;
       IdType hop_num_sampled_edges = 0;
 
-      for (const auto& plan : hop.source_plans) {
-        std::vector<IdType> neighbors;
-        neighbors.reserve(static_cast<size_t>(hop.max_neighbors));
-        for (const auto& span : plan.spans) {
-          auto table_it = hop.adjacency_tables.find(span.key);
-          if (table_it == hop.adjacency_tables.end() || table_it->second == nullptr) {
-            return Status::Invalid("Adjacency chunk missing during finalize");
-          }
-          auto cursor_it = cursor_cache.find(span.key);
-          if (cursor_it == cursor_cache.end()) {
-            if (table_it->second->num_columns() < 2) {
-              return Status::Invalid("Adjacency chunk has fewer than 2 columns");
-            }
-            auto inserted = cursor_cache.emplace(
-                span.key, std::make_shared<Int64ChunkedArrayCursor>(
-                              table_it->second->column(1)));
-            cursor_it = inserted.first;
-          }
-          auto& cursor = cursor_it->second;
-
-          if (span.picked_rows.empty()) {
-            IdType row = span.row_begin;
-            while (row < span.row_end) {
-              IdType available = 0;
-              auto raw_result = cursor->RawValuesAt(row, &available);
-              if (raw_result.has_error()) {
-                return raw_result.status();
-              }
-              auto raw = raw_result.value();
-              const IdType batch_rows = std::min(span.row_end - row, available);
-              neighbors.insert(neighbors.end(), raw, raw + batch_rows);
-              row += batch_rows;
-            }
-          } else {
-            for (IdType row : span.picked_rows) {
-              auto dst_result = cursor->ValueAt(row);
-              if (dst_result.has_error()) {
-                return dst_result.status();
-              }
-              neighbors.push_back(dst_result.value());
-            }
-          }
-        }
-
+      for (auto& plan : hop.source_plans) {
         if (plan.needs_shuffle) {
-          std::shuffle(neighbors.begin(), neighbors.end(), batch->gen);
+          std::shuffle(plan.neighbors.begin(), plan.neighbors.end(), batch->gen);
         }
 
-        for (IdType dst_node : neighbors) {
+        for (IdType dst_node : plan.neighbors) {
           batch->edge_list.emplace_back(plan.src_node, dst_node);
           ++hop_num_sampled_edges;
           if (batch->all_sampled_nodes_set.insert(dst_node).second) {
@@ -976,13 +938,49 @@ struct EdgeSamplingPipelineCoordinator::Impl {
 
   Status OnAdjReady(const std::shared_ptr<SamplingBatchState>& batch,
                     const ChunkReadKey& key, const TablePtr& table) {
+    if (table == nullptr) {
+      return Status::Invalid("Adjacency chunk is null");
+    }
+    if (table->num_columns() < 2) {
+      return Status::Invalid("Adjacency chunk has fewer than 2 columns");
+    }
+
+    Int64ChunkedArrayCursor cursor(table->column(1));
     bool advance = false;
     {
       std::lock_guard<std::mutex> lock(batch->mutex_);
       if (batch->promise_set) {
         return Status::OK();
       }
-      batch->hop_state.adjacency_tables[key] = table;
+      for (auto& plan : batch->hop_state.source_plans) {
+        for (const auto& span : plan.spans) {
+          if (!(span.key == key)) {
+            continue;
+          }
+          if (span.picked_rows.empty()) {
+            IdType row = span.row_begin;
+            while (row < span.row_end) {
+              IdType available = 0;
+              auto raw_result = cursor.RawValuesAt(row, &available);
+              if (raw_result.has_error()) {
+                return raw_result.status();
+              }
+              auto raw = raw_result.value();
+              const IdType batch_rows = std::min(span.row_end - row, available);
+              plan.neighbors.insert(plan.neighbors.end(), raw, raw + batch_rows);
+              row += batch_rows;
+            }
+          } else {
+            for (IdType row : span.picked_rows) {
+              auto dst_result = cursor.ValueAt(row);
+              if (dst_result.has_error()) {
+                return dst_result.status();
+              }
+              plan.neighbors.push_back(dst_result.value());
+            }
+          }
+        }
+      }
       if (batch->hop_state.pending_adj_chunks == 0) {
         return Status::Invalid("Adjacency pending counter underflow");
       }
