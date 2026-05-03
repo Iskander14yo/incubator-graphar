@@ -184,6 +184,32 @@ def _feature_pipeline_stats_to_dict(stats) -> dict[str, int]:
     }
 
 
+def _edge_pipeline_stats_to_dict(stats) -> dict[str, int]:
+    return {
+        "submitted_batches": int(stats.submitted_batches),
+        "completed_batches": int(stats.completed_batches),
+        "active_batches_current": int(stats.active_batches_current),
+        "pending_batches_peak": int(stats.pending_batches_peak),
+        "active_offset_chunk_keys_current": int(
+            stats.active_offset_chunk_keys_current
+        ),
+        "active_offset_chunk_keys_peak": int(stats.active_offset_chunk_keys_peak),
+        "active_adj_chunk_keys_current": int(stats.active_adj_chunk_keys_current),
+        "active_adj_chunk_keys_peak": int(stats.active_adj_chunk_keys_peak),
+        "read_queue_current": int(stats.read_queue_current),
+        "processor_queue_current": int(stats.processor_queue_current),
+        "offset_chunk_subscriptions": int(stats.offset_chunk_subscriptions),
+        "offset_chunk_reads": int(stats.offset_chunk_reads),
+        "offset_chunk_reuses": int(stats.offset_chunk_reuses),
+        "adj_chunk_subscriptions": int(stats.adj_chunk_subscriptions),
+        "adj_chunk_reads": int(stats.adj_chunk_reads),
+        "adj_chunk_reuses": int(stats.adj_chunk_reuses),
+        "processor_tasks": int(stats.processor_tasks),
+        "processor_wait_ms_sum": int(stats.processor_wait_ms_sum),
+        "processor_service_ms_sum": int(stats.processor_service_ms_sum),
+    }
+
+
 def _empty_feature_pipeline_stats() -> dict[str, int]:
     return {
         "submitted_batches": 0,
@@ -200,6 +226,30 @@ def _empty_feature_pipeline_stats() -> dict[str, int]:
         "stitch_tasks": 0,
         "stitch_wait_ms_sum": 0,
         "stitch_service_ms_sum": 0,
+    }
+
+
+def _empty_edge_pipeline_stats() -> dict[str, int]:
+    return {
+        "submitted_batches": 0,
+        "completed_batches": 0,
+        "active_batches_current": 0,
+        "pending_batches_peak": 0,
+        "active_offset_chunk_keys_current": 0,
+        "active_offset_chunk_keys_peak": 0,
+        "active_adj_chunk_keys_current": 0,
+        "active_adj_chunk_keys_peak": 0,
+        "read_queue_current": 0,
+        "processor_queue_current": 0,
+        "offset_chunk_subscriptions": 0,
+        "offset_chunk_reads": 0,
+        "offset_chunk_reuses": 0,
+        "adj_chunk_subscriptions": 0,
+        "adj_chunk_reads": 0,
+        "adj_chunk_reuses": 0,
+        "processor_tasks": 0,
+        "processor_wait_ms_sum": 0,
+        "processor_service_ms_sum": 0,
     }
 
 
@@ -223,6 +273,8 @@ class GARNeighborLoader(IterableDataset):
         feature_ram_for_loader_mb: int = 0,
         edge_cursor_count: int = 0,
         edge_cursor_trail_chunks: int = 0,
+        num_edge_readers: int = 0,
+        num_edge_processors: int = 1,
         num_readers: int | None = None,
         num_stitchers: int = 1,
         feature_cursor_count: int | None = None,
@@ -255,6 +307,12 @@ class GARNeighborLoader(IterableDataset):
         if edge_cursor_trail_chunks < 0:
             msg = "edge_cursor_trail_chunks must be >= 0"
             raise ValueError(msg)
+        if num_edge_readers < 0:
+            msg = "num_edge_readers must be >= 0"
+            raise ValueError(msg)
+        if num_edge_processors <= 0:
+            msg = "num_edge_processors must be > 0"
+            raise ValueError(msg)
         if num_readers is None:
             num_readers = 1 if feature_cursor_count is None else feature_cursor_count
         if feature_cursor_count is not None and num_readers != feature_cursor_count:
@@ -286,10 +344,11 @@ class GARNeighborLoader(IterableDataset):
         edge_chunk_manager_options.edge_offset_ram_budget_bytes = (
             int(offset_ram_for_loader_mb) * 1024 * 1024
         )
-        edge_chunk_manager_options.edge_cursor_count = int(edge_cursor_count)
-        edge_chunk_manager_options.edge_cursor_trail_capacity_chunks = int(
-            edge_cursor_trail_chunks
-        )
+        if num_edge_readers == 0:
+            edge_chunk_manager_options.edge_cursor_count = int(edge_cursor_count)
+            edge_chunk_manager_options.edge_cursor_trail_capacity_chunks = int(
+                edge_cursor_trail_chunks
+            )
         self._sampling_chunk_manager = gar_ml._ChunkReadManager(
             edge_chunk_manager_options
         )
@@ -315,6 +374,19 @@ class GARNeighborLoader(IterableDataset):
         self.features = _properties_for_vertex(graph_info, vertex_type) if features is None else features
         self._rng = torch.Generator()
         self._rng.manual_seed(int(torch.initial_seed()))
+        self._edge_pipeline = None
+        if num_edge_readers > 0:
+            edge_pipeline_options = gar_ml._EdgeSamplingPipelineOptions()
+            edge_pipeline_options.num_readers = int(num_edge_readers)
+            edge_pipeline_options.num_processors = int(num_edge_processors)
+            edge_pipeline_options.max_active_batches = self._max_pending_batches()
+            edge_pipeline_options.max_queued_processor_tasks = (
+                edge_pipeline_options.max_active_batches * num_edge_processors
+            )
+            self._edge_pipeline = gar_ml._EdgeSamplingPipelineCoordinator(
+                self._sampling_chunk_manager,
+                edge_pipeline_options,
+            )
         self._feature_pipeline = None
         if self.features:
             feature_pipeline_options = gar_ml._FeaturePipelineOptions()
@@ -375,6 +447,11 @@ class GARNeighborLoader(IterableDataset):
             return _empty_feature_pipeline_stats()
         return _feature_pipeline_stats_to_dict(self._feature_pipeline.stats())
 
+    def edge_pipeline_stats(self) -> dict[str, int]:
+        if self._edge_pipeline is None:
+            return _empty_edge_pipeline_stats()
+        return _edge_pipeline_stats_to_dict(self._edge_pipeline.stats())
+
     def feature_cursor_stats(self) -> dict[str, int]:
         return _cursor_stats_to_dict(self._feature_chunk_manager.feature_cursor_stats())
 
@@ -385,6 +462,8 @@ class GARNeighborLoader(IterableDataset):
         return _cursor_stats_to_dict(self._sampling_chunk_manager.edge_adj_list_cursor_stats())
 
     def close(self) -> None:
+        if self._edge_pipeline is not None:
+            self._edge_pipeline.shutdown()
         if self._feature_pipeline is not None:
             self._feature_pipeline.shutdown()
         self._feature_chunk_manager.shutdown()
@@ -393,16 +472,28 @@ class GARNeighborLoader(IterableDataset):
     def _sample_and_submit_batch(self, seed_nodes: list[int], seed: int) -> _SampledBatch:
         total_started_at = time.perf_counter()
         t_s = total_started_at
-        sampling = gar_ml.sample_neighbors(
-            self.graph_info,
-            self.vertex_type,
-            self.edge_type,
-            seed_nodes,
-            self.num_neighbors,
-            seed=seed,
-            chunk_manager=self._sampling_chunk_manager,
-        )
-        sampling_ms = (time.perf_counter() - t_s) * 1000
+        if self._edge_pipeline is None:
+            sampling = gar_ml.sample_neighbors(
+                self.graph_info,
+                self.vertex_type,
+                self.edge_type,
+                seed_nodes,
+                self.num_neighbors,
+                seed=seed,
+                chunk_manager=self._sampling_chunk_manager,
+            )
+            sampling_ms = (time.perf_counter() - t_s) * 1000
+        else:
+            sampling_handle = self._edge_pipeline.submit_seed_batch(
+                self.graph_info,
+                self.vertex_type,
+                self.edge_type,
+                seed_nodes,
+                self.num_neighbors,
+                seed,
+            )
+            sampling = sampling_handle.wait()
+            sampling_ms = float(sampling_handle.sampling_ms())
 
         sampled_nodes = [int(node) for node in sampling.sampled_nodes]
         src_indices = [int(src_idx) for src_idx in sampling.src_indices]

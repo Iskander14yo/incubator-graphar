@@ -25,6 +25,7 @@
 #include "arrow/c/bridge.h"
 #include "graphar/graph_info.h"
 #include "graphar/ml/chunk_read_manager.h"
+#include "graphar/ml/edge_pipeline.h"
 #include "graphar/ml/feature_pipeline.h"
 #include "graphar/ml/neighbor_sampling.h"
 
@@ -244,6 +245,75 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
           "stitch_service_ms_sum",
           &graphar::ml::FeaturePipelineStats::stitch_service_ms_sum);
 
+  py::class_<graphar::ml::EdgeSamplingPipelineOptions>(
+      m, "_EdgeSamplingPipelineOptions")
+      .def(py::init<>())
+      .def_readwrite("num_readers",
+                     &graphar::ml::EdgeSamplingPipelineOptions::num_readers)
+      .def_readwrite("num_processors",
+                     &graphar::ml::EdgeSamplingPipelineOptions::num_processors)
+      .def_readwrite(
+          "max_active_batches",
+          &graphar::ml::EdgeSamplingPipelineOptions::max_active_batches)
+      .def_readwrite(
+          "max_queued_processor_tasks",
+          &graphar::ml::EdgeSamplingPipelineOptions::
+              max_queued_processor_tasks);
+
+  py::class_<graphar::ml::EdgeSamplingPipelineStats>(
+      m, "_EdgeSamplingPipelineStats")
+      .def_readonly("submitted_batches",
+                    &graphar::ml::EdgeSamplingPipelineStats::submitted_batches)
+      .def_readonly("completed_batches",
+                    &graphar::ml::EdgeSamplingPipelineStats::completed_batches)
+      .def_readonly(
+          "active_batches_current",
+          &graphar::ml::EdgeSamplingPipelineStats::active_batches_current)
+      .def_readonly(
+          "pending_batches_peak",
+          &graphar::ml::EdgeSamplingPipelineStats::pending_batches_peak)
+      .def_readonly("active_offset_chunk_keys_current",
+                    &graphar::ml::EdgeSamplingPipelineStats::
+                        active_offset_chunk_keys_current)
+      .def_readonly("active_offset_chunk_keys_peak",
+                    &graphar::ml::EdgeSamplingPipelineStats::
+                        active_offset_chunk_keys_peak)
+      .def_readonly("active_adj_chunk_keys_current",
+                    &graphar::ml::EdgeSamplingPipelineStats::
+                        active_adj_chunk_keys_current)
+      .def_readonly("active_adj_chunk_keys_peak",
+                    &graphar::ml::EdgeSamplingPipelineStats::
+                        active_adj_chunk_keys_peak)
+      .def_readonly("read_queue_current",
+                    &graphar::ml::EdgeSamplingPipelineStats::read_queue_current)
+      .def_readonly("processor_queue_current",
+                    &graphar::ml::EdgeSamplingPipelineStats::
+                        processor_queue_current)
+      .def_readonly("offset_chunk_subscriptions",
+                    &graphar::ml::EdgeSamplingPipelineStats::
+                        offset_chunk_subscriptions)
+      .def_readonly("offset_chunk_reads",
+                    &graphar::ml::EdgeSamplingPipelineStats::
+                        offset_chunk_reads)
+      .def_readonly("offset_chunk_reuses",
+                    &graphar::ml::EdgeSamplingPipelineStats::
+                        offset_chunk_reuses)
+      .def_readonly("adj_chunk_subscriptions",
+                    &graphar::ml::EdgeSamplingPipelineStats::
+                        adj_chunk_subscriptions)
+      .def_readonly("adj_chunk_reads",
+                    &graphar::ml::EdgeSamplingPipelineStats::adj_chunk_reads)
+      .def_readonly("adj_chunk_reuses",
+                    &graphar::ml::EdgeSamplingPipelineStats::adj_chunk_reuses)
+      .def_readonly("processor_tasks",
+                    &graphar::ml::EdgeSamplingPipelineStats::processor_tasks)
+      .def_readonly("processor_wait_ms_sum",
+                    &graphar::ml::EdgeSamplingPipelineStats::
+                        processor_wait_ms_sum)
+      .def_readonly("processor_service_ms_sum",
+                    &graphar::ml::EdgeSamplingPipelineStats::
+                        processor_service_ms_sum);
+
   py::class_<graphar::ml::FeatureBatchHandle,
              std::shared_ptr<graphar::ml::FeatureBatchHandle>>(
       m, "_FeatureBatchHandle")
@@ -258,6 +328,20 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def("feature_fetch_ms",
            &graphar::ml::FeatureBatchHandle::feature_fetch_ms)
       .def("valid", &graphar::ml::FeatureBatchHandle::valid);
+
+  py::class_<graphar::ml::SamplingBatchHandle,
+             std::shared_ptr<graphar::ml::SamplingBatchHandle>>(
+      m, "_SamplingBatchHandle")
+      .def("wait", [](const graphar::ml::SamplingBatchHandle& handle) {
+        auto result = [&]() {
+          py::gil_scoped_release release;
+          return handle.Wait();
+        }();
+        return ThrowOrReturn(result);
+      })
+      .def("sampling_ms",
+           &graphar::ml::SamplingBatchHandle::sampling_ms)
+      .def("valid", &graphar::ml::SamplingBatchHandle::valid);
 
   py::class_<graphar::ml::FeaturePipelineCoordinator,
              std::shared_ptr<graphar::ml::FeaturePipelineCoordinator>>(
@@ -284,6 +368,34 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
           py::arg("properties"))
       .def("stats", &graphar::ml::FeaturePipelineCoordinator::Stats)
       .def("shutdown", &graphar::ml::FeaturePipelineCoordinator::Shutdown);
+
+  py::class_<graphar::ml::EdgeSamplingPipelineCoordinator,
+             std::shared_ptr<graphar::ml::EdgeSamplingPipelineCoordinator>>(
+      m, "_EdgeSamplingPipelineCoordinator")
+      .def(py::init<std::shared_ptr<graphar::ml::ChunkReadManager>,
+                    graphar::ml::EdgeSamplingPipelineOptions>(),
+           py::arg("chunk_manager"),
+           py::arg("options") = graphar::ml::EdgeSamplingPipelineOptions{})
+      .def(
+          "submit_seed_batch",
+          [](graphar::ml::EdgeSamplingPipelineCoordinator& coordinator,
+             const std::shared_ptr<graphar::GraphInfo>& graph_info,
+             const std::string& vertex_type, const std::string& edge_type,
+             const std::vector<graphar::IdType>& seed_nodes,
+             const std::vector<int>& fanout, uint64_t seed) {
+            auto result = [&]() {
+              py::gil_scoped_release release;
+              return coordinator.SubmitSeedBatch(graph_info, vertex_type,
+                                                 edge_type, seed_nodes, fanout,
+                                                 seed);
+            }();
+            return ThrowOrReturn(result);
+          },
+          py::arg("graph_info"), py::arg("vertex_type"),
+          py::arg("edge_type"), py::arg("seed_nodes"), py::arg("fanout"),
+          py::arg("seed"))
+      .def("stats", &graphar::ml::EdgeSamplingPipelineCoordinator::Stats)
+      .def("shutdown", &graphar::ml::EdgeSamplingPipelineCoordinator::Shutdown);
 
   py::class_<graphar::ml::FeatureCursorStats>(m, "_FeatureCursorStats")
       .def_readonly("cursor_count",

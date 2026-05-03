@@ -33,6 +33,8 @@ def _make_loader(
     feature_ram_for_loader_mb=0,
     edge_cursor_count=0,
     edge_cursor_trail_chunks=0,
+    num_edge_readers=0,
+    num_edge_processors=1,
     num_readers=None,
     num_stitchers=1,
 ):
@@ -54,6 +56,8 @@ def _make_loader(
         feature_ram_for_loader_mb=feature_ram_for_loader_mb,
         edge_cursor_count=edge_cursor_count,
         edge_cursor_trail_chunks=edge_cursor_trail_chunks,
+        num_edge_readers=num_edge_readers,
+        num_edge_processors=num_edge_processors,
         num_readers=num_readers,
         num_stitchers=num_stitchers,
     )
@@ -375,6 +379,49 @@ def test_edge_cursor_stats_are_exposed(ldbc_graph):
     assert adj_stats["requests_completed"] == adj_stats["requests"]
 
 
+def test_edge_pipeline_stats_are_exposed(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=[],
+        batch_size=2,
+        shuffle=False,
+        num_samplers=2,
+        num_edge_readers=1,
+        num_edge_processors=1,
+    )
+    list(loader)
+
+    stats = loader.edge_pipeline_stats()
+    assert stats["submitted_batches"] == len(loader)
+    assert stats["completed_batches"] == len(loader)
+    assert stats["offset_chunk_subscriptions"] > 0
+    assert stats["offset_chunk_reads"] > 0
+
+
+def test_edge_pipeline_matches_sync_sampling_shuffle_false(ldbc_graph):
+    sync_loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3, 4, 5],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        num_samplers=2,
+    )
+    pipeline_loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3, 4, 5],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        num_samplers=2,
+        num_edge_readers=1,
+        num_edge_processors=1,
+    )
+
+    assert _epoch_signature(sync_loader) == _epoch_signature(pipeline_loader)
+
+
 def test_negative_adj_list_ram_for_loader_is_rejected(ldbc_graph):
     with pytest.raises(ValueError, match="adj_list_ram_for_loader_mb"):
         _make_loader(ldbc_graph, adj_list_ram_for_loader_mb=-1)
@@ -403,6 +450,16 @@ def test_negative_edge_cursor_count_is_rejected(ldbc_graph):
 def test_negative_edge_cursor_trail_chunks_is_rejected(ldbc_graph):
     with pytest.raises(ValueError, match="edge_cursor_trail_chunks"):
         _make_loader(ldbc_graph, edge_cursor_trail_chunks=-1)
+
+
+def test_negative_num_edge_readers_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="num_edge_readers"):
+        _make_loader(ldbc_graph, num_edge_readers=-1)
+
+
+def test_non_positive_num_edge_processors_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="num_edge_processors"):
+        _make_loader(ldbc_graph, num_edge_processors=0)
 
 
 def test_valid_batch_with_zero_fanout(ldbc_graph):
