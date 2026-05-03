@@ -512,12 +512,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     }
 
     if (groups.empty()) {
-      return EnqueueProcessorTask(nullptr, [this, batch]() {
-        auto status = FinalizeHop(batch);
-        if (!status.ok()) {
-          FinishBatch(batch, status);
-        }
-      });
+      return FinalizeHop(batch);
     }
 
     for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
@@ -648,12 +643,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     }
 
     if (unique_adj_keys.empty()) {
-      return EnqueueProcessorTask(nullptr, [this, batch]() {
-        auto status = FinalizeHop(batch);
-        if (!status.ok()) {
-          FinishBatch(batch, status);
-        }
-      });
+      return FinalizeHop(batch);
     }
 
     for (const auto& [_, key] : unique_adj_keys) {
@@ -954,12 +944,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     if (!advance) {
       return Status::OK();
     }
-    return EnqueueProcessorTask(nullptr, [this, batch]() {
-      auto status = AdvanceFromOffsets(batch);
-      if (!status.ok()) {
-        FinishBatch(batch, status);
-      }
-    });
+    return AdvanceFromOffsets(batch);
   }
 
   Status OnAdjReady(const std::shared_ptr<SamplingBatchState>& batch,
@@ -1017,12 +1002,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     if (!advance) {
       return Status::OK();
     }
-    return EnqueueProcessorTask(nullptr, [this, batch]() {
-      auto status = FinalizeHop(batch);
-      if (!status.ok()) {
-        FinishBatch(batch, status);
-      }
-    });
+    return FinalizeHop(batch);
   }
 
   Status StartChunkRead(const std::shared_ptr<ActiveChunk>& active_chunk) {
