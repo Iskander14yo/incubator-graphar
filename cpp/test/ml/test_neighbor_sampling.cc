@@ -12,6 +12,7 @@
 #include "graphar/filesystem.h"
 #include "graphar/graph_info.h"
 #include "graphar/ml/chunk_read_manager.h"
+#include "graphar/ml/edge_pipeline.h"
 #include "graphar/ml/feature_pipeline.h"
 #include "graphar/ml/neighbor_sampling.h"
 #include "graphar/reader_util.h"
@@ -481,6 +482,56 @@ TEST_CASE_METHOD(GlobalFixture,
   REQUIRE(adj_stats.requests > 0);
   REQUIRE(adj_stats.requests_completed == adj_stats.requests);
   REQUIRE(adj_stats.requests_failed == 0);
+}
+
+TEST_CASE_METHOD(
+    GlobalFixture,
+    "Edge sampling pipeline merges batches that share edge chunk keys") {
+  auto graph_info = LoadLdbcSampleGraph(test_data_dir);
+  auto chunk_manager = std::make_shared<ChunkReadManager>();
+
+  EdgeSamplingPipelineOptions options;
+  options.num_readers = 1;
+  options.num_processors = 2;
+  options.max_active_batches = 4;
+  options.max_queued_processor_tasks = 8;
+  EdgeSamplingPipelineCoordinator coordinator(chunk_manager, options);
+
+  auto expected = SampleNeighbors(graph_info, kVertexType, kEdgeType, {0, 1},
+                                  {3, 2}, 42);
+  REQUIRE(expected.status().ok());
+
+  auto first_handle = coordinator.SubmitSeedBatch(
+      graph_info, kVertexType, kEdgeType, {0, 1}, {3, 2}, 42);
+  auto second_handle = coordinator.SubmitSeedBatch(
+      graph_info, kVertexType, kEdgeType, {0, 1}, {3, 2}, 42);
+  REQUIRE(first_handle.status().ok());
+  REQUIRE(second_handle.status().ok());
+
+  auto first = first_handle.value()->Wait();
+  auto second = second_handle.value()->Wait();
+  REQUIRE(first.status().ok());
+  REQUIRE(second.status().ok());
+  REQUIRE(first.value().sampled_nodes == expected.value().sampled_nodes);
+  REQUIRE(first.value().src_indices == expected.value().src_indices);
+  REQUIRE(first.value().dst_indices == expected.value().dst_indices);
+  REQUIRE(first.value().num_sampled_nodes_per_hop ==
+          expected.value().num_sampled_nodes_per_hop);
+  REQUIRE(first.value().num_sampled_edges_per_hop ==
+          expected.value().num_sampled_edges_per_hop);
+  REQUIRE(second.value().sampled_nodes == expected.value().sampled_nodes);
+  REQUIRE(second.value().src_indices == expected.value().src_indices);
+  REQUIRE(second.value().dst_indices == expected.value().dst_indices);
+
+  const auto stats = coordinator.Stats();
+  REQUIRE(stats.submitted_batches == 2);
+  REQUIRE(stats.completed_batches == 2);
+  REQUIRE(stats.offset_chunk_subscriptions == 2);
+  REQUIRE(stats.offset_chunk_reads == 1);
+  REQUIRE(stats.offset_chunk_reuses == 1);
+  REQUIRE(stats.adj_chunk_subscriptions > 0);
+  REQUIRE(stats.adj_chunk_reads < stats.adj_chunk_subscriptions);
+  REQUIRE(stats.adj_chunk_reuses > 0);
 }
 
 //////////////////////////// GetNodeFeatures /////////////////////////////////////
