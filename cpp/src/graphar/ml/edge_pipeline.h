@@ -40,7 +40,6 @@ struct EdgeSamplingPipelineOptions {
   size_t trail_capacity_chunks = 0;
   size_t num_processors = 1;
   size_t max_active_batches = 1;
-  size_t max_queued_processor_tasks = 1;
 };
 
 struct EdgeSamplingPipelineStats {

@@ -494,7 +494,6 @@ TEST_CASE_METHOD(
   options.num_readers = 1;
   options.num_processors = 2;
   options.max_active_batches = 4;
-  options.max_queued_processor_tasks = 8;
   EdgeSamplingPipelineCoordinator coordinator(chunk_manager, options);
 
   auto expected = SampleNeighbors(graph_info, kVertexType, kEdgeType, {0, 1},

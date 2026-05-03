@@ -247,11 +247,7 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
                      &graphar::ml::EdgeSamplingPipelineOptions::num_processors)
       .def_readwrite(
           "max_active_batches",
-          &graphar::ml::EdgeSamplingPipelineOptions::max_active_batches)
-      .def_readwrite(
-          "max_queued_processor_tasks",
-          &graphar::ml::EdgeSamplingPipelineOptions::
-              max_queued_processor_tasks);
+          &graphar::ml::EdgeSamplingPipelineOptions::max_active_batches);
 
   py::class_<graphar::ml::EdgeSamplingPipelineStats>(
       m, "_EdgeSamplingPipelineStats")

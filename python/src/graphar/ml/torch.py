@@ -346,9 +346,6 @@ class GARNeighborLoader(IterableDataset):
         edge_pipeline_options.trail_capacity_chunks = int(edge_cursor_trail_chunks)
         edge_pipeline_options.num_processors = int(num_edge_processors)
         edge_pipeline_options.max_active_batches = self._max_pending_batches()
-        edge_pipeline_options.max_queued_processor_tasks = (
-            edge_pipeline_options.max_active_batches * num_edge_processors
-        )
         self._edge_pipeline = gar_ml._EdgeSamplingPipelineCoordinator(
             self._sampling_chunk_manager,
             edge_pipeline_options,

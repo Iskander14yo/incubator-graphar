@@ -50,8 +50,6 @@ EdgeSamplingPipelineOptions NormalizeOptions(EdgeSamplingPipelineOptions options
   options.num_readers = std::max<size_t>(1, options.num_readers);
   options.num_processors = std::max<size_t>(1, options.num_processors);
   options.max_active_batches = std::max<size_t>(1, options.max_active_batches);
-  options.max_queued_processor_tasks =
-      std::max(options.max_queued_processor_tasks, options.num_processors);
   return options;
 }
 
@@ -431,7 +429,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
 
     active_batches_cv_.notify_all();
     processor_cv_.notify_all();
-    processor_space_cv_.notify_all();
 
     for (const auto& batch : batches_to_fail) {
       FinishBatch(batch, Status::Invalid("Edge pipeline is shut down"));
@@ -903,11 +900,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
   Status EnqueueProcessorTask(const std::shared_ptr<ActiveChunk>& active_chunk,
                               std::function<void()> fn) {
     {
-      std::unique_lock<std::mutex> lock(mutex_);
-      processor_space_cv_.wait(lock, [&]() {
-        return shutdown_ ||
-               processor_queue_.size() < options_.max_queued_processor_tasks;
-      });
+      std::lock_guard<std::mutex> lock(mutex_);
       if (shutdown_) {
         if (active_chunk != nullptr && active_chunk->in_flight_processors > 0) {
           active_chunk->in_flight_processors -= 1;
@@ -1109,7 +1102,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
         task = std::move(processor_queue_.front());
         processor_queue_.pop_front();
       }
-      processor_space_cv_.notify_all();
 
       const auto service_start = Clock::now();
       const auto wait_ms = MillisecondsBetween(task.enqueued_at, service_start);
@@ -1192,7 +1184,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
   mutable std::mutex mutex_;
   std::condition_variable active_batches_cv_;
   std::condition_variable processor_cv_;
-  std::condition_variable processor_space_cv_;
   bool shutdown_ = false;
 
   std::unordered_map<uint64_t, std::shared_ptr<SamplingBatchState>>
