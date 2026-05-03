@@ -819,7 +819,8 @@ ChunkReadManager::TableResult ChunkReadManager::GetEdgeOffsetChunk(
 ChunkReadManager::TableResult ChunkReadManager::GetEdgeAdjListChunk(
     const std::shared_ptr<GraphInfo>& graph_info, const std::string& src_type,
     const std::string& edge_type, const std::string& dst_type,
-    AdjListType adj_list_type, IdType vertex_chunk_id, IdType chunk_id) {
+    AdjListType adj_list_type, IdType vertex_chunk_id, IdType chunk_id,
+    IdType vertex_chunk_edge_count_hint) {
   if (graph_info == nullptr) {
     return Status::Invalid("GraphInfo cannot be null");
   }
@@ -844,13 +845,36 @@ ChunkReadManager::TableResult ChunkReadManager::GetEdgeAdjListChunk(
   key.chunk_id = chunk_id;
 
   return GetOrLoad(key, [edge_info, adj_list_type, graph_info, vertex_chunk_id,
-                         chunk_id]() -> TableResult {
-    AdjListArrowChunkReader reader(edge_info, adj_list_type,
-                                   graph_info->GetPrefix());
-    GAR_RETURN_NOT_OK(reader.seek_chunk_index(vertex_chunk_id, chunk_id));
-    auto chunk_result = reader.GetChunk();
-    GAR_RETURN_NOT_OK(chunk_result.status());
-    return chunk_result.value();
+                         chunk_id, vertex_chunk_edge_count_hint]() -> TableResult {
+    const std::string& prefix = graph_info->GetPrefix();
+    std::string normalized_prefix;
+    GAR_ASSIGN_OR_RAISE(auto fs,
+                        FileSystemFromUriOrPath(prefix, &normalized_prefix));
+    IdType edge_num = vertex_chunk_edge_count_hint;
+    if (vertex_chunk_edge_count_hint < 0) {
+      GAR_ASSIGN_OR_RAISE(
+          auto edge_num_file_suffix,
+          edge_info->GetEdgesNumFilePath(vertex_chunk_id, adj_list_type));
+      GAR_ASSIGN_OR_RAISE(
+          edge_num,
+          fs->ReadFileToValue<IdType>(normalized_prefix + edge_num_file_suffix));
+    }
+    if (edge_num == 0) {
+      return std::shared_ptr<arrow::Table>(nullptr);
+    }
+    GAR_ASSIGN_OR_RAISE(
+        auto chunk_file_path,
+        edge_info->GetAdjListFilePath(vertex_chunk_id, chunk_id, adj_list_type));
+    auto file_type = edge_info->GetAdjacentList(adj_list_type)->GetFileType();
+    GAR_ASSIGN_OR_RAISE(
+        auto table,
+        fs->ReadFileToTable(normalized_prefix + chunk_file_path, file_type));
+    if (table->num_columns() < 2) {
+      return Status::Invalid(
+          "Adjacency chunk for edge type '", edge_info->GetEdgeType(),
+          "' must have at least two columns (src, dst)");
+    }
+    return table;
   });
 }
 

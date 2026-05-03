@@ -249,6 +249,15 @@ Result<SamplingResult> SampleNeighbors(
       Int64ChunkedArrayCursor offset_cursor(offset_column);
       IdType offset_len = offset_column->length();
 
+      IdType vertex_chunk_edge_hint = -1;
+      if (chunk_manager != nullptr && offset_len >= 2) {
+        GAR_ASSIGN_OR_RAISE(auto off_first, offset_cursor.ValueAt(0));
+        GAR_ASSIGN_OR_RAISE(
+            auto off_last,
+            offset_cursor.ValueAt(static_cast<IdType>(offset_len - 1)));
+        vertex_chunk_edge_hint = off_last - off_first;
+      }
+
       if (chunk_manager == nullptr) {
         GAR_RETURN_NOT_OK(adj_reader.seek_chunk_index(vertex_chunk_idx));
       }
@@ -291,7 +300,7 @@ Result<SamplingResult> SampleNeighbors(
                     chunk_table,
                     chunk_manager->GetEdgeAdjListChunk(
                         graph_info, vertex_type, edge_type, vertex_type, adj_type,
-                        vertex_chunk_idx, edge_chunk_idx));
+                        vertex_chunk_idx, edge_chunk_idx, vertex_chunk_edge_hint));
               } else {
                 GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
                 GAR_ASSIGN_OR_RAISE(chunk_table, adj_reader.GetChunk());
@@ -336,7 +345,7 @@ Result<SamplingResult> SampleNeighbors(
                     chunk_table,
                     chunk_manager->GetEdgeAdjListChunk(
                         graph_info, vertex_type, edge_type, vertex_type, adj_type,
-                        vertex_chunk_idx, edge_chunk_idx));
+                        vertex_chunk_idx, edge_chunk_idx, vertex_chunk_edge_hint));
               } else {
                 GAR_RETURN_NOT_OK(adj_reader.seek(edge_chunk_start));
                 GAR_ASSIGN_OR_RAISE(chunk_table, adj_reader.GetChunk());

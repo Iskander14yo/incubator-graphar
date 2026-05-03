@@ -162,7 +162,8 @@ class ChunkReadManager {
                                   const std::string& edge_type,
                                   const std::string& dst_type,
                                   AdjListType adj_list_type,
-                                  IdType vertex_chunk_id, IdType chunk_id);
+                                  IdType vertex_chunk_id, IdType chunk_id,
+                                  IdType vertex_chunk_edge_count_hint = -1);
 
   ChunkReadStats stats() const;
   FeatureCursorStats feature_cursor_stats() const;
