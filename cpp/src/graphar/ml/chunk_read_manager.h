@@ -141,6 +141,7 @@ class OrderedChunkCursor {
   using TablePtr = std::shared_ptr<arrow::Table>;
   using TableResult = Result<TablePtr>;
   using TableLoader = std::function<TableResult()>;
+  using CompletionCallback = std::function<void(TableResult)>;
 
   struct OrderKey {
     IdType primary = 0;
@@ -159,6 +160,9 @@ class OrderedChunkCursor {
 
   TableResult LoadChunk(const ChunkReadKey& key, OrderKey order_key,
                         const TableLoader& loader);
+  Status SubmitChunk(const ChunkReadKey& key, OrderKey order_key,
+                     const TableLoader& loader,
+                     CompletionCallback on_complete);
   FeatureCursorStats stats() const;
   void Shutdown();
   void RegisterRequest();

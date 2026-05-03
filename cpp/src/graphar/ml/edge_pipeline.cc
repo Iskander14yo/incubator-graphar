@@ -275,10 +275,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
         options_(NormalizeOptions(options)) {
     read_cursor_ = std::make_unique<OrderedChunkCursor>(
         options_.num_readers, options_.trail_capacity_chunks, true);
-    reader_threads_.reserve(options_.num_readers);
-    for (size_t i = 0; i < options_.num_readers; ++i) {
-      reader_threads_.emplace_back([this]() { ReaderLoop(); });
-    }
     processor_threads_.reserve(options_.num_processors);
     for (size_t i = 0; i < options_.num_processors; ++i) {
       processor_threads_.emplace_back([this]() { ProcessorLoop(); });
@@ -403,7 +399,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       stats.active_batches_current = active_batches_.size();
       stats.active_offset_chunk_keys_current = active_offset_chunk_keys_current_;
       stats.active_adj_chunk_keys_current = active_adj_chunk_keys_current_;
-      stats.read_queue_current = read_queue_.size();
+      stats.read_queue_current = 0;
       stats.processor_queue_current = processor_queue_.size();
     }
     return stats;
@@ -427,7 +423,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       for (const auto& [_, batch] : active_batches_) {
         batches_to_fail.push_back(batch);
       }
-      read_queue_.clear();
       processor_queue_.clear();
       active_chunks_.clear();
       active_offset_chunk_keys_current_ = 0;
@@ -435,7 +430,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     }
 
     active_batches_cv_.notify_all();
-    read_cv_.notify_all();
     processor_cv_.notify_all();
     processor_space_cv_.notify_all();
 
@@ -446,13 +440,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     if (read_cursor_ != nullptr) {
       read_cursor_->Shutdown();
     }
-    for (auto& thread : reader_threads_) {
-      if (thread.joinable()) {
-        thread.join();
-      }
-    }
-    reader_threads_.clear();
-
     for (auto& thread : processor_threads_) {
       if (thread.joinable()) {
         thread.join();
@@ -827,7 +814,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
         active_chunk->chunk_id = chunk_id;
         active_chunk->waiting_subscribers.push_back(std::move(subscription));
         active_chunks_.emplace(key, active_chunk);
-        read_queue_.push_back(active_chunk);
         if (key.kind == ChunkReadKind::kEdgeOffset) {
           active_offset_chunk_keys_current_ += 1;
           AtomicMax(&active_offset_chunk_keys_peak_,
@@ -854,7 +840,11 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     }
 
     if (enqueue_read) {
-      read_cv_.notify_one();
+      auto status = StartChunkRead(active_chunk);
+      if (!status.ok()) {
+        OnChunkReadComplete(active_chunk, status);
+        return status;
+      }
       return Status::OK();
     }
     if (chunk_error != nullptr) {
@@ -1006,95 +996,84 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     });
   }
 
-  void ReaderLoop() {
-    while (true) {
-      std::shared_ptr<ActiveChunk> active_chunk;
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        read_cv_.wait(lock, [&]() { return shutdown_ || !read_queue_.empty(); });
-        if (shutdown_ && read_queue_.empty()) {
-          return;
-        }
-        active_chunk = read_queue_.front();
-        read_queue_.pop_front();
-      }
-
-      if (active_chunk == nullptr) {
-        continue;
-      }
-
-      auto direct_loader = [this, active_chunk]() -> TableResult {
-        if (active_chunk->key.kind == ChunkReadKind::kEdgeOffset) {
-          return chunk_manager_->GetEdgeOffsetChunk(
-              active_chunk->graph_info, active_chunk->vertex_type,
-              active_chunk->edge_info->GetEdgeType(), active_chunk->vertex_type,
-              active_chunk->adj_list_type, active_chunk->vertex_chunk_id);
-        }
-        return chunk_manager_->GetEdgeAdjListChunk(
+  Status StartChunkRead(const std::shared_ptr<ActiveChunk>& active_chunk) {
+    auto direct_loader = [this, active_chunk]() -> TableResult {
+      if (active_chunk->key.kind == ChunkReadKind::kEdgeOffset) {
+        return chunk_manager_->GetEdgeOffsetChunk(
             active_chunk->graph_info, active_chunk->vertex_type,
             active_chunk->edge_info->GetEdgeType(), active_chunk->vertex_type,
-            active_chunk->adj_list_type, active_chunk->vertex_chunk_id,
-            active_chunk->chunk_id);
-      };
-      auto table_result = read_cursor_->LoadChunk(active_chunk->key,
-                                                  active_chunk->order_key,
-                                                  direct_loader);
-
-      if (active_chunk->key.kind == ChunkReadKind::kEdgeOffset) {
-        offset_chunk_reads_.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        adj_chunk_reads_.fetch_add(1, std::memory_order_relaxed);
+            active_chunk->adj_list_type, active_chunk->vertex_chunk_id);
       }
+      return chunk_manager_->GetEdgeAdjListChunk(
+          active_chunk->graph_info, active_chunk->vertex_type,
+          active_chunk->edge_info->GetEdgeType(), active_chunk->vertex_type,
+          active_chunk->adj_list_type, active_chunk->vertex_chunk_id,
+          active_chunk->chunk_id);
+    };
+    return read_cursor_->SubmitChunk(
+        active_chunk->key, active_chunk->order_key, direct_loader,
+        [this, active_chunk](TableResult result) {
+          OnChunkReadComplete(active_chunk, std::move(result));
+        });
+  }
 
-      std::vector<Subscription> subscriptions;
-      std::shared_ptr<ActiveChunk> current_chunk;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = active_chunks_.find(active_chunk->key);
-        if (it == active_chunks_.end()) {
-          continue;
-        }
-        current_chunk = it->second;
-        subscriptions = std::move(current_chunk->waiting_subscribers);
-        if (shutdown_) {
-          RemoveActiveChunkLocked(it);
-        } else if (table_result.has_error()) {
-          current_chunk->failed = true;
-          current_chunk->error = table_result.status();
-          RemoveActiveChunkLocked(it);
-        } else {
-          current_chunk->ready = true;
-          current_chunk->table = table_result.value();
-          current_chunk->in_flight_processors += subscriptions.size();
-          if (subscriptions.empty() &&
-              current_chunk->in_flight_processors == 0) {
-            RemoveActiveChunkLocked(it);
-          }
-        }
+  void OnChunkReadComplete(const std::shared_ptr<ActiveChunk>& active_chunk,
+                           TableResult table_result) {
+    if (active_chunk->key.kind == ChunkReadKind::kEdgeOffset) {
+      offset_chunk_reads_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      adj_chunk_reads_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::vector<Subscription> subscriptions;
+    std::shared_ptr<ActiveChunk> current_chunk;
+    bool shutting_down = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it = active_chunks_.find(active_chunk->key);
+      if (it == active_chunks_.end()) {
+        return;
       }
-
+      current_chunk = it->second;
+      subscriptions = std::move(current_chunk->waiting_subscribers);
+      shutting_down = shutdown_;
       if (shutdown_) {
-        for (const auto& subscription : subscriptions) {
-          FinishBatch(subscription.batch,
-                      Status::Invalid("Edge pipeline is shut down"));
+        RemoveActiveChunkLocked(it);
+      } else if (table_result.has_error()) {
+        current_chunk->failed = true;
+        current_chunk->error = table_result.status();
+        RemoveActiveChunkLocked(it);
+      } else {
+        current_chunk->ready = true;
+        current_chunk->table = table_result.value();
+        current_chunk->in_flight_processors += subscriptions.size();
+        if (subscriptions.empty() && current_chunk->in_flight_processors == 0) {
+          RemoveActiveChunkLocked(it);
         }
-        continue;
       }
+    }
 
-      if (table_result.has_error()) {
-        for (const auto& subscription : subscriptions) {
-          FinishBatch(subscription.batch, table_result.status());
-        }
-        continue;
+    if (shutting_down) {
+      for (const auto& subscription : subscriptions) {
+        FinishBatch(subscription.batch,
+                    Status::Invalid("Edge pipeline is shut down"));
       }
+      return;
+    }
 
-      for (auto& subscription : subscriptions) {
-        auto batch = subscription.batch;
-        auto status = EnqueueProcessorForSubscription(
-            current_chunk, std::move(subscription), table_result.value());
-        if (!status.ok()) {
-          FinishBatch(batch, status);
-        }
+    if (table_result.has_error()) {
+      for (const auto& subscription : subscriptions) {
+        FinishBatch(subscription.batch, table_result.status());
+      }
+      return;
+    }
+
+    for (auto& subscription : subscriptions) {
+      auto batch = subscription.batch;
+      auto status = EnqueueProcessorForSubscription(
+          current_chunk, std::move(subscription), table_result.value());
+      if (!status.ok()) {
+        FinishBatch(batch, status);
       }
     }
   }
@@ -1194,7 +1173,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
 
   mutable std::mutex mutex_;
   std::condition_variable active_batches_cv_;
-  std::condition_variable read_cv_;
   std::condition_variable processor_cv_;
   std::condition_variable processor_space_cv_;
   bool shutdown_ = false;
@@ -1204,9 +1182,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
   std::unordered_map<ChunkReadKey, std::shared_ptr<ActiveChunk>,
                      ChunkReadKeyHash>
       active_chunks_;
-  std::deque<std::shared_ptr<ActiveChunk>> read_queue_;
   std::deque<ProcessorTask> processor_queue_;
-  std::vector<std::thread> reader_threads_;
   std::vector<std::thread> processor_threads_;
   size_t active_offset_chunk_keys_current_ = 0;
   size_t active_adj_chunk_keys_current_ = 0;

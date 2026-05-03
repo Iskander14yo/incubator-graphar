@@ -74,7 +74,9 @@ struct OrderedChunkCursor::Impl {
     ChunkReadKey key;
     OrderKey order_key;
     TableLoader loader;
-    std::promise<TableResult> promise;
+    CompletionCallback on_complete;
+    bool track_request = false;
+    Clock::time_point request_start;
   };
 
   struct QueueState {
@@ -100,60 +102,62 @@ struct OrderedChunkCursor::Impl {
 
   TableResult LoadChunk(const ChunkReadKey& key, OrderKey order_key,
                         const TableLoader& loader) {
-    struct AutoRequestTracker {
-      Impl* impl = nullptr;
-      Clock::time_point start;
-      bool ok = false;
-
-      ~AutoRequestTracker() {
-        if (impl != nullptr) {
-          impl->CompleteRequest(start, ok);
-        }
-      }
-    };
-
-    AutoRequestTracker tracker;
-    if (auto_track_requests_) {
-      RegisterRequest();
-      tracker.impl = this;
-      tracker.start = Clock::now();
+    auto promise = std::make_shared<std::promise<TableResult>>();
+    auto future = promise->get_future();
+    auto status = SubmitChunk(
+        key, order_key, loader,
+        [promise](TableResult result) { promise->set_value(std::move(result)); });
+    if (!status.ok()) {
+      return status;
     }
+    return future.get();
+  }
+
+  Status SubmitChunk(const ChunkReadKey& key, OrderKey order_key,
+                     const TableLoader& loader,
+                     CompletionCallback on_complete) {
+    const auto request_start = Clock::now();
+    TablePtr trail_table;
+    bool served_from_trail = false;
+    bool track_request = auto_track_requests_;
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (shutdown_) {
         return Status::Invalid("Chunk cursor is shut down");
       }
-      auto trail_table = LookupTrailLocked(key);
+      if (track_request) {
+        RegisterRequest();
+      }
+      trail_table = LookupTrailLocked(key);
       if (trail_table != nullptr) {
         trail_hits_.fetch_add(1, std::memory_order_relaxed);
-        tracker.ok = true;
-        return trail_table;
+        served_from_trail = true;
+      } else {
+        trail_misses_.fetch_add(1, std::memory_order_relaxed);
+        auto task = std::make_shared<Task>();
+        task->key = key;
+        task->order_key = order_key;
+        task->loader = loader;
+        task->on_complete = std::move(on_complete);
+        task->track_request = track_request;
+        task->request_start = request_start;
+        auto& queue = queues_[CursorIndexFor(key)];
+        queue.tasks_by_order_key[task->order_key].push_back(task);
+        queue.task_count += 1;
       }
-      trail_misses_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    auto task = std::make_shared<Task>();
-    task->key = key;
-    task->order_key = order_key;
-    task->loader = loader;
-    auto future = task->promise.get_future();
-
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (shutdown_) {
-        return Status::Invalid("Chunk cursor is shut down");
+    if (served_from_trail) {
+      if (track_request) {
+        CompleteRequest(request_start, true);
       }
-      auto& queue = queues_[CursorIndexFor(key)];
-      queue.tasks_by_order_key[task->order_key].push_back(task);
-      queue.task_count += 1;
+      on_complete(trail_table);
+      return Status::OK();
     }
+
     cv_.notify_all();
-    auto result = future.get();
-    if (tracker.impl != nullptr) {
-      tracker.ok = !result.has_error();
-    }
-    return result;
+    return Status::OK();
   }
 
   FeatureCursorStats stats() const {
@@ -204,7 +208,10 @@ struct OrderedChunkCursor::Impl {
 
     cv_.notify_all();
     for (const auto& task : pending) {
-      task->promise.set_value(Status::Invalid("Chunk cursor is shut down"));
+      if (task->track_request) {
+        CompleteRequest(task->request_start, false);
+      }
+      task->on_complete(Status::Invalid("Chunk cursor is shut down"));
     }
     for (auto& worker : workers_) {
       if (worker.joinable()) {
@@ -288,7 +295,10 @@ struct OrderedChunkCursor::Impl {
       }
 
       if (IsShutdown()) {
-        task->promise.set_value(Status::Invalid("Chunk cursor is shut down"));
+        if (task->track_request) {
+          CompleteRequest(task->request_start, false);
+        }
+        task->on_complete(Status::Invalid("Chunk cursor is shut down"));
         continue;
       }
 
@@ -309,7 +319,10 @@ struct OrderedChunkCursor::Impl {
         const uint64_t service_ms = MillisecondsSince(service_start);
         service_ms_sum_.fetch_add(service_ms, std::memory_order_relaxed);
         AtomicMax(&service_ms_max_, service_ms);
-        task->promise.set_value(result);
+        if (task->track_request) {
+          CompleteRequest(task->request_start, true);
+        }
+        task->on_complete(std::move(result));
         continue;
       }
 
@@ -336,7 +349,10 @@ struct OrderedChunkCursor::Impl {
       const uint64_t service_ms = MillisecondsSince(service_start);
       service_ms_sum_.fetch_add(service_ms, std::memory_order_relaxed);
       AtomicMax(&service_ms_max_, service_ms);
-      task->promise.set_value(result);
+      if (task->track_request) {
+        CompleteRequest(task->request_start, !result.has_error());
+      }
+      task->on_complete(std::move(result));
     }
   }
 
@@ -418,6 +434,13 @@ OrderedChunkCursor::~OrderedChunkCursor() = default;
 OrderedChunkCursor::TableResult OrderedChunkCursor::LoadChunk(
     const ChunkReadKey& key, OrderKey order_key, const TableLoader& loader) {
   return impl_->LoadChunk(key, order_key, loader);
+}
+
+Status OrderedChunkCursor::SubmitChunk(const ChunkReadKey& key,
+                                       OrderKey order_key,
+                                       const TableLoader& loader,
+                                       CompletionCallback on_complete) {
+  return impl_->SubmitChunk(key, order_key, loader, std::move(on_complete));
 }
 
 FeatureCursorStats OrderedChunkCursor::stats() const { return impl_->stats(); }
