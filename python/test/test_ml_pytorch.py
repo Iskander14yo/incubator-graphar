@@ -619,7 +619,7 @@ def test_profile_works_with_multi_sampler(ldbc_graph):
 # ---------------------------------------------------------------------------
 
 def test_bounded_prefetch_limits_concurrency(ldbc_graph):
-    """At most num_samplers sampling submissions should run simultaneously."""
+    """At most num_samplers submit threads run _submit_sampling_batch simultaneously."""
     num_samplers = 2
     loader = _make_loader(
         ldbc_graph,
@@ -633,7 +633,7 @@ def test_bounded_prefetch_limits_concurrency(ldbc_graph):
     peak = 0
     active = 0
     lock = threading.Lock()
-    real_submit = loader._sample_and_submit_batch
+    real_submit = loader._submit_sampling_batch
 
     def tracked_submit(seed_nodes, seed):
         nonlocal peak, active
@@ -646,13 +646,14 @@ def test_bounded_prefetch_limits_concurrency(ldbc_graph):
             with lock:
                 active -= 1
 
-    with mock.patch.object(loader, "_sample_and_submit_batch", side_effect=tracked_submit):
+    with mock.patch.object(loader, "_submit_sampling_batch", side_effect=tracked_submit):
         list(loader)
 
     assert peak <= num_samplers
 
 
 def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
+    """With prefetch_batches=4, sampling for batches 1–3 can submit while batch 0 finalize waits."""
     loader = _make_loader(
         ldbc_graph,
         input_nodes=list(range(10)),
@@ -663,38 +664,44 @@ def test_prefetch_batches_submit_past_slow_head(ldbc_graph):
         prefetch_batches=4,
     )
 
-    real_submit = loader._sample_and_submit_batch
+    real_finalize = loader._finalize_sampling_batch
+    real_submit = loader._submit_sampling_batch
     release_first = threading.Event()
     started_fourth = threading.Event()
     started_batches = set()
     started_lock = threading.Lock()
-    thread_error = []
+    thread_error: list[Exception] = []
 
-    def tracked_submit(seed_nodes, seed):
+    def tracked_finalize(inflight):
+        batch_idx = inflight.seed_nodes[0] // 2
+        if batch_idx == 0:
+            if not release_first.wait(timeout=5.0):
+                raise TimeoutError("timed out waiting to release first batch")
+        return real_finalize(inflight)
+
+    def submit_wrapper(seed_nodes, seed):
         batch_idx = seed_nodes[0] // 2
         with started_lock:
             started_batches.add(batch_idx)
             if batch_idx == 3:
                 started_fourth.set()
-        if batch_idx == 0:
-            if not release_first.wait(timeout=5.0):
-                raise TimeoutError("timed out waiting to release first batch")
         return real_submit(seed_nodes, seed)
 
     def consume():
         try:
-            list(loader)
+            with mock.patch.object(loader, "_submit_sampling_batch", side_effect=submit_wrapper):
+                with mock.patch.object(loader, "_finalize_sampling_batch", side_effect=tracked_finalize):
+                    list(loader)
         except Exception as exc:  # pragma: no cover - surfaced by assertion below
             thread_error.append(exc)
 
-    with mock.patch.object(loader, "_sample_and_submit_batch", side_effect=tracked_submit):
-        consumer = threading.Thread(target=consume)
-        consumer.start()
-        assert started_fourth.wait(timeout=5.0)
-        with started_lock:
-            assert started_batches >= {0, 1, 2, 3}
-        release_first.set()
-        consumer.join(timeout=10.0)
+    consumer = threading.Thread(target=consume)
+    consumer.start()
+    assert started_fourth.wait(timeout=5.0)
+    with started_lock:
+        assert started_batches >= {0, 1, 2, 3}
+    release_first.set()
+    consumer.join(timeout=10.0)
 
     assert not consumer.is_alive()
     assert thread_error == []

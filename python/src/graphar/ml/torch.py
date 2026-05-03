@@ -36,6 +36,16 @@ class _SampledBatch:
     feature_handle: object | None
 
 
+@dataclass
+class _SamplingInFlight:
+    """Edge pipeline batch submitted; sampling not waited on yet."""
+
+    seed_nodes: list[int]
+    seed: int
+    total_started_at: float
+    sampling_handle: object
+
+
 def _chunked_array_to_tensor(column: pa.ChunkedArray, name: str) -> torch.Tensor:
     combined = column.combine_chunks()
     numpy_array = combined.to_numpy(zero_copy_only=False)
@@ -426,7 +436,7 @@ class GARNeighborLoader(IterableDataset):
         self._feature_chunk_manager.shutdown()
         self._sampling_chunk_manager.shutdown()
 
-    def _sample_and_submit_batch(self, seed_nodes: list[int], seed: int) -> _SampledBatch:
+    def _submit_sampling_batch(self, seed_nodes: list[int], seed: int) -> _SamplingInFlight:
         total_started_at = time.perf_counter()
         sampling_handle = self._edge_pipeline.submit_seed_batch(
             self.graph_info,
@@ -436,8 +446,16 @@ class GARNeighborLoader(IterableDataset):
             self.num_neighbors,
             seed,
         )
-        sampling = sampling_handle.wait()
-        sampling_ms = float(sampling_handle.sampling_ms())
+        return _SamplingInFlight(
+            seed_nodes=list(seed_nodes),
+            seed=seed,
+            total_started_at=total_started_at,
+            sampling_handle=sampling_handle,
+        )
+
+    def _finalize_sampling_batch(self, inflight: _SamplingInFlight) -> _SampledBatch:
+        sampling = inflight.sampling_handle.wait()
+        sampling_ms = float(inflight.sampling_handle.sampling_ms())
 
         sampled_nodes = [int(node) for node in sampling.sampled_nodes]
         src_indices = [int(src_idx) for src_idx in sampling.src_indices]
@@ -452,13 +470,13 @@ class GARNeighborLoader(IterableDataset):
                 self.features,
             )
         return _SampledBatch(
-            seed_nodes=list(seed_nodes),
+            seed_nodes=inflight.seed_nodes,
             sampled_nodes=sampled_nodes,
             src_indices=src_indices,
             dst_indices=dst_indices,
             num_sampled_nodes=[int(value) for value in sampling.num_sampled_nodes_per_hop],
             num_sampled_edges=[int(value) for value in sampling.num_sampled_edges_per_hop],
-            total_started_at=total_started_at,
+            total_started_at=inflight.total_started_at,
             sampling_ms=sampling_ms,
             feature_handle=feature_handle,
         )
@@ -505,7 +523,9 @@ class GARNeighborLoader(IterableDataset):
         return batch, prof
 
     def _build_batch(self, seed_nodes: list[int], seed: int) -> tuple[Data, BatchProfile]:
-        return self._materialize_batch(self._sample_and_submit_batch(seed_nodes, seed))
+        return self._materialize_batch(
+            self._finalize_sampling_batch(self._submit_sampling_batch(seed_nodes, seed))
+        )
 
     def __iter__(self) -> Iterator[Data]:
         for batch, _ in self._iter_batches():
@@ -516,61 +536,53 @@ class GARNeighborLoader(IterableDataset):
         yield from self._iter_batches()
 
     def _iter_batches(self) -> Iterator[tuple[Data, BatchProfile]]:
+        """Submit sampling without waiting (up to max_pending), then finalize in order."""
         jobs = ((nodes, self._sample_seed()) for nodes in self._iter_input_batches())
         max_pending = self._max_pending_batches()
-
-        if self.num_samplers == 0:
-            next_seq = 0
-            next_to_yield = 0
-            jobs_exhausted = False
-            completed: dict[int, _SampledBatch] = {}
-
-            def submit_until_full() -> None:
-                nonlocal next_seq, jobs_exhausted
-                while not jobs_exhausted and len(completed) < max_pending:
-                    try:
-                        seed_nodes, seed = next(jobs)
-                    except StopIteration:
-                        jobs_exhausted = True
-                        return
-                    completed[next_seq] = self._sample_and_submit_batch(seed_nodes, seed)
-                    next_seq += 1
-
-            submit_until_full()
-            while completed:
-                yield self._materialize_batch(completed.pop(next_to_yield))
-                next_to_yield += 1
-                submit_until_full()
-            return
 
         next_seq = 0
         next_to_yield = 0
         jobs_exhausted = False
-        completed: dict[int, _SampledBatch] = {}
-        in_flight: dict[Future, int] = {}
+        inflight_by_seq: dict[int, _SamplingInFlight] = {}
+        futures: dict[Future, int] = {}
 
-        def submit_until_full(executor: ThreadPoolExecutor) -> None:
+        def submit_until_full(executor: ThreadPoolExecutor | None) -> None:
             nonlocal next_seq, jobs_exhausted
-            while not jobs_exhausted and len(in_flight) + len(completed) < max_pending:
+            while not jobs_exhausted and len(inflight_by_seq) + len(futures) < max_pending:
                 try:
                     seed_nodes, seed = next(jobs)
                 except StopIteration:
                     jobs_exhausted = True
                     return
-                future = executor.submit(self._sample_and_submit_batch, seed_nodes, seed)
-                in_flight[future] = next_seq
+                if executor is None:
+                    inflight_by_seq[next_seq] = self._submit_sampling_batch(seed_nodes, seed)
+                else:
+                    fut = executor.submit(self._submit_sampling_batch, seed_nodes, seed)
+                    futures[fut] = next_seq
                 next_seq += 1
+
+        if self.num_samplers == 0:
+            submit_until_full(None)
+            while inflight_by_seq or next_to_yield < next_seq:
+                while next_to_yield in inflight_by_seq:
+                    sampled = self._finalize_sampling_batch(inflight_by_seq.pop(next_to_yield))
+                    yield self._materialize_batch(sampled)
+                    next_to_yield += 1
+                    submit_until_full(None)
+            return
 
         with ThreadPoolExecutor(max_workers=self.num_samplers) as executor:
             submit_until_full(executor)
-            while in_flight or completed:
-                while next_to_yield in completed:
-                    yield self._materialize_batch(completed.pop(next_to_yield))
+            while futures or inflight_by_seq or next_to_yield < next_seq:
+                while next_to_yield in inflight_by_seq:
+                    sampled = self._finalize_sampling_batch(inflight_by_seq.pop(next_to_yield))
+                    yield self._materialize_batch(sampled)
                     next_to_yield += 1
                     submit_until_full(executor)
-                if not in_flight:
+                if not futures:
                     continue
-                done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
-                for future in done:
-                    completed[in_flight.pop(future)] = future.result()
+                done, _ = wait(tuple(futures), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    seq = futures.pop(fut)
+                    inflight_by_seq[seq] = fut.result()
                 submit_until_full(executor)
