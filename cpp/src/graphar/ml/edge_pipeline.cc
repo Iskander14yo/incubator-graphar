@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <thread>
 #include <unordered_map>
@@ -183,13 +184,13 @@ struct SamplingBatchState {
     IdType row_begin = 0;
     IdType row_end = 0;
     std::vector<IdType> picked_rows;
+    std::vector<IdType> neighbors;
   };
 
   struct SourcePlan {
     IdType src_node = 0;
-    bool needs_shuffle = false;
     std::vector<AdjChunkSpan> spans;
-    std::vector<IdType> neighbors;
+    std::vector<size_t> shuffle_order;
   };
 
   struct HopState {
@@ -273,7 +274,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       : chunk_manager_(std::move(chunk_manager)),
         options_(NormalizeOptions(options)) {
     read_cursor_ = std::make_unique<OrderedChunkCursor>(
-        options_.num_readers, 0, false);
+        options_.num_readers, options_.trail_capacity_chunks, true);
     reader_threads_.reserve(options_.num_readers);
     for (size_t i = 0; i < options_.num_readers; ++i) {
       reader_threads_.emplace_back([this]() { ReaderLoop(); });
@@ -406,6 +407,13 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       stats.processor_queue_current = processor_queue_.size();
     }
     return stats;
+  }
+
+  FeatureCursorStats CursorStats() const {
+    if (read_cursor_ == nullptr) {
+      return {};
+    }
+    return read_cursor_->stats();
   }
 
   void Shutdown() {
@@ -577,8 +585,9 @@ struct EdgeSamplingPipelineCoordinator::Impl {
           const IdType end_off = end_result.value();
           if (begin_off >= end_off || hop.max_neighbors <= 0) {
             if (begin_off < end_off) {
-              hop.source_plans.push_back(
-                  SamplingBatchState::SourcePlan{src_node, false, {}});
+              SamplingBatchState::SourcePlan plan;
+              plan.src_node = src_node;
+              hop.source_plans.push_back(std::move(plan));
             }
             continue;
           }
@@ -586,11 +595,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
           const IdType total_edges = end_off - begin_off;
           SamplingBatchState::SourcePlan plan;
           plan.src_node = src_node;
-          if (hop.max_neighbors > 0) {
-            plan.neighbors.reserve(
-                static_cast<size_t>(
-                    std::min<IdType>(total_edges, hop.max_neighbors)));
-          }
 
           if (total_edges <= static_cast<IdType>(hop.max_neighbors)) {
             IdType cur_off = begin_off;
@@ -614,7 +618,10 @@ struct EdgeSamplingPipelineCoordinator::Impl {
             SampleUniformLocalIndices(total_edges,
                                       static_cast<IdType>(hop.max_neighbors),
                                       &batch->gen, &local_indices);
-            plan.needs_shuffle = true;
+            plan.shuffle_order.resize(local_indices.size());
+            std::iota(plan.shuffle_order.begin(), plan.shuffle_order.end(), 0);
+            std::shuffle(plan.shuffle_order.begin(), plan.shuffle_order.end(),
+                         batch->gen);
             size_t pick_i = 0;
             while (pick_i < local_indices.size()) {
               const IdType abs_off = begin_off + local_indices[pick_i];
@@ -684,11 +691,29 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       IdType hop_num_sampled_edges = 0;
 
       for (auto& plan : hop.source_plans) {
-        if (plan.needs_shuffle) {
-          std::shuffle(plan.neighbors.begin(), plan.neighbors.end(), batch->gen);
+        std::vector<IdType> neighbors;
+        size_t total_neighbors = 0;
+        for (const auto& span : plan.spans) {
+          total_neighbors += span.neighbors.size();
+        }
+        neighbors.reserve(total_neighbors);
+        for (const auto& span : plan.spans) {
+          neighbors.insert(neighbors.end(), span.neighbors.begin(),
+                           span.neighbors.end());
+        }
+        if (!plan.shuffle_order.empty()) {
+          if (plan.shuffle_order.size() != neighbors.size()) {
+            return Status::Invalid("Adjacency shuffle order size mismatch");
+          }
+          std::vector<IdType> shuffled_neighbors;
+          shuffled_neighbors.reserve(neighbors.size());
+          for (size_t index : plan.shuffle_order) {
+            shuffled_neighbors.push_back(neighbors[index]);
+          }
+          neighbors = std::move(shuffled_neighbors);
         }
 
-        for (IdType dst_node : plan.neighbors) {
+        for (IdType dst_node : neighbors) {
           batch->edge_list.emplace_back(plan.src_node, dst_node);
           ++hop_num_sampled_edges;
           if (batch->all_sampled_nodes_set.insert(dst_node).second) {
@@ -935,7 +960,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
         return Status::OK();
       }
       for (auto& plan : batch->hop_state.source_plans) {
-        for (const auto& span : plan.spans) {
+        for (auto& span : plan.spans) {
           if (!(span.key == key)) {
             continue;
           }
@@ -949,7 +974,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
               }
               auto raw = raw_result.value();
               const IdType batch_rows = std::min(span.row_end - row, available);
-              plan.neighbors.insert(plan.neighbors.end(), raw, raw + batch_rows);
+              span.neighbors.insert(span.neighbors.end(), raw, raw + batch_rows);
               row += batch_rows;
             }
           } else {
@@ -958,7 +983,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
               if (dst_result.has_error()) {
                 return dst_result.status();
               }
-              plan.neighbors.push_back(dst_result.value());
+              span.neighbors.push_back(dst_result.value());
             }
           }
         }
@@ -1273,6 +1298,10 @@ EdgeSamplingPipelineCoordinator::SubmitSeedBatch(
 
 EdgeSamplingPipelineStats EdgeSamplingPipelineCoordinator::Stats() const {
   return impl_->Stats();
+}
+
+FeatureCursorStats EdgeSamplingPipelineCoordinator::CursorStats() const {
+  return impl_->CursorStats();
 }
 
 void EdgeSamplingPipelineCoordinator::Shutdown() { impl_->Shutdown(); }

@@ -31,11 +31,13 @@
 namespace graphar::ml {
 
 class ChunkReadManager;
+struct FeatureCursorStats;
 struct SamplingResult;
 struct SamplingBatchState;
 
 struct EdgeSamplingPipelineOptions {
   size_t num_readers = 1;
+  size_t trail_capacity_chunks = 0;
   size_t num_processors = 1;
   size_t max_active_batches = 1;
   size_t max_queued_processor_tasks = 1;
@@ -104,6 +106,7 @@ class EdgeSamplingPipelineCoordinator {
       uint64_t seed);
 
   EdgeSamplingPipelineStats Stats() const;
+  FeatureCursorStats CursorStats() const;
   void Shutdown();
 
  private:

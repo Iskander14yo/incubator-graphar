@@ -93,12 +93,6 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def_readwrite("edge_adj_list_ram_budget_bytes",
                      &graphar::ml::ChunkReadManagerOptions::
                          edge_adj_list_ram_budget_bytes)
-      .def_readwrite("edge_cursor_count",
-                     &graphar::ml::ChunkReadManagerOptions::edge_cursor_count)
-      .def_readwrite(
-          "edge_cursor_trail_capacity_chunks",
-          &graphar::ml::ChunkReadManagerOptions::
-              edge_cursor_trail_capacity_chunks)
       .def_readwrite("feature_cursor_count",
                      &graphar::ml::ChunkReadManagerOptions::feature_cursor_count)
       .def_readwrite(
@@ -193,10 +187,6 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def("stats", &graphar::ml::ChunkReadManager::stats)
       .def("feature_cursor_stats",
            &graphar::ml::ChunkReadManager::feature_cursor_stats)
-      .def("edge_offset_cursor_stats",
-           &graphar::ml::ChunkReadManager::edge_offset_cursor_stats)
-      .def("edge_adj_list_cursor_stats",
-           &graphar::ml::ChunkReadManager::edge_adj_list_cursor_stats)
       .def("shutdown", &graphar::ml::ChunkReadManager::Shutdown);
 
   py::class_<graphar::ml::FeaturePipelineOptions>(m,
@@ -250,6 +240,9 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def(py::init<>())
       .def_readwrite("num_readers",
                      &graphar::ml::EdgeSamplingPipelineOptions::num_readers)
+      .def_readwrite(
+          "trail_capacity_chunks",
+          &graphar::ml::EdgeSamplingPipelineOptions::trail_capacity_chunks)
       .def_readwrite("num_processors",
                      &graphar::ml::EdgeSamplingPipelineOptions::num_processors)
       .def_readwrite(
@@ -395,6 +388,8 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
           py::arg("edge_type"), py::arg("seed_nodes"), py::arg("fanout"),
           py::arg("seed"))
       .def("stats", &graphar::ml::EdgeSamplingPipelineCoordinator::Stats)
+      .def("cursor_stats",
+           &graphar::ml::EdgeSamplingPipelineCoordinator::CursorStats)
       .def("shutdown", &graphar::ml::EdgeSamplingPipelineCoordinator::Shutdown);
 
   py::class_<graphar::ml::FeatureCursorStats>(m, "_FeatureCursorStats")

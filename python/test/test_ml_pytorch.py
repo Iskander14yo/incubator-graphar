@@ -8,6 +8,7 @@ import torch
 from torch_geometric.data import Data
 
 import graphar as gar
+import graphar.ml as gar_ml
 import graphar.ml.torch as gar_torch
 from graphar.ml.torch import BatchProfile, GARNeighborLoader
 
@@ -31,9 +32,8 @@ def _make_loader(
     adj_list_ram_for_loader_mb=0,
     offset_ram_for_loader_mb=0,
     feature_ram_for_loader_mb=0,
-    edge_cursor_count=0,
     edge_cursor_trail_chunks=0,
-    num_edge_readers=0,
+    num_edge_readers=1,
     num_edge_processors=1,
     num_readers=None,
     num_stitchers=1,
@@ -54,7 +54,6 @@ def _make_loader(
         adj_list_ram_for_loader_mb=adj_list_ram_for_loader_mb,
         offset_ram_for_loader_mb=offset_ram_for_loader_mb,
         feature_ram_for_loader_mb=feature_ram_for_loader_mb,
-        edge_cursor_count=edge_cursor_count,
         edge_cursor_trail_chunks=edge_cursor_trail_chunks,
         num_edge_readers=num_edge_readers,
         num_edge_processors=num_edge_processors,
@@ -364,19 +363,14 @@ def test_edge_cursor_stats_are_exposed(ldbc_graph):
         features=[],
         batch_size=2,
         shuffle=False,
-        edge_cursor_count=1,
         edge_cursor_trail_chunks=1,
     )
     list(loader)
 
-    offset_stats = loader.edge_offset_cursor_stats()
-    adj_stats = loader.edge_adj_list_cursor_stats()
-    assert offset_stats["cursor_count"] == 1
-    assert adj_stats["cursor_count"] == 1
-    assert offset_stats["requests"] > 0
-    assert adj_stats["requests"] > 0
-    assert offset_stats["requests_completed"] == offset_stats["requests"]
-    assert adj_stats["requests_completed"] == adj_stats["requests"]
+    stats = loader.edge_cursor_stats()
+    assert stats["cursor_count"] == 1
+    assert stats["requests"] > 0
+    assert stats["requests_completed"] == stats["requests"]
 
 
 def test_edge_pipeline_stats_are_exposed(ldbc_graph):
@@ -400,26 +394,37 @@ def test_edge_pipeline_stats_are_exposed(ldbc_graph):
 
 
 def test_edge_pipeline_matches_sync_sampling_shuffle_false(ldbc_graph):
-    sync_loader = _make_loader(
+    loader = _make_loader(
         ldbc_graph,
         input_nodes=[0, 1, 2, 3, 4, 5],
-        features=["id"],
-        batch_size=2,
-        shuffle=False,
-        num_samplers=2,
-    )
-    pipeline_loader = _make_loader(
-        ldbc_graph,
-        input_nodes=[0, 1, 2, 3, 4, 5],
-        features=["id"],
+        features=[],
         batch_size=2,
         shuffle=False,
         num_samplers=2,
         num_edge_readers=1,
         num_edge_processors=1,
     )
+    batch_seeds = [101, 202, 303]
+    expected = []
+    for seed_nodes, seed in zip(([0, 1], [2, 3], [4, 5]), batch_seeds):
+        sampling = gar_ml.sample_neighbors(
+            ldbc_graph,
+            "person",
+            "knows",
+            seed_nodes,
+            [5],
+            seed=seed,
+        )
+        expected.append(
+            (
+                seed_nodes,
+                list(sampling.sampled_nodes),
+                [list(sampling.src_indices), list(sampling.dst_indices)],
+            )
+        )
 
-    assert _epoch_signature(sync_loader) == _epoch_signature(pipeline_loader)
+    with mock.patch.object(loader, "_sample_seed", side_effect=batch_seeds):
+        assert _epoch_signature(loader) == expected
 
 
 def test_negative_adj_list_ram_for_loader_is_rejected(ldbc_graph):
@@ -442,11 +447,6 @@ def test_negative_feature_ram_for_loader_is_rejected(ldbc_graph):
         _make_loader(ldbc_graph, feature_ram_for_loader_mb=-1)
 
 
-def test_negative_edge_cursor_count_is_rejected(ldbc_graph):
-    with pytest.raises(ValueError, match="edge_cursor_count"):
-        _make_loader(ldbc_graph, edge_cursor_count=-1)
-
-
 def test_negative_edge_cursor_trail_chunks_is_rejected(ldbc_graph):
     with pytest.raises(ValueError, match="edge_cursor_trail_chunks"):
         _make_loader(ldbc_graph, edge_cursor_trail_chunks=-1)
@@ -455,6 +455,11 @@ def test_negative_edge_cursor_trail_chunks_is_rejected(ldbc_graph):
 def test_negative_num_edge_readers_is_rejected(ldbc_graph):
     with pytest.raises(ValueError, match="num_edge_readers"):
         _make_loader(ldbc_graph, num_edge_readers=-1)
+
+
+def test_zero_num_edge_readers_is_rejected(ldbc_graph):
+    with pytest.raises(ValueError, match="num_edge_readers"):
+        _make_loader(ldbc_graph, num_edge_readers=0)
 
 
 def test_non_positive_num_edge_processors_is_rejected(ldbc_graph):

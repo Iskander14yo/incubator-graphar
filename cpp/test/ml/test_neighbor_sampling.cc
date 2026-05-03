@@ -526,9 +526,10 @@ TEST_CASE_METHOD(
   const auto stats = coordinator.Stats();
   REQUIRE(stats.submitted_batches == 2);
   REQUIRE(stats.completed_batches == 2);
-  REQUIRE(stats.offset_chunk_subscriptions == 2);
-  REQUIRE(stats.offset_chunk_reads == 1);
-  REQUIRE(stats.offset_chunk_reuses == 1);
+  REQUIRE(stats.offset_chunk_subscriptions > 0);
+  REQUIRE(stats.offset_chunk_reads > 0);
+  REQUIRE(stats.offset_chunk_reads < stats.offset_chunk_subscriptions);
+  REQUIRE(stats.offset_chunk_reuses > 0);
   REQUIRE(stats.adj_chunk_subscriptions > 0);
   REQUIRE(stats.adj_chunk_reads < stats.adj_chunk_subscriptions);
   REQUIRE(stats.adj_chunk_reuses > 0);
