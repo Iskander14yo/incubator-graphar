@@ -136,6 +136,41 @@ struct FeatureCursorStats {
   uint64_t service_ms_max = 0;
 };
 
+class OrderedChunkCursor {
+ public:
+  using TablePtr = std::shared_ptr<arrow::Table>;
+  using TableResult = Result<TablePtr>;
+  using TableLoader = std::function<TableResult()>;
+
+  struct OrderKey {
+    IdType primary = 0;
+    IdType secondary = 0;
+    IdType tertiary = 0;
+
+    bool operator<(const OrderKey& other) const;
+  };
+
+  OrderedChunkCursor(size_t cursor_count, size_t trail_capacity_chunks,
+                     bool auto_track_requests);
+  ~OrderedChunkCursor();
+
+  OrderedChunkCursor(const OrderedChunkCursor&) = delete;
+  OrderedChunkCursor& operator=(const OrderedChunkCursor&) = delete;
+
+  TableResult LoadChunk(const ChunkReadKey& key, OrderKey order_key,
+                        const TableLoader& loader);
+  FeatureCursorStats stats() const;
+  void Shutdown();
+  void RegisterRequest();
+  void CompleteRequest(std::chrono::steady_clock::time_point start, bool ok);
+  void RecordBatchServed(size_t rows);
+
+ private:
+  struct Impl;
+
+  std::unique_ptr<Impl> impl_;
+};
+
 class ChunkReadManager {
  public:
   using TablePtr = std::shared_ptr<arrow::Table>;
@@ -185,7 +220,6 @@ class ChunkReadManager {
 
   using Clock = std::chrono::steady_clock;
 
-  struct CursorState;
   enum class CacheDomain {
     kVertexProperty,
     kEdgeOffset,
@@ -226,9 +260,9 @@ class ChunkReadManager {
   std::unordered_map<ChunkReadKey, std::shared_future<TableResult>,
                      ChunkReadKeyHash>
       in_flight_;
-  std::unique_ptr<CursorState> feature_cursor_;
-  std::unique_ptr<CursorState> edge_offset_cursor_;
-  std::unique_ptr<CursorState> edge_adj_list_cursor_;
+  std::unique_ptr<OrderedChunkCursor> feature_cursor_;
+  std::unique_ptr<OrderedChunkCursor> edge_offset_cursor_;
+  std::unique_ptr<OrderedChunkCursor> edge_adj_list_cursor_;
 
   std::atomic<uint64_t> requests_{0};
   std::atomic<uint64_t> leaders_{0};

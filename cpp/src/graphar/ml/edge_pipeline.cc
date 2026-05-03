@@ -236,20 +236,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
   using BatchResult = Result<SamplingResult>;
   using TableResult = Result<TablePtr>;
 
-  struct OrderKey {
-    IdType primary = 0;
-    int kind_rank = 0;
-    IdType secondary = 0;
-
-    bool operator<(const OrderKey& other) const {
-      return primary < other.primary ||
-             (primary == other.primary &&
-              (kind_rank < other.kind_rank ||
-               (kind_rank == other.kind_rank &&
-                secondary < other.secondary)));
-    }
-  };
-
   enum class SubscriptionKind { kOffsetGroup, kAdjChunk };
 
   struct Subscription {
@@ -261,7 +247,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
 
   struct ActiveChunk {
     ChunkReadKey key;
-    OrderKey order_key;
+    OrderedChunkCursor::OrderKey order_key;
     std::shared_ptr<GraphInfo> graph_info;
     std::string vertex_type;
     std::shared_ptr<EdgeInfo> edge_info;
@@ -276,14 +262,6 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     std::vector<Subscription> waiting_subscribers;
   };
 
-  struct QueueState {
-    std::map<OrderKey, std::deque<std::shared_ptr<ActiveChunk>>>
-        chunks_by_order_key;
-    size_t chunk_count = 0;
-    OrderKey next_order_key;
-    bool has_next_order_key = false;
-  };
-
   struct ProcessorTask {
     std::shared_ptr<ActiveChunk> active_chunk;
     std::function<void()> fn;
@@ -294,6 +272,8 @@ struct EdgeSamplingPipelineCoordinator::Impl {
        EdgeSamplingPipelineOptions options)
       : chunk_manager_(std::move(chunk_manager)),
         options_(NormalizeOptions(options)) {
+    read_cursor_ = std::make_unique<OrderedChunkCursor>(
+        options_.num_readers, 0, false);
     reader_threads_.reserve(options_.num_readers);
     for (size_t i = 0; i < options_.num_readers; ++i) {
       reader_threads_.emplace_back([this]() { ReaderLoop(); });
@@ -422,7 +402,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       stats.active_batches_current = active_batches_.size();
       stats.active_offset_chunk_keys_current = active_offset_chunk_keys_current_;
       stats.active_adj_chunk_keys_current = active_adj_chunk_keys_current_;
-      stats.read_queue_current = read_queue_.chunk_count;
+      stats.read_queue_current = read_queue_.size();
       stats.processor_queue_current = processor_queue_.size();
     }
     return stats;
@@ -439,8 +419,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       for (const auto& [_, batch] : active_batches_) {
         batches_to_fail.push_back(batch);
       }
-      read_queue_.chunks_by_order_key.clear();
-      read_queue_.chunk_count = 0;
+      read_queue_.clear();
       processor_queue_.clear();
       active_chunks_.clear();
       active_offset_chunk_keys_current_ = 0;
@@ -456,6 +435,9 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       FinishBatch(batch, Status::Invalid("Edge pipeline is shut down"));
     }
 
+    if (read_cursor_ != nullptr) {
+      read_cursor_->Shutdown();
+    }
     for (auto& thread : reader_threads_) {
       if (thread.joinable()) {
         thread.join();
@@ -759,7 +741,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     auto key = MakeOffsetChunkKey(batch->graph_info, batch->vertex_type,
                                   batch->edge_info, batch->adj_list_type,
                                   vertex_chunk_id);
-    auto order_key = OrderKey{vertex_chunk_id, 0, 0};
+    auto order_key = OrderedChunkCursor::OrderKey{vertex_chunk_id, 0, 0};
     return AddSubscription(std::move(subscription), key, order_key,
                            batch->graph_info, batch->vertex_type,
                            batch->edge_info, batch->adj_list_type,
@@ -772,7 +754,8 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     subscription.batch = batch;
     subscription.kind = SubscriptionKind::kAdjChunk;
     subscription.key = key;
-    auto order_key = OrderKey{key.vertex_chunk_id, 1, key.chunk_id};
+    auto order_key =
+        OrderedChunkCursor::OrderKey{key.vertex_chunk_id, 1, key.chunk_id};
     return AddSubscription(std::move(subscription), key, order_key,
                            batch->graph_info, batch->vertex_type,
                            batch->edge_info, batch->adj_list_type,
@@ -780,7 +763,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
   }
 
   Status AddSubscription(Subscription subscription, const ChunkReadKey& key,
-                         const OrderKey& order_key,
+                         const OrderedChunkCursor::OrderKey& order_key,
                          const std::shared_ptr<GraphInfo>& graph_info,
                          const std::string& vertex_type,
                          const std::shared_ptr<EdgeInfo>& edge_info,
@@ -819,8 +802,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
         active_chunk->chunk_id = chunk_id;
         active_chunk->waiting_subscribers.push_back(std::move(subscription));
         active_chunks_.emplace(key, active_chunk);
-        read_queue_.chunks_by_order_key[order_key].push_back(active_chunk);
-        read_queue_.chunk_count += 1;
+        read_queue_.push_back(active_chunk);
         if (key.kind == ChunkReadKind::kEdgeOffset) {
           active_offset_chunk_keys_current_ += 1;
           AtomicMax(&active_offset_chunk_keys_peak_,
@@ -999,49 +981,24 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     });
   }
 
-  std::shared_ptr<ActiveChunk> PopNextReadChunkLocked(bool* wrapped) {
-    if (read_queue_.chunk_count == 0) {
-      return nullptr;
-    }
-    auto it = read_queue_.chunks_by_order_key.begin();
-    if (read_queue_.has_next_order_key) {
-      it = read_queue_.chunks_by_order_key.lower_bound(read_queue_.next_order_key);
-      if (it == read_queue_.chunks_by_order_key.end()) {
-        it = read_queue_.chunks_by_order_key.begin();
-        *wrapped = true;
-      }
-    }
-    const auto order_key = it->first;
-    auto chunk = std::move(it->second.front());
-    it->second.pop_front();
-    if (it->second.empty()) {
-      read_queue_.chunks_by_order_key.erase(it);
-    }
-    read_queue_.chunk_count -= 1;
-    read_queue_.next_order_key = order_key;
-    read_queue_.has_next_order_key = true;
-    return chunk;
-  }
-
   void ReaderLoop() {
     while (true) {
       std::shared_ptr<ActiveChunk> active_chunk;
       {
         std::unique_lock<std::mutex> lock(mutex_);
-        read_cv_.wait(lock,
-                      [&]() { return shutdown_ || read_queue_.chunk_count > 0; });
-        if (shutdown_ && read_queue_.chunk_count == 0) {
+        read_cv_.wait(lock, [&]() { return shutdown_ || !read_queue_.empty(); });
+        if (shutdown_ && read_queue_.empty()) {
           return;
         }
-        bool wrapped = false;
-        active_chunk = PopNextReadChunkLocked(&wrapped);
+        active_chunk = read_queue_.front();
+        read_queue_.pop_front();
       }
 
       if (active_chunk == nullptr) {
         continue;
       }
 
-      TableResult table_result = [&]() -> TableResult {
+      auto direct_loader = [this, active_chunk]() -> TableResult {
         if (active_chunk->key.kind == ChunkReadKind::kEdgeOffset) {
           return chunk_manager_->GetEdgeOffsetChunk(
               active_chunk->graph_info, active_chunk->vertex_type,
@@ -1053,7 +1010,10 @@ struct EdgeSamplingPipelineCoordinator::Impl {
             active_chunk->edge_info->GetEdgeType(), active_chunk->vertex_type,
             active_chunk->adj_list_type, active_chunk->vertex_chunk_id,
             active_chunk->chunk_id);
-      }();
+      };
+      auto table_result = read_cursor_->LoadChunk(active_chunk->key,
+                                                  active_chunk->order_key,
+                                                  direct_loader);
 
       if (active_chunk->key.kind == ChunkReadKind::kEdgeOffset) {
         offset_chunk_reads_.fetch_add(1, std::memory_order_relaxed);
@@ -1205,6 +1165,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
 
   std::shared_ptr<ChunkReadManager> chunk_manager_;
   EdgeSamplingPipelineOptions options_;
+  std::unique_ptr<OrderedChunkCursor> read_cursor_;
 
   mutable std::mutex mutex_;
   std::condition_variable active_batches_cv_;
@@ -1218,7 +1179,7 @@ struct EdgeSamplingPipelineCoordinator::Impl {
   std::unordered_map<ChunkReadKey, std::shared_ptr<ActiveChunk>,
                      ChunkReadKeyHash>
       active_chunks_;
-  QueueState read_queue_;
+  std::deque<std::shared_ptr<ActiveChunk>> read_queue_;
   std::deque<ProcessorTask> processor_queue_;
   std::vector<std::thread> reader_threads_;
   std::vector<std::thread> processor_threads_;

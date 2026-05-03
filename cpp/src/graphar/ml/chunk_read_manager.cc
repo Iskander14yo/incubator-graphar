@@ -45,22 +45,6 @@ void HashCombine(size_t* seed, const T& value) {
   *seed ^= hasher(value) + 0x9e3779b97f4a7c15ULL + (*seed << 6) + (*seed >> 2);
 }
 
-template <typename T>
-void AtomicMax(std::atomic<T>* target, T value) {
-  T current = target->load(std::memory_order_relaxed);
-  while (current < value &&
-         !target->compare_exchange_weak(current, value,
-                                        std::memory_order_relaxed)) {
-  }
-}
-
-uint64_t MillisecondsSince(std::chrono::steady_clock::time_point start) {
-  return static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - start)
-          .count());
-}
-
 size_t ArrayDataBytes(const std::shared_ptr<arrow::ArrayData>& data,
                       std::unordered_set<const arrow::Buffer*>* seen) {
   if (data == nullptr) {
@@ -169,374 +153,18 @@ size_t ChunkReadKeyHash::operator()(const ChunkReadKey& key) const {
   return seed;
 }
 
-struct ChunkReadManager::CursorState {
-  struct OrderKey {
-    IdType primary = 0;
-    IdType secondary = 0;
-
-    bool operator<(const OrderKey& other) const {
-      return primary < other.primary ||
-             (primary == other.primary && secondary < other.secondary);
-    }
-  };
-
-  struct TrailEntry {
-    ChunkReadKey key;
-    TablePtr table;
-  };
-
-  struct Task {
-    ChunkReadKey key;
-    OrderKey order_key;
-    TableLoader loader;
-    std::promise<TableResult> promise;
-  };
-
-  struct QueueState {
-    std::map<OrderKey, std::deque<std::shared_ptr<Task>>> tasks_by_order_key;
-    size_t task_count = 0;
-    OrderKey next_order_key;
-    bool has_next_order_key = false;
-  };
-
-  CursorState(size_t cursor_count, size_t trail_capacity_chunks,
-              bool auto_track_requests)
-      : cursor_count_(cursor_count),
-        trail_capacity_chunks_(trail_capacity_chunks),
-        auto_track_requests_(auto_track_requests),
-        queues_(cursor_count_) {
-    workers_.reserve(cursor_count_);
-    for (size_t i = 0; i < cursor_count_; ++i) {
-      workers_.emplace_back([this, i]() { WorkerLoop(i); });
-    }
-  }
-
-  ~CursorState() { Shutdown(); }
-
-  TableResult LoadChunk(const ChunkReadKey& key, OrderKey order_key,
-                        const TableLoader& loader) {
-    struct AutoRequestTracker {
-      CursorState* state = nullptr;
-      Clock::time_point start;
-      bool ok = false;
-
-      ~AutoRequestTracker() {
-        if (state != nullptr) {
-          state->CompleteRequest(start, ok);
-        }
-      }
-    };
-
-    AutoRequestTracker tracker;
-    if (auto_track_requests_) {
-      RegisterRequest();
-      tracker.state = this;
-      tracker.start = Clock::now();
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (shutdown_) {
-        return Status::Invalid("Chunk cursor is shut down");
-      }
-      auto trail_table = LookupTrailLocked(key);
-      if (trail_table != nullptr) {
-        trail_hits_.fetch_add(1, std::memory_order_relaxed);
-        tracker.ok = true;
-        return trail_table;
-      }
-      trail_misses_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    auto task = std::make_shared<Task>();
-    task->key = key;
-    task->order_key = order_key;
-    task->loader = loader;
-    auto future = task->promise.get_future();
-
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (shutdown_) {
-        return Status::Invalid("Chunk cursor is shut down");
-      }
-      auto& queue = queues_[CursorIndexFor(key)];
-      queue.tasks_by_order_key[task->order_key].push_back(task);
-      queue.task_count += 1;
-    }
-    cv_.notify_all();
-    auto result = future.get();
-    if (tracker.state != nullptr) {
-      tracker.ok = !result.has_error();
-    }
-    return result;
-  }
-
-  FeatureCursorStats stats() const {
-    FeatureCursorStats stats;
-    stats.cursor_count = cursor_count_;
-    stats.trail_capacity_chunks = trail_capacity_chunks_;
-    stats.requests = requests_.load(std::memory_order_relaxed);
-    stats.requests_completed =
-        requests_completed_.load(std::memory_order_relaxed);
-    stats.requests_failed = requests_failed_.load(std::memory_order_relaxed);
-    stats.active_requests_peak =
-        active_requests_peak_.load(std::memory_order_relaxed);
-    stats.chunks_read = chunks_read_.load(std::memory_order_relaxed);
-    stats.chunks_served = chunks_served_.load(std::memory_order_relaxed);
-    stats.chunk_order_wraps =
-        chunk_order_wraps_.load(std::memory_order_relaxed);
-    stats.rows_served = rows_served_.load(std::memory_order_relaxed);
-    stats.batches_served = batches_served_.load(std::memory_order_relaxed);
-    stats.trail_hits = trail_hits_.load(std::memory_order_relaxed);
-    stats.trail_misses = trail_misses_.load(std::memory_order_relaxed);
-    stats.trail_evictions = trail_evictions_.load(std::memory_order_relaxed);
-    stats.wait_ms_sum = wait_ms_sum_.load(std::memory_order_relaxed);
-    stats.wait_ms_max = wait_ms_max_.load(std::memory_order_relaxed);
-    stats.service_ms_sum = service_ms_sum_.load(std::memory_order_relaxed);
-    stats.service_ms_max = service_ms_max_.load(std::memory_order_relaxed);
-    return stats;
-  }
-
-  void Shutdown() {
-    std::vector<std::shared_ptr<Task>> pending;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (shutdown_) {
-        return;
-      }
-      shutdown_ = true;
-      for (auto& queue : queues_) {
-        for (auto& [_, tasks] : queue.tasks_by_order_key) {
-          while (!tasks.empty()) {
-            pending.push_back(std::move(tasks.front()));
-            tasks.pop_front();
-          }
-        }
-        queue.tasks_by_order_key.clear();
-        queue.task_count = 0;
-      }
-    }
-
-    cv_.notify_all();
-    for (const auto& task : pending) {
-      task->promise.set_value(Status::Invalid("Chunk cursor is shut down"));
-    }
-    for (auto& worker : workers_) {
-      if (worker.joinable()) {
-        worker.join();
-      }
-    }
-  }
-
-  void RegisterRequest() {
-    requests_.fetch_add(1, std::memory_order_relaxed);
-    const uint64_t active =
-        active_requests_current_.fetch_add(1, std::memory_order_relaxed) + 1;
-    AtomicMax(&active_requests_peak_, active);
-  }
-
-  void CompleteRequest(Clock::time_point start, bool ok) {
-    const uint64_t wait_ms = MillisecondsSince(start);
-    wait_ms_sum_.fetch_add(wait_ms, std::memory_order_relaxed);
-    AtomicMax(&wait_ms_max_, wait_ms);
-    active_requests_current_.fetch_sub(1, std::memory_order_relaxed);
-    if (ok) {
-      requests_completed_.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      requests_failed_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
-
-  void RecordBatchServed(size_t rows) {
-    rows_served_.fetch_add(rows, std::memory_order_relaxed);
-    batches_served_.fetch_add(1, std::memory_order_relaxed);
-  }
-
- private:
-  size_t CursorIndexFor(const ChunkReadKey& key) const {
-    return ChunkReadKeyHash{}(key) % cursor_count_;
-  }
-
-  std::shared_ptr<Task> PopNextTaskLocked(size_t index, bool* wrapped) {
-    auto& queue = queues_[index];
-    if (queue.task_count == 0) {
-      return nullptr;
-    }
-
-    auto it = queue.tasks_by_order_key.begin();
-    if (queue.has_next_order_key) {
-      it = queue.tasks_by_order_key.lower_bound(queue.next_order_key);
-      if (it == queue.tasks_by_order_key.end()) {
-        it = queue.tasks_by_order_key.begin();
-        *wrapped = true;
-      }
-    }
-
-    const auto order_key = it->first;
-    auto task = std::move(it->second.front());
-    it->second.pop_front();
-    if (it->second.empty()) {
-      queue.tasks_by_order_key.erase(it);
-    }
-    queue.task_count -= 1;
-    queue.next_order_key = order_key;
-    queue.has_next_order_key = true;
-    return task;
-  }
-
-  void WorkerLoop(size_t index) {
-    while (true) {
-      std::shared_ptr<Task> task;
-      bool wrapped = false;
-      {
-        std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock,
-                 [&]() { return shutdown_ || queues_[index].task_count > 0; });
-        if (shutdown_ && queues_[index].task_count == 0) {
-          return;
-        }
-        task = PopNextTaskLocked(index, &wrapped);
-      }
-
-      if (wrapped) {
-        chunk_order_wraps_.fetch_add(1, std::memory_order_relaxed);
-      }
-
-      if (IsShutdown()) {
-        task->promise.set_value(Status::Invalid("Chunk cursor is shut down"));
-        continue;
-      }
-
-      const auto service_start = Clock::now();
-      TableResult result = Status::Invalid("chunk cursor trail miss");
-      bool served_from_trail = false;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto trail_table = LookupTrailLocked(task->key);
-        if (trail_table != nullptr) {
-          trail_hits_.fetch_add(1, std::memory_order_relaxed);
-          result = trail_table;
-          served_from_trail = true;
-        }
-      }
-
-      if (served_from_trail) {
-        const uint64_t service_ms = MillisecondsSince(service_start);
-        service_ms_sum_.fetch_add(service_ms, std::memory_order_relaxed);
-        AtomicMax(&service_ms_max_, service_ms);
-        task->promise.set_value(result);
-        continue;
-      }
-
-      result = [&]() -> TableResult {
-        try {
-          auto chunk_result = task->loader();
-          if (!chunk_result.has_error()) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            InsertTrailLocked(task->key, chunk_result.value());
-          }
-          return chunk_result;
-        } catch (const std::exception& e) {
-          return Status::UnknownError("Chunk cursor read threw: ",
-                                      e.what());
-        } catch (...) {
-          return Status::UnknownError("Chunk cursor read threw unknown error");
-        }
-      }();
-
-      if (!result.has_error()) {
-        chunks_read_.fetch_add(1, std::memory_order_relaxed);
-        chunks_served_.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        chunks_read_.fetch_add(1, std::memory_order_relaxed);
-      }
-
-      const uint64_t service_ms = MillisecondsSince(service_start);
-      service_ms_sum_.fetch_add(service_ms, std::memory_order_relaxed);
-      AtomicMax(&service_ms_max_, service_ms);
-      task->promise.set_value(result);
-    }
-  }
-
-  bool IsShutdown() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return shutdown_;
-  }
-
-  TablePtr LookupTrailLocked(const ChunkReadKey& key) const {
-    auto it = trail_index_.find(key);
-    if (it == trail_index_.end()) {
-      return nullptr;
-    }
-    return it->second->table;
-  }
-
-  void InsertTrailLocked(const ChunkReadKey& key, const TablePtr& table) {
-    if (trail_capacity_chunks_ == 0 || table == nullptr) {
-      return;
-    }
-    auto existing = trail_index_.find(key);
-    if (existing != trail_index_.end()) {
-      existing->second->table = table;
-      trail_.splice(trail_.end(), trail_, existing->second);
-      return;
-    }
-
-    trail_.push_back(TrailEntry{key, table});
-    auto inserted = std::prev(trail_.end());
-    trail_index_.emplace(key, inserted);
-    while (trail_.size() > trail_capacity_chunks_) {
-      trail_index_.erase(trail_.front().key);
-      trail_.pop_front();
-      trail_evictions_.fetch_add(1, std::memory_order_relaxed);
-    }
-  }
-
-  const size_t cursor_count_;
-  const size_t trail_capacity_chunks_;
-  const bool auto_track_requests_;
-
-  mutable std::mutex mutex_;
-  std::condition_variable cv_;
-  bool shutdown_ = false;
-  std::vector<std::thread> workers_;
-  std::vector<QueueState> queues_;
-  std::list<TrailEntry> trail_;
-  std::unordered_map<ChunkReadKey, std::list<TrailEntry>::iterator,
-                     ChunkReadKeyHash>
-      trail_index_;
-
-  std::atomic<uint64_t> requests_{0};
-  std::atomic<uint64_t> requests_completed_{0};
-  std::atomic<uint64_t> requests_failed_{0};
-  std::atomic<uint64_t> active_requests_current_{0};
-  std::atomic<uint64_t> active_requests_peak_{0};
-  std::atomic<uint64_t> chunks_read_{0};
-  std::atomic<uint64_t> chunks_served_{0};
-  std::atomic<uint64_t> chunk_order_wraps_{0};
-  std::atomic<uint64_t> rows_served_{0};
-  std::atomic<uint64_t> batches_served_{0};
-  std::atomic<uint64_t> trail_hits_{0};
-  std::atomic<uint64_t> trail_misses_{0};
-  std::atomic<uint64_t> trail_evictions_{0};
-  std::atomic<uint64_t> wait_ms_sum_{0};
-  std::atomic<uint64_t> wait_ms_max_{0};
-  std::atomic<uint64_t> service_ms_sum_{0};
-  std::atomic<uint64_t> service_ms_max_{0};
-};
-
 ChunkReadManager::ChunkReadManager(ChunkReadManagerOptions options)
     : options_(std::move(options)) {
   if (options_.feature_cursor_count > 0) {
-    feature_cursor_ = std::make_unique<CursorState>(
+    feature_cursor_ = std::make_unique<OrderedChunkCursor>(
         options_.feature_cursor_count,
         options_.feature_cursor_trail_capacity_chunks, false);
   }
   if (options_.edge_cursor_count > 0) {
-    edge_offset_cursor_ = std::make_unique<CursorState>(
+    edge_offset_cursor_ = std::make_unique<OrderedChunkCursor>(
         options_.edge_cursor_count,
         options_.edge_cursor_trail_capacity_chunks, true);
-    edge_adj_list_cursor_ = std::make_unique<CursorState>(
+    edge_adj_list_cursor_ = std::make_unique<OrderedChunkCursor>(
         options_.edge_cursor_count,
         options_.edge_cursor_trail_capacity_chunks, true);
   }
@@ -820,7 +448,7 @@ ChunkReadManager::TableResult ChunkReadManager::GetVertexPropertyChunk(
     return GetOrLoad(key, [this, graph_info, vertex_type, property_group,
                            vertex_info, key, chunk_id]() -> TableResult {
       return feature_cursor_->LoadChunk(
-          key, CursorState::OrderKey{0, chunk_id},
+          key, OrderedChunkCursor::OrderKey{0, 0, chunk_id},
           [graph_info, vertex_type, property_group, vertex_info,
            chunk_id]() -> TableResult {
             return LoadVertexPropertyChunkDirect(graph_info, vertex_type,
@@ -868,7 +496,7 @@ ChunkReadManager::TableResult ChunkReadManager::GetEdgeOffsetChunk(
         key, [this, key, graph_info, edge_info, adj_list_type,
               vertex_chunk_id]() -> TableResult {
           return edge_offset_cursor_->LoadChunk(
-              key, CursorState::OrderKey{vertex_chunk_id, 0},
+              key, OrderedChunkCursor::OrderKey{vertex_chunk_id, 0, 0},
               [graph_info, edge_info, adj_list_type,
                vertex_chunk_id]() -> TableResult {
                 return LoadEdgeOffsetChunkDirect(graph_info, edge_info,
@@ -917,7 +545,7 @@ ChunkReadManager::TableResult ChunkReadManager::GetEdgeAdjListChunk(
         key, [this, key, graph_info, edge_info, adj_list_type,
               vertex_chunk_id, chunk_id]() -> TableResult {
           return edge_adj_list_cursor_->LoadChunk(
-              key, CursorState::OrderKey{vertex_chunk_id, chunk_id},
+              key, OrderedChunkCursor::OrderKey{vertex_chunk_id, 0, chunk_id},
               [graph_info, edge_info, adj_list_type, vertex_chunk_id,
                chunk_id]() -> TableResult {
                 return LoadEdgeAdjListChunkDirect(graph_info, edge_info,
