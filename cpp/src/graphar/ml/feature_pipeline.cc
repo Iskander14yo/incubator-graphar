@@ -669,6 +669,7 @@ struct FeaturePipelineCoordinator::Impl {
       chunk_manager_->RecordFeatureBatchServed(task.subscription.positions.size());
 
       bool finalize_batch = false;
+      TableResult final_result;
       {
         std::lock_guard<std::mutex> lock(task.subscription.batch->mutex_);
         if (!task.subscription.batch->promise_set) {
@@ -691,8 +692,7 @@ struct FeaturePipelineCoordinator::Impl {
       }
 
       if (finalize_batch) {
-        FinishBatch(task.subscription.batch,
-                    BuildBatchTable(task.subscription.batch));
+        final_result = BuildBatchTable(task.subscription.batch);
       }
 
       const auto service_ms =
@@ -700,6 +700,9 @@ struct FeaturePipelineCoordinator::Impl {
       stitch_service_ms_sum_.fetch_add(service_ms,
                                        std::memory_order_relaxed);
       FinishChunkTask(task.active_chunk);
+      if (finalize_batch) {
+        FinishBatch(task.subscription.batch, final_result);
+      }
     }
   }
 

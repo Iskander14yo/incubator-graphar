@@ -881,6 +881,35 @@ struct EdgeSamplingPipelineCoordinator::Impl {
     });
   }
 
+  void ProcessReadySubscription(Subscription subscription, const TablePtr& table) {
+    if (subscription.kind == SubscriptionKind::kOffsetGroup) {
+      auto batch = subscription.batch;
+      auto status = OnOffsetReady(batch, subscription.index, table);
+      if (!status.ok()) {
+        FinishBatch(batch, status);
+      }
+      return;
+    }
+
+    auto batch = subscription.batch;
+    auto key = subscription.key;
+    auto status = OnAdjReady(batch, key, table);
+    if (!status.ok()) {
+      FinishBatch(batch, status);
+    }
+  }
+
+  Status EnqueueProcessorForSubscriptions(
+      const std::shared_ptr<ActiveChunk>& active_chunk,
+      std::vector<Subscription> subscriptions, const TablePtr& table) {
+    return EnqueueProcessorTask(active_chunk, [this, subscriptions = std::move(subscriptions),
+                                               table]() mutable {
+      for (auto& subscription : subscriptions) {
+        ProcessReadySubscription(std::move(subscription), table);
+      }
+    });
+  }
+
   Status EnqueueProcessorTask(const std::shared_ptr<ActiveChunk>& active_chunk,
                               std::function<void()> fn) {
     {
@@ -1046,7 +1075,9 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       } else {
         current_chunk->ready = true;
         current_chunk->table = table_result.value();
-        current_chunk->in_flight_processors += subscriptions.size();
+        if (!subscriptions.empty()) {
+          current_chunk->in_flight_processors += 1;
+        }
         if (subscriptions.empty() && current_chunk->in_flight_processors == 0) {
           RemoveActiveChunkLocked(it);
         }
@@ -1067,12 +1098,19 @@ struct EdgeSamplingPipelineCoordinator::Impl {
       }
       return;
     }
+    if (subscriptions.empty()) {
+      return;
+    }
 
-    for (auto& subscription : subscriptions) {
-      auto batch = subscription.batch;
-      auto status = EnqueueProcessorForSubscription(
-          current_chunk, std::move(subscription), table_result.value());
-      if (!status.ok()) {
+    std::vector<std::shared_ptr<SamplingBatchState>> batches;
+    batches.reserve(subscriptions.size());
+    for (const auto& subscription : subscriptions) {
+      batches.push_back(subscription.batch);
+    }
+    auto status = EnqueueProcessorForSubscriptions(
+        current_chunk, std::move(subscriptions), table_result.value());
+    if (!status.ok()) {
+      for (const auto& batch : batches) {
         FinishBatch(batch, status);
       }
     }
