@@ -582,18 +582,14 @@ class GARNeighborLoader(IterableDataset):
             completed: dict[int, _SampledBatch] = {}
             warmup_done = False
 
-            def submit_ready_features() -> None:
-                for seq in sorted(completed):
-                    self._submit_features_for_batch(completed[seq])
-
             def maybe_finish_warmup() -> None:
                 nonlocal warmup_done
                 if warmup_done:
-                    submit_ready_features()
                     return
                 if len(completed) >= read_warmup_batches or jobs_exhausted:
                     warmup_done = True
-                    submit_ready_features()
+                    for seq in sorted(completed):
+                        self._submit_features_for_batch(completed[seq])
 
             def submit_until_full() -> None:
                 nonlocal next_seq, jobs_exhausted
@@ -603,7 +599,10 @@ class GARNeighborLoader(IterableDataset):
                     except StopIteration:
                         jobs_exhausted = True
                         return
-                    completed[next_seq] = self._sample_batch(seed_nodes, seed)
+                    sampled = self._sample_batch(seed_nodes, seed)
+                    completed[next_seq] = sampled
+                    if warmup_done:
+                        self._submit_features_for_batch(sampled)
                     next_seq += 1
 
             submit_until_full()
@@ -622,21 +621,14 @@ class GARNeighborLoader(IterableDataset):
         in_flight: dict[Future, int] = {}
         warmup_done = False
 
-        def submit_ready_features() -> None:
-            for seq in sorted(completed):
-                self._submit_features_for_batch(completed[seq])
-
         def maybe_finish_warmup() -> None:
             nonlocal warmup_done
             if warmup_done:
-                submit_ready_features()
                 return
-            if len(completed) >= read_warmup_batches:
+            if len(completed) >= read_warmup_batches or (jobs_exhausted and not in_flight):
                 warmup_done = True
-                submit_ready_features()
-            elif jobs_exhausted and not in_flight:
-                warmup_done = True
-                submit_ready_features()
+                for seq in sorted(completed):
+                    self._submit_features_for_batch(completed[seq])
 
         def submit_until_full(executor: ThreadPoolExecutor) -> None:
             nonlocal next_seq, jobs_exhausted
@@ -677,6 +669,9 @@ class GARNeighborLoader(IterableDataset):
                     continue
                 done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
                 for future in done:
-                    completed[in_flight.pop(future)] = future.result()
+                    seq = in_flight.pop(future)
+                    sampled = future.result()
+                    self._submit_features_for_batch(sampled)
+                    completed[seq] = sampled
                 submit_until_full(executor)
-                submit_ready_features()
+                maybe_finish_warmup()
