@@ -753,7 +753,6 @@ struct FeaturePipelineCoordinator::Impl {
       return;
     }
 
-    batch->promise.set_value(result);
     if (batch->feature_request_registered) {
       chunk_manager_->CompleteFeatureRequest(batch->submitted_at,
                                             !result.has_error());
@@ -765,6 +764,7 @@ struct FeaturePipelineCoordinator::Impl {
       active_batches_.erase(batch->id);
     }
     active_batches_cv_.notify_all();
+    batch->promise.set_value(result);
   }
 
   std::shared_ptr<ChunkReadManager> chunk_manager_;
