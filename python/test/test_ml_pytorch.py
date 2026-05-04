@@ -33,6 +33,7 @@ def _make_loader(
     feature_ram_for_loader_mb=0,
     num_readers=None,
     num_stitchers=1,
+    read_warmup_pct=0.0,
 ):
     if num_neighbors is None:
         num_neighbors = [5]
@@ -52,6 +53,7 @@ def _make_loader(
         feature_ram_for_loader_mb=feature_ram_for_loader_mb,
         num_readers=num_readers,
         num_stitchers=num_stitchers,
+        read_warmup_pct=read_warmup_pct,
     )
     return GARNeighborLoader(**kwargs)
 

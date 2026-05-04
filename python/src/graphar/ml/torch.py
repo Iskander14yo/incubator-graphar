@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -33,6 +34,8 @@ class _SampledBatch:
     num_sampled_edges: list[int]
     total_started_at: float
     sampling_ms: float
+    sampling_finished_at: float
+    feature_warmup_ms: float
     feature_handle: object | None
 
 
@@ -202,6 +205,7 @@ class GARNeighborLoader(IterableDataset):
         num_stitchers: int = 1,
         feature_cursor_count: int | None = None,
         feature_cursor_trail_chunks: int = 10,
+        read_warmup_pct: float = 0.0,
     ) -> None:
         if batch_size <= 0:
             msg = "batch_size must be > 0"
@@ -238,6 +242,9 @@ class GARNeighborLoader(IterableDataset):
         if feature_cursor_trail_chunks < 0:
             msg = "feature_cursor_trail_chunks must be >= 0"
             raise ValueError(msg)
+        if not 0.0 <= read_warmup_pct <= 1.0:
+            msg = "read_warmup_pct must be between 0 and 1"
+            raise ValueError(msg)
         self.graph_info = graph_info
         self.vertex_type = vertex_type
         self.edge_type = edge_type
@@ -248,6 +255,7 @@ class GARNeighborLoader(IterableDataset):
         self.prefetch_batches = prefetch_batches
         self.num_readers = int(num_readers)
         self.num_stitchers = int(num_stitchers)
+        self.read_warmup_pct = float(read_warmup_pct)
         edge_chunk_manager_options = gar_ml._ChunkReadManagerOptions()
         edge_chunk_manager_options.edge_adj_list_ram_budget_bytes = (
             int(adj_list_ram_for_loader_mb) * 1024 * 1024
@@ -305,6 +313,11 @@ class GARNeighborLoader(IterableDataset):
         if self.num_samplers > 0:
             return self.num_samplers
         return 1
+
+    def _read_warmup_batches(self) -> int:
+        if not self.features or self.read_warmup_pct == 0.0:
+            return 0
+        return math.ceil(self._max_pending_batches() * self.read_warmup_pct)
 
     def _iter_input_batches(self) -> Iterator[list[int]]:
         total = self._input_node_count
@@ -368,7 +381,7 @@ class GARNeighborLoader(IterableDataset):
             self._feature_pipeline.shutdown()
         self._feature_chunk_manager.shutdown()
 
-    def _sample_and_submit_batch(self, seed_nodes: list[int], seed: int) -> _SampledBatch:
+    def _sample_batch(self, seed_nodes: list[int], seed: int) -> _SampledBatch:
         total_started_at = time.perf_counter()
         t_s = total_started_at
         sampling = gar_ml.sample_neighbors(
@@ -380,20 +393,12 @@ class GARNeighborLoader(IterableDataset):
             seed=seed,
             chunk_manager=self._sampling_chunk_manager,
         )
-        sampling_ms = (time.perf_counter() - t_s) * 1000
+        sampling_finished_at = time.perf_counter()
+        sampling_ms = (sampling_finished_at - t_s) * 1000
 
         sampled_nodes = [int(node) for node in sampling.sampled_nodes]
         src_indices = [int(src_idx) for src_idx in sampling.src_indices]
         dst_indices = [int(dst_idx) for dst_idx in sampling.dst_indices]
-        feature_handle = None
-        if self.features:
-            assert self._feature_pipeline is not None
-            feature_handle = self._feature_pipeline.submit_sampled_batch(
-                self.graph_info,
-                self.vertex_type,
-                sampled_nodes,
-                self.features,
-            )
         return _SampledBatch(
             seed_nodes=list(seed_nodes),
             sampled_nodes=sampled_nodes,
@@ -403,8 +408,32 @@ class GARNeighborLoader(IterableDataset):
             num_sampled_edges=[int(value) for value in sampling.num_sampled_edges_per_hop],
             total_started_at=total_started_at,
             sampling_ms=sampling_ms,
-            feature_handle=feature_handle,
+            sampling_finished_at=sampling_finished_at,
+            feature_warmup_ms=0.0,
+            feature_handle=None,
         )
+
+    def _submit_features_for_batch(self, sampled: _SampledBatch) -> _SampledBatch:
+        if not self.features or sampled.feature_handle is not None:
+            return sampled
+        assert self._feature_pipeline is not None
+        submit_started_at = time.perf_counter()
+        sampled.feature_warmup_ms = (
+            submit_started_at - sampled.sampling_finished_at
+        ) * 1000
+        sampled.feature_handle = self._feature_pipeline.submit_sampled_batch(
+            self.graph_info,
+            self.vertex_type,
+            sampled.sampled_nodes,
+            self.features,
+        )
+        return sampled
+
+    def _sample_and_submit_batch(self, seed_nodes: list[int], seed: int) -> _SampledBatch:
+        sampled = self._sample_batch(seed_nodes, seed)
+        if self._read_warmup_batches() == 0:
+            self._submit_features_for_batch(sampled)
+        return sampled
 
     def _materialize_batch(self, sampled: _SampledBatch) -> tuple[Data, BatchProfile]:
         if sampled.src_indices:
@@ -417,7 +446,9 @@ class GARNeighborLoader(IterableDataset):
         if self.features:
             assert sampled.feature_handle is not None
             feature_table = sampled.feature_handle.wait()
-            feature_fetch_ms = float(sampled.feature_handle.feature_fetch_ms())
+            feature_fetch_ms = sampled.feature_warmup_ms + float(
+                sampled.feature_handle.feature_fetch_ms()
+            )
 
             t_s = time.perf_counter()
             x = _table_to_feature_tensor(feature_table)
@@ -461,8 +492,9 @@ class GARNeighborLoader(IterableDataset):
     def _iter_batches(self) -> Iterator[tuple[Data, BatchProfile]]:
         jobs = ((nodes, self._sample_seed()) for nodes in self._iter_input_batches())
         max_pending = self._max_pending_batches()
+        read_warmup_batches = self._read_warmup_batches()
 
-        if self.num_samplers == 0:
+        if read_warmup_batches == 0 and self.num_samplers == 0:
             next_seq = 0
             next_to_yield = 0
             jobs_exhausted = False
@@ -486,11 +518,102 @@ class GARNeighborLoader(IterableDataset):
                 submit_until_full()
             return
 
+        if read_warmup_batches == 0:
+            next_seq = 0
+            next_to_yield = 0
+            jobs_exhausted = False
+            completed: dict[int, _SampledBatch] = {}
+            in_flight: dict[Future, int] = {}
+
+            def submit_until_full(executor: ThreadPoolExecutor) -> None:
+                nonlocal next_seq, jobs_exhausted
+                while not jobs_exhausted and len(in_flight) + len(completed) < max_pending:
+                    try:
+                        seed_nodes, seed = next(jobs)
+                    except StopIteration:
+                        jobs_exhausted = True
+                        return
+                    future = executor.submit(self._sample_and_submit_batch, seed_nodes, seed)
+                    in_flight[future] = next_seq
+                    next_seq += 1
+
+            with ThreadPoolExecutor(max_workers=self.num_samplers) as executor:
+                submit_until_full(executor)
+                while in_flight or completed:
+                    while next_to_yield in completed:
+                        yield self._materialize_batch(completed.pop(next_to_yield))
+                        next_to_yield += 1
+                        submit_until_full(executor)
+                    if not in_flight:
+                        continue
+                    done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        completed[in_flight.pop(future)] = future.result()
+                    submit_until_full(executor)
+            return
+
+        if self.num_samplers == 0:
+            next_seq = 0
+            next_to_yield = 0
+            jobs_exhausted = False
+            completed: dict[int, _SampledBatch] = {}
+            warmup_done = False
+
+            def submit_ready_features() -> None:
+                for seq in sorted(completed):
+                    self._submit_features_for_batch(completed[seq])
+
+            def maybe_finish_warmup() -> None:
+                nonlocal warmup_done
+                if warmup_done:
+                    submit_ready_features()
+                    return
+                if len(completed) >= read_warmup_batches or jobs_exhausted:
+                    warmup_done = True
+                    submit_ready_features()
+
+            def submit_until_full() -> None:
+                nonlocal next_seq, jobs_exhausted
+                while not jobs_exhausted and len(completed) < max_pending:
+                    try:
+                        seed_nodes, seed = next(jobs)
+                    except StopIteration:
+                        jobs_exhausted = True
+                        return
+                    completed[next_seq] = self._sample_batch(seed_nodes, seed)
+                    next_seq += 1
+
+            submit_until_full()
+            maybe_finish_warmup()
+            while completed:
+                yield self._materialize_batch(completed.pop(next_to_yield))
+                next_to_yield += 1
+                submit_until_full()
+                maybe_finish_warmup()
+            return
+
         next_seq = 0
         next_to_yield = 0
         jobs_exhausted = False
         completed: dict[int, _SampledBatch] = {}
         in_flight: dict[Future, int] = {}
+        warmup_done = False
+
+        def submit_ready_features() -> None:
+            for seq in sorted(completed):
+                self._submit_features_for_batch(completed[seq])
+
+        def maybe_finish_warmup() -> None:
+            nonlocal warmup_done
+            if warmup_done:
+                submit_ready_features()
+                return
+            if len(completed) >= read_warmup_batches:
+                warmup_done = True
+                submit_ready_features()
+            elif jobs_exhausted and not in_flight:
+                warmup_done = True
+                submit_ready_features()
 
         def submit_until_full(executor: ThreadPoolExecutor) -> None:
             nonlocal next_seq, jobs_exhausted
@@ -500,20 +623,32 @@ class GARNeighborLoader(IterableDataset):
                 except StopIteration:
                     jobs_exhausted = True
                     return
-                future = executor.submit(self._sample_and_submit_batch, seed_nodes, seed)
+                future = executor.submit(self._sample_batch, seed_nodes, seed)
                 in_flight[future] = next_seq
                 next_seq += 1
 
         with ThreadPoolExecutor(max_workers=self.num_samplers) as executor:
             submit_until_full(executor)
+            maybe_finish_warmup()
             while in_flight or completed:
+                while not warmup_done:
+                    if not in_flight:
+                        maybe_finish_warmup()
+                        continue
+                    done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        completed[in_flight.pop(future)] = future.result()
+                    submit_until_full(executor)
+                    maybe_finish_warmup()
                 while next_to_yield in completed:
                     yield self._materialize_batch(completed.pop(next_to_yield))
                     next_to_yield += 1
                     submit_until_full(executor)
+                    maybe_finish_warmup()
                 if not in_flight:
                     continue
                 done, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
                 for future in done:
                     completed[in_flight.pop(future)] = future.result()
                 submit_until_full(executor)
+                submit_ready_features()
