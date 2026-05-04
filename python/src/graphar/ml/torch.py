@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections.abc import Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -150,6 +151,7 @@ def _feature_pipeline_stats_to_dict(stats) -> dict[str, int]:
         "submitted_batches": int(stats.submitted_batches),
         "completed_batches": int(stats.completed_batches),
         "active_batches_current": int(stats.active_batches_current),
+        "active_samplers_current": 0,
         "pending_batches_peak": int(stats.pending_batches_peak),
         "active_chunk_keys_current": int(stats.active_chunk_keys_current),
         "active_chunk_keys_peak": int(stats.active_chunk_keys_peak),
@@ -169,6 +171,7 @@ def _empty_feature_pipeline_stats() -> dict[str, int]:
         "submitted_batches": 0,
         "completed_batches": 0,
         "active_batches_current": 0,
+        "active_samplers_current": 0,
         "pending_batches_peak": 0,
         "active_chunk_keys_current": 0,
         "active_chunk_keys_peak": 0,
@@ -288,6 +291,8 @@ class GARNeighborLoader(IterableDataset):
         self.features = _properties_for_vertex(graph_info, vertex_type) if features is None else features
         self._rng = torch.Generator()
         self._rng.manual_seed(int(torch.initial_seed()))
+        self._active_samplers_current = 0
+        self._active_samplers_lock = threading.Lock()
         self._feature_pipeline = None
         if self.features:
             feature_pipeline_options = gar_ml._FeaturePipelineOptions()
@@ -350,8 +355,12 @@ class GARNeighborLoader(IterableDataset):
 
     def feature_pipeline_stats(self) -> dict[str, int]:
         if self._feature_pipeline is None:
-            return _empty_feature_pipeline_stats()
-        return _feature_pipeline_stats_to_dict(self._feature_pipeline.stats())
+            stats = _empty_feature_pipeline_stats()
+        else:
+            stats = _feature_pipeline_stats_to_dict(self._feature_pipeline.stats())
+        with self._active_samplers_lock:
+            stats["active_samplers_current"] = self._active_samplers_current
+        return stats
 
     def feature_cursor_stats(self) -> dict[str, int]:
         stats = self._feature_chunk_manager.feature_cursor_stats()
@@ -380,6 +389,15 @@ class GARNeighborLoader(IterableDataset):
         if self._feature_pipeline is not None:
             self._feature_pipeline.shutdown()
         self._feature_chunk_manager.shutdown()
+
+    def _run_sampler_job(self, fn, *args):
+        with self._active_samplers_lock:
+            self._active_samplers_current += 1
+        try:
+            return fn(*args)
+        finally:
+            with self._active_samplers_lock:
+                self._active_samplers_current -= 1
 
     def _sample_batch(self, seed_nodes: list[int], seed: int) -> _SampledBatch:
         total_started_at = time.perf_counter()
@@ -533,7 +551,12 @@ class GARNeighborLoader(IterableDataset):
                     except StopIteration:
                         jobs_exhausted = True
                         return
-                    future = executor.submit(self._sample_and_submit_batch, seed_nodes, seed)
+                    future = executor.submit(
+                        self._run_sampler_job,
+                        self._sample_and_submit_batch,
+                        seed_nodes,
+                        seed,
+                    )
                     in_flight[future] = next_seq
                     next_seq += 1
 
@@ -623,7 +646,12 @@ class GARNeighborLoader(IterableDataset):
                 except StopIteration:
                     jobs_exhausted = True
                     return
-                future = executor.submit(self._sample_batch, seed_nodes, seed)
+                future = executor.submit(
+                    self._run_sampler_job,
+                    self._sample_batch,
+                    seed_nodes,
+                    seed,
+                )
                 in_flight[future] = next_seq
                 next_seq += 1
 

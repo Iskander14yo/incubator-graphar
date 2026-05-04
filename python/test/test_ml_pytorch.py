@@ -335,6 +335,54 @@ def test_feature_pipeline_stats_track_submitted_batches(ldbc_graph):
     assert stats["stitch_tasks"] == stats["chunk_subscriptions"]
 
 
+def test_feature_pipeline_stats_track_active_samplers(ldbc_graph):
+    num_samplers = 2
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=list(range(8)),
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        num_samplers=num_samplers,
+    )
+
+    started = 0
+    started_lock = threading.Lock()
+    all_started = threading.Event()
+    release = threading.Event()
+    thread_error = []
+    real_submit = loader._sample_and_submit_batch
+
+    def tracked_submit(seed_nodes, seed):
+        nonlocal started
+        with started_lock:
+            started += 1
+            if started == num_samplers:
+                all_started.set()
+        assert all_started.wait(timeout=5)
+        assert release.wait(timeout=5)
+        return real_submit(seed_nodes, seed)
+
+    def consume() -> None:
+        try:
+            list(loader)
+        except Exception as exc:  # pragma: no cover - test helper
+            thread_error.append(exc)
+            release.set()
+
+    with mock.patch.object(loader, "_sample_and_submit_batch", side_effect=tracked_submit):
+        worker = threading.Thread(target=consume, daemon=True)
+        worker.start()
+        assert all_started.wait(timeout=5)
+        assert loader.feature_pipeline_stats()["active_samplers_current"] == num_samplers
+        release.set()
+        worker.join(timeout=5)
+
+    assert not thread_error
+    assert not worker.is_alive()
+    assert loader.feature_pipeline_stats()["active_samplers_current"] == 0
+
+
 def test_chunk_manager_is_used_for_sampling_without_features(ldbc_graph):
     loader = _make_loader(
         ldbc_graph,
