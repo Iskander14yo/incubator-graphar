@@ -207,6 +207,7 @@ struct FeaturePipelineCoordinator::Impl {
                active_batches_.size() < options_.max_active_batches;
       });
       if (shutdown_) {
+        lock.unlock();
         chunk_manager_->CompleteFeatureRequest(batch->submitted_at, false);
         return Status::Invalid("Feature pipeline is shut down");
       }
@@ -666,12 +667,11 @@ struct FeaturePipelineCoordinator::Impl {
         continue;
       }
 
-      chunk_manager_->RecordFeatureBatchServed(task.subscription.positions.size());
-
       bool finalize_batch = false;
       {
         std::lock_guard<std::mutex> lock(task.subscription.batch->mutex_);
         if (!task.subscription.batch->promise_set) {
+          chunk_manager_->RecordFeatureBatchServed(task.subscription.positions.size());
           for (size_t i = 0; i < task.subscription.properties.size(); ++i) {
             const auto index = task.subscription.batch->property_index.at(
                 task.subscription.properties[i]);
