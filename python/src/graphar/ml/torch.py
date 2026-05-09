@@ -388,6 +388,8 @@ class GARNeighborLoader(IterableDataset):
     def close(self) -> None:
         if self._feature_pipeline is not None:
             self._feature_pipeline.shutdown()
+        self._sampling_chunk_manager.clear_ram_cache()
+        self._feature_chunk_manager.clear_ram_cache()
         self._feature_chunk_manager.shutdown()
 
     def _run_sampler_job(self, fn, *args):

@@ -292,6 +292,12 @@ struct ChunkReadManager::FeatureCursorState {
     batches_served_.fetch_add(1, std::memory_order_relaxed);
   }
 
+  void ClearTrail() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    trail_index_.clear();
+    trail_.clear();
+  }
+
  private:
   size_t CursorIndexFor(const ChunkReadKey& key) const {
     return ChunkReadKeyHash{}(key) % cursor_count_;
@@ -961,6 +967,18 @@ FeatureCursorStats ChunkReadManager::feature_cursor_stats() const {
   return feature_cursor_->stats();
 }
 
+void ChunkReadManager::ClearRamCache() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ClearCacheStoreLocked(&vertex_property_ram_cache_);
+    ClearCacheStoreLocked(&edge_offset_ram_cache_);
+    ClearCacheStoreLocked(&edge_adj_list_ram_cache_);
+  }
+  if (feature_cursor_ != nullptr) {
+    feature_cursor_->ClearTrail();
+  }
+}
+
 void ChunkReadManager::Shutdown() {
   if (feature_cursor_ != nullptr) {
     feature_cursor_->Shutdown();
@@ -1035,6 +1053,12 @@ void ChunkReadManager::InsertRamCacheLocked(const ChunkReadKey& key,
   auto lru_it = std::prev(store->lru.end());
   store->entries.emplace(key, CacheEntry{table, bytes, lru_it});
   store->bytes += bytes;
+}
+
+void ChunkReadManager::ClearCacheStoreLocked(CacheStore* store) {
+  store->entries.clear();
+  store->lru.clear();
+  store->bytes = 0;
 }
 
 void ChunkReadManager::EvictRamCacheLocked(CacheDomain domain,

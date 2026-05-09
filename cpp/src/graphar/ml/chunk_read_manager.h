@@ -171,6 +171,7 @@ class ChunkReadManager {
   void CompleteFeatureRequest(std::chrono::steady_clock::time_point start,
                               bool ok);
   void RecordFeatureBatchServed(size_t rows);
+  void ClearRamCache();
   void Shutdown();
 
  private:
@@ -213,6 +214,7 @@ class ChunkReadManager {
   size_t RamBudgetBytesFor(CacheDomain domain) const;
   TablePtr LookupRamCacheLocked(const ChunkReadKey& key);
   void InsertRamCacheLocked(const ChunkReadKey& key, const TablePtr& table);
+  void ClearCacheStoreLocked(CacheStore* store);
   void EvictRamCacheLocked(CacheDomain domain, size_t bytes_needed);
 
   ChunkReadManagerOptions options_;

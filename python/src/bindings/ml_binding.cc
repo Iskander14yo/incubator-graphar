@@ -186,6 +186,7 @@ extern "C" void bind_ml_api(pybind11::module_& m) {
       .def("stats", &graphar::ml::ChunkReadManager::stats)
       .def("feature_cursor_stats",
            &graphar::ml::ChunkReadManager::feature_cursor_stats)
+      .def("clear_ram_cache", &graphar::ml::ChunkReadManager::ClearRamCache)
       .def("shutdown", &graphar::ml::ChunkReadManager::Shutdown);
 
   py::class_<graphar::ml::FeaturePipelineOptions>(m,

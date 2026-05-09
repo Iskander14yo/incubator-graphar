@@ -316,6 +316,26 @@ def test_feature_chunk_manager_cache_can_be_disabled(ldbc_graph):
     assert feature_stats["ram_cache_bytes"] == 0
 
 
+def test_close_clears_chunk_manager_caches(ldbc_graph):
+    loader = _make_loader(
+        ldbc_graph,
+        input_nodes=[0, 1, 2, 3],
+        features=["id"],
+        batch_size=2,
+        shuffle=False,
+        adj_list_ram_for_loader_mb=1,
+        feature_ram_for_loader_mb=1,
+    )
+    list(loader)
+    assert loader.chunk_manager_stats()["ram_cache_bytes"] > 0
+    assert loader.feature_chunk_manager_stats()["ram_cache_bytes"] > 0
+
+    loader.close()
+
+    assert loader.chunk_manager_stats()["ram_cache_bytes"] == 0
+    assert loader.feature_chunk_manager_stats()["ram_cache_bytes"] == 0
+
+
 def test_feature_pipeline_stats_track_submitted_batches(ldbc_graph):
     loader = _make_loader(
         ldbc_graph,

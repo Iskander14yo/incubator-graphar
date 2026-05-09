@@ -255,6 +255,16 @@ TEST_CASE("ChunkReadManager serves later requests from RAM cache") {
   REQUIRE(stats.ram_cache_misses == 1);
   REQUIRE(stats.ram_cache_evictions == 0);
   REQUIRE(stats.ram_cache_bytes >= TableBytes(table));
+
+  manager.ClearRamCache();
+  REQUIRE(manager.stats().ram_cache_bytes == 0);
+
+  auto third = manager.GetOrLoad(TestKey(), [&]() {
+    loader_calls.fetch_add(1, std::memory_order_relaxed);
+    return MakeTable(13);
+  });
+  REQUIRE(third.status().ok());
+  REQUIRE(loader_calls.load() == 2);
 }
 
 TEST_CASE("ChunkReadManager keeps offset and adjacency RAM caches separate") {
